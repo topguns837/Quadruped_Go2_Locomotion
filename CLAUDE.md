@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Reinforcement learning project for training a Unitree Go1/Go2 quadruped robot in NVIDIA Isaac Lab. The core environment is `Quadruped-Locomotion-Go2`, a ManagerBasedRLEnv that tracks velocity commands (linear x/y, angular z) with extended pitch/lean angle control. Uses RSL-RL (PPO) for training.
+Reinforcement learning project for training a Unitree Go2 quadruped robot in NVIDIA Isaac Lab. The core environment is `Quadruped-Locomotion-Go2`, a ManagerBasedRLEnv that tracks velocity commands (linear x/y, angular z) with extended pitch/lean angle control. Uses RSL-RL (PPO) for training.
 
 ## Key Dependencies
 
@@ -33,7 +33,7 @@ scripts/
   random_agent.py                     # Random-action validation agent
   list_envs.py                        # List available environments
 continualTraining.sh                  # Script for resuming training
-logs/rsl_rl/<experiment_name>/        # Training checkpoints and logs (go2_with_pitch, unitree_go1_flat, unitree_go2_flat)
+logs/rsl_rl/<experiment_name>/        # Training checkpoints and logs (go2_with_pitch, unitree_go2_flat)
 ```
 
 ## Running Python Scripts

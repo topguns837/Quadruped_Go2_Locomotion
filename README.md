@@ -1,12 +1,12 @@
 # Quadruped Locomotion (Isaac Lab)
 
-Reinforcement learning project for training the Unitree Go1 quadruped in NVIDIA Isaac Lab.
+Reinforcement learning project for training the Unitree Go2 quadruped in NVIDIA Isaac Lab.
 
 ## Overview
 
 This repository provides:
 
-- A custom Isaac Lab task: `Quadruped-Locomotion-Go1` For customised movement with extended Pitch and Roll movement of the body.  
+- A custom Isaac Lab task: `Quadruped-Locomotion-Go2` For customised movement with extended Pitch and Lean movement of the body.  
   - The Robot is customised to include a static version of the Open Manipulator X robot mounted on its head, for compensation of the weight.
 - RSL-RL training and playback scripts
 - Simple validation agents (`zero_agent.py` and `random_agent.py`)
@@ -51,19 +51,19 @@ python scripts/list_envs.py
 
 Expected tasks include:
 
-- `Quadruped-Locomotion-Go1`
-- `Quadruped-Locomotion-Go1-Play`
+- `Quadruped-Locomotion-Go2`
+- `Quadruped-Locomotion-Go2-Play`
 
 ### Train with RSL-RL
 
 ```bash
-python scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go1
+python scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2
 ```
 
 ### Play a trained checkpoint
 
 ```bash
-python scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go1-Play
+python scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play
 ```
 
 ### Validate environment wiring with dummy agents
@@ -71,13 +71,13 @@ python scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go1-Play
 Zero-action agent:
 
 ```bash
-python scripts/zero_agent.py --task=Quadruped-Locomotion-Go1
+python scripts/zero_agent.py --task=Quadruped-Locomotion-Go2
 ```
 
 Random-action agent:
 
 ```bash
-python scripts/random_agent.py --task=Quadruped-Locomotion-Go1
+python scripts/random_agent.py --task=Quadruped-Locomotion-Go2
 ```
 
 ## Development
