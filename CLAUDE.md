@@ -53,12 +53,12 @@ To quickly test small code snippets without the full simulator, use Isaac Sim's 
 
 ```bash
 # One-liner — no alias or env setup needed:
-/home/gavin/IsaacLab/_isaac_sim/python.sh -c "
+$ISAACLAB_ROOT/_isaac_sim/python.sh -c "
 import torch
 import importlib.util as iu
 spec = iu.spec_from_file_location(
     'math_utils',
-    '/home/gavin/IsaacLab/source/isaaclab/isaaclab/utils/math.py')
+    '$ISAACLAB_ROOT/source/isaaclab/isaaclab/utils/math.py')
 math_utils = iu.module_from_spec(spec)
 spec.loader.exec_module(math_utils)
 
@@ -71,7 +71,7 @@ print(q)
 Or add a shell alias to `~/.bashrc` / `~/.zshrc`:
 
 ```bash
-alias isaaclab-python='/home/gavin/IsaacLab/_isaac_sim/python.sh'
+alias isaaclab-python='$ISAACLAB_ROOT/_isaac_sim/python.sh'
 ```
 
 Then use the same pattern: `isaaclab-python -c "..."`
