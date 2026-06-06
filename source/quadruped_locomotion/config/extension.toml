@@ -9,18 +9,13 @@ readme  = "README.md"
 
 title = "Quadruped Locomotion"
 author = "Udula Ranasinghe"
-maintainer = "Udula Ranasinghe"
-description="Training UnitreeGo1 robot using reinforcement learnig in Isaac Lab"
+maintainer = "Gavin Kane"
+description="Training UnitreeGo2 robot using reinforcement learnig in Isaac Lab"
 repository = "https://github.com/UdulaRana/quadruped_locomotion.git"
 keywords = ["extension", "template", "isaaclab"]
 
 [dependencies]
-"isaaclab" = {}
-"isaaclab_assets" = {}
-"isaaclab_mimic" = {}
-"isaaclab_rl" = {}
-"isaaclab_tasks" = {}
-"rsl-rl-lib" = {}
+"omni.kit.uiapp" = {}
 # NOTE: Add additional dependencies here
 
 [[python.module]]

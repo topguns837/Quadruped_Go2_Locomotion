@@ -6,7 +6,8 @@ Reinforcement learning project for training the Unitree Go1 quadruped in NVIDIA 
 
 This repository provides:
 
-- A custom Isaac Lab task: `Quadruped-Locomotion-Go1`
+- A custom Isaac Lab task: `Quadruped-Locomotion-Go1` For customised movement with extended Pitch and Roll movement of the body.  
+  - The Robot is customised to include a static version of the Open Manipulator X robot mounted on its head, for compensation of the weight.
 - RSL-RL training and playback scripts
 - Simple validation agents (`zero_agent.py` and `random_agent.py`)
 - Packaging as an Isaac Lab extension (`quadruped_locomotion`)

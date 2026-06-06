@@ -13,7 +13,7 @@ from . import agents
 
 
 gym.register(
-    id="Quadruped-Locomotion-Go1",
+    id="Quadruped-Locomotion-Go2",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
@@ -23,7 +23,7 @@ gym.register(
 )
 
 gym.register(
-    id="Quadruped-Locomotion-Go1-Play",
+    id="Quadruped-Locomotion-Go2-Play",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={

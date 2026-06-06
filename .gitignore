@@ -55,11 +55,16 @@ _build
 
 # RL-Games
 **/runs/*
+**/logs/rsl_rl/
 # **/logs/*
 **/recordings/*
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
+
+# Trained model checkpoints
+**/*.pt
+**/*.pth
 
 # Teleop Recorded Dataset
 /datasets/

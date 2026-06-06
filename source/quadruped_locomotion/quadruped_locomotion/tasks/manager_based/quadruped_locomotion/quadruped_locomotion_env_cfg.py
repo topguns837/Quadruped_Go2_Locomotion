@@ -2,6 +2,8 @@
 import torch
 import os
 
+
+
 class LowLevelPolicyWrapper:
     """Wrapper for loading and running the pretrained low-level policy (Network B)."""
     def __init__(self, policy_path=None, device="cpu", freeze=True):
@@ -44,11 +46,13 @@ from isaaclab.scene import InteractiveSceneCfg
 
 # my libs
 from isaaclab.envs import ViewerCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
-from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.sensors import ContactSensorCfg, TiledCameraCfg, RayCasterCfg, patterns
+from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+
+
 
 from . import mdp
 
@@ -56,7 +60,7 @@ from . import mdp
 # Pre-defined configs
 ##
 
-from isaaclab_assets.robots.unitree import UNITREE_GO1_CFG  # isort: skip
+from isaaclab_assets.robots.unitree import UNITREE_GO2WITHARM_CFG  # isort: skip
 
 
 ##
@@ -72,6 +76,37 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
     # ground plane
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            size=(8.0, 8.0),
+            border_width=20.0,
+            num_rows=9,
+            num_cols=21,
+            horizontal_scale=0.1,
+            vertical_scale=0.005,
+            slope_threshold=0.75,
+            difficulty_range=(0.0, 1.0),
+            use_cache=False,
+            sub_terrains={
+                "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.2),
+                "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+                    proportion=0.2, noise_range=(0.02, 0.05), noise_step=0.02, border_width=0.25
+                ),
+            },
+        ),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+        visual_material=sim_utils.MdlFileCfg(
+            mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            project_uvw=True,
+            texture_scale=(0.25, 0.25),
+        ),
+    )
+    """        prim_path="/World/ground",
         terrain_type="plane",
         terrain_generator=None,
         max_init_terrain_level=5,
@@ -87,16 +122,31 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
             project_uvw=True,
             texture_scale=(0.25, 0.25),
         ),
-        debug_vis=False,
-    )
+        debug_vis=False, 
+    """
 
     # robot
-    robot: ArticulationCfg = UNITREE_GO1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = UNITREE_GO2WITHARM_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # sensors
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
     )
+
+    """     depth_camera = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base/DepthCamera",
+        update_period=0.0,
+        offset=TiledCameraCfg.OffsetCfg(pos=(-0.25, 0.0, 0.7), rot=(0.66446, 0.24184, -0.24184, -0.66446), convention="opengl"),
+        data_types=["distance_to_camera"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=18.15,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.01, 1.0),
+        ),
+        width=320,
+        height=240,
+    ) """
     # lights
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
@@ -115,7 +165,7 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications for the MDP."""
 
-    base_velocity = mdp.UniformVelocityCommandCfg(
+    base_velocity = mdp.UniformVelocityCommandCfgWithPitch(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
         rel_standing_envs=0.02,
@@ -123,8 +173,13 @@ class CommandsCfg:
         heading_command=True,
         heading_control_stiffness=0.5,
         debug_vis=True,
-        ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+        ranges=mdp.UniformVelocityCommandCfgWithPitch.Ranges(
+            lin_vel_x=(-1.0, 1.0),
+            lin_vel_y=(-1.0, 1.0),
+            ang_vel_z=(-1.0, 1.0),
+            heading=(-math.pi, math.pi),
+            ang_pos_x=(-0.3, 0.3),
+            ang_pos_y=(-0.6, 0.6),
         ),
     )
 
@@ -191,7 +246,7 @@ class EventCfg:
                 "x": (-0.5, 0.5),
                 "y": (-0.3, 0.3),
                 "z": (-0.25, 0.25),
-                "roll": (-0.25, 0.25),
+                "roll": (-0.15, 0.15),
                 "pitch": (-0.25, 0.25),
                 "yaw": (-0.25, 0.25),
             },
@@ -225,6 +280,16 @@ class RewardsCfg:
         weight=0.5,
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
+    track_pitch_exp = RewTerm(
+        func=mdp.track_pitch_exp,
+        weight=0.5,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+    )
+    track_lean_exp = RewTerm(
+        func=mdp.track_lean_exp,
+        weight=0.3,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+    )    
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
@@ -239,12 +304,61 @@ class RewardsCfg:
             "threshold": 1.0,
         },
     )
+    # additional penalties to encourage more natural motions
+    height_penalty = RewTerm(
+        func=mdp.base_height_l2_pitch,
+        weight=-1.65,
+        params={
+            "target_height": 0.4,
+            "command_name": "base_velocity",
+            "pitch_sensitivity": -0.5,
+            "lean_sensitivity": 0.05,
+        },
+    )
 
+    hip_crossing = RewTerm(
+        func=mdp.hip_crossing_l2,
+        weight=-0.5,  # tune starting point
+        params={
+            "joint_ids": [0, 1, 2, 3],  # hip_roll joint indices
+            "asset_cfg": SceneEntityCfg("robot"),
+            "threshold": 0.4,
+      },
+    )
+    # foot sliding penalty -- use same contact sensor as undesired_contacts
+    foot_sliding = RewTerm(
+        func=mdp.foot_sliding_exp,
+        weight=-1.0,  # tune: increase magnitude for stronger penalty
+        params={
+            "std": math.sqrt(0.04),  # 0.2 m/s e-folding speed
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+        },
+    )
+    # foot lift reward -- reward feet above min_height when not in contact
+    foot_lift = RewTerm(
+        func=mdp.foot_lift_exp,
+        weight=0.1,  # tune: increase for stronger lift encouragement
+        params={
+            "std": math.sqrt(0.01),  # 0.1 m e-folding height
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+            "min_height": 0.05,  # 5 cm
+        },
+    )
     # -- optional penalties 
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
+    #flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
 
-
+    joint_deviation = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.005,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+        },
+    )
 
 @configclass
 class TerminationsCfg:
@@ -254,7 +368,7 @@ class TerminationsCfg:
     body_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names="trunk"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"),
             "threshold": 1.0,
         },
     )
@@ -296,7 +410,7 @@ class QuadrupedLocomotionEnvCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # general settings
         self.decimation = 4
-        self.episode_length_s = 20.0
+        self.episode_length_s = 40.0
         # simulation settings
         self.sim.dt = 0.005 
         self.sim.render_interval = self.decimation
