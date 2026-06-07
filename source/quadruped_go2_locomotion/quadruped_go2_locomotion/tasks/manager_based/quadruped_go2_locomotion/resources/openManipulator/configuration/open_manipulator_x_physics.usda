@@ -1,0 +1,524 @@
+#usda 1.0
+(
+    customLayerData = {
+        dictionary cameraSettings = {
+            dictionary Front = {
+                double3 position = (5, 0, 0)
+                double radius = 5
+            }
+            dictionary Perspective = {
+                double3 position = (5, 5, 5)
+                double3 target = (-3.978038431995401e-8, -3.978038254359717e-8, 7.956076863990802e-8)
+            }
+            dictionary Right = {
+                double3 position = (0, -5, 0)
+                double radius = 5
+            }
+            dictionary Top = {
+                double3 position = (0, 0, 5)
+                double radius = 5
+            }
+            string boundCamera = "/OmniverseKit_Persp"
+        }
+        dictionary omni_layer = {
+            string authoring_layer = "./open_manipulator_x_physics.usd"
+            dictionary locked = {
+            }
+            dictionary muteness = {
+            }
+        }
+        dictionary renderSettings = {
+        }
+    }
+    defaultPrim = "open_manipulator_x"
+    metersPerUnit = 1
+    subLayers = [
+        @open_manipulator_x_base.usda@
+    ]
+    upAxis = "Z"
+)
+
+def PhysicsScene "physicsScene" (
+    prepend apiSchemas = ["PhysxSceneAPI"]
+)
+{
+    vector3f physics:gravityDirection = (0, 0, -1)
+    float physics:gravityMagnitude = 9.81
+    uniform token physxScene:broadphaseType = "MBP"
+    bool physxScene:enableCCD = 1
+    bool physxScene:enableGPUDynamics = 0
+    bool physxScene:enableStabilization = 1
+    uniform token physxScene:solverType = "TGS"
+}
+
+over "open_manipulator_x"
+{
+    def PhysicsFixedJoint "root_joint" (
+        prepend apiSchemas = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI"]
+    )
+    {
+        rel physics:body1 = </open_manipulator_x/world>
+        bool physxArticulation:enabledSelfCollisions = 0
+        int physxArticulation:solverPositionIterationCount = 32
+        int physxArticulation:solverVelocityIterationCount = 1
+    }
+
+    over "world" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float3 physics:diagonalInertia = (0.0001, 0.0001, 0.0001)
+        float physics:mass = 0
+
+        def Xform "collisions"
+        {
+        }
+    }
+
+    over "link1" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0.00030876155, 0, -0.00012176461)
+        float3 physics:diagonalInertia = (0.000012500524, 0.000021898364, 0.000019272073)
+        float physics:mass = 0.079119965
+        quatf physics:principalAxes = (0.99991304, 0, -0.013189722, 0)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/link1>
+        )
+        {
+        }
+    }
+
+    over "joints"
+    {
+        def PhysicsFixedJoint "world_fixed"
+        {
+            rel physics:body0 = </open_manipulator_x/world>
+            rel physics:body1 = </open_manipulator_x/link1>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0
+            point3f physics:localPos0 = (0, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+        }
+
+        def PhysicsRevoluteJoint "joint1" (
+            prepend apiSchemas = ["PhysicsJointStateAPI:angular", "PhysxJointAPI", "PhysicsDriveAPI:angular"]
+        )
+        {
+            float drive:angular:physics:damping = 0.000011525834
+            float drive:angular:physics:maxForce = 1000
+            float drive:angular:physics:stiffness = 0.028814584
+            float drive:angular:physics:targetPosition = 0
+            uniform token drive:angular:physics:type = "force"
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </open_manipulator_x/link1>
+            rel physics:body1 = </open_manipulator_x/link2>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0.000046103338
+            point3f physics:localPos0 = (0.012, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -180
+            float physics:upperLimit = 180
+            float physxJoint:maxJointVelocity = 275.01974
+        }
+
+        def PhysicsRevoluteJoint "joint2" (
+            prepend apiSchemas = ["PhysicsJointStateAPI:angular", "PhysxJointAPI", "PhysicsDriveAPI:angular"]
+        )
+        {
+            float drive:angular:physics:damping = 0.00012447205
+            float drive:angular:physics:maxForce = 1000
+            float drive:angular:physics:stiffness = 0.3111801
+            float drive:angular:physics:targetPosition = 0
+            uniform token drive:angular:physics:type = "force"
+            uniform token physics:axis = "Y"
+            rel physics:body0 = </open_manipulator_x/link2>
+            rel physics:body1 = </open_manipulator_x/link3>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0.0004978882
+            point3f physics:localPos0 = (0, 0, 0.0595)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -85.943665
+            float physics:upperLimit = 85.943665
+            float physxJoint:maxJointVelocity = 275.01974
+        }
+
+        def PhysicsRevoluteJoint "joint3" (
+            prepend apiSchemas = ["PhysicsJointStateAPI:angular", "PhysxJointAPI", "PhysicsDriveAPI:angular"]
+        )
+        {
+            float drive:angular:physics:damping = 0.0013228114
+            float drive:angular:physics:maxForce = 1000
+            float drive:angular:physics:stiffness = 3.3070285
+            float drive:angular:physics:targetPosition = 0
+            uniform token drive:angular:physics:type = "force"
+            uniform token physics:axis = "Y"
+            rel physics:body0 = </open_manipulator_x/link3>
+            rel physics:body1 = </open_manipulator_x/link4>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0.0052912454
+            point3f physics:localPos0 = (0.024, 0, 0.128)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -85.943665
+            float physics:upperLimit = 80.21409
+            float physxJoint:maxJointVelocity = 275.01974
+        }
+
+        def PhysicsRevoluteJoint "joint4" (
+            prepend apiSchemas = ["PhysicsJointStateAPI:angular", "PhysxJointAPI", "PhysicsDriveAPI:angular"]
+        )
+        {
+            float drive:angular:physics:damping = 0.0011048802
+            float drive:angular:physics:maxForce = 1000
+            float drive:angular:physics:stiffness = 2.7622006
+            float drive:angular:physics:targetPosition = 0
+            uniform token drive:angular:physics:type = "force"
+            uniform token physics:axis = "Y"
+            rel physics:body0 = </open_manipulator_x/link4>
+            rel physics:body1 = </open_manipulator_x/link5>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0.004419521
+            point3f physics:localPos0 = (0.124, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -97.402824
+            float physics:upperLimit = 112.87268
+            float physxJoint:maxJointVelocity = 275.01974
+        }
+
+        def PhysicsPrismaticJoint "gripper_left_joint" (
+            prepend apiSchemas = ["PhysicsJointStateAPI:linear", "PhysxJointAPI", "PhysicsDriveAPI:linear"]
+        )
+        {
+            float drive:linear:physics:damping = 0.000002879268
+            float drive:linear:physics:maxForce = 1000
+            float drive:linear:physics:stiffness = 0.0071981703
+            float drive:linear:physics:targetPosition = 0
+            uniform token drive:linear:physics:type = "force"
+            uniform token physics:axis = "Y"
+            rel physics:body0 = </open_manipulator_x/link5>
+            rel physics:body1 = </open_manipulator_x/gripper_left_link>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0.000011517072
+            point3f physics:localPos0 = (0.0817, 0.021, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            float physics:lowerLimit = -0.011
+            float physics:upperLimit = 0.02
+            float physxJoint:maxJointVelocity = 4.8
+        }
+
+        def PhysicsPrismaticJoint "gripper_right_joint" (
+            prepend apiSchemas = ["PhysicsJointStateAPI:linear", "PhysxJointAPI", "PhysxMimicJointAPI:rotY"]
+        )
+        {
+            uniform token physics:axis = "Y"
+            rel physics:body0 = </open_manipulator_x/link5>
+            rel physics:body1 = </open_manipulator_x/gripper_right_link>
+            float physics:breakForce = 3.4028235e38
+            float physics:breakTorque = 3.4028235e38
+            float physics:JointEquivalentInertia = 0.000011517074
+            point3f physics:localPos0 = (0.0817, -0.021, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (0, 1, 0, 0)
+            quatf physics:localRot1 = (0, 1, 0, 0)
+            float physics:lowerLimit = -0.0172
+            float physics:upperLimit = 0.0262
+            custom float physxMimicJoint:rotY:dampingRatio = 0.005
+            float physxMimicJoint:rotY:gearing = -1
+            custom float physxMimicJoint:rotY:naturalFrequency = 25
+            float physxMimicJoint:rotY:offset = 0
+            prepend rel physxMimicJoint:rotY:referenceJoint = </open_manipulator_x/joints/gripper_left_joint>
+        }
+    }
+
+    over "link2" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (-0.0003018487, 0.0005404368, 0.047433466)
+        float3 physics:diagonalInertia = (0.000034552955, 0.000032689233, 0.000018840883)
+        float physics:mass = 0.09840684
+        quatf physics:principalAxes = (0.9999148, 0.00096008566, 0.012220063, -0.0044987164)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/link2>
+        )
+        {
+        }
+    }
+
+    over "link3" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0.010308393, 0.00037743364, 0.10170197)
+        float3 physics:diagonalInertia = (0.0003359318, 0.00034291513, 0.000054957833)
+        float physics:mass = 0.13850917
+        quatf physics:principalAxes = (0.9975529, -0.0033182802, 0.06932859, -0.008419083)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/link3>
+        )
+        {
+        }
+    }
+
+    over "link4" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0.09090959, 0.00038929816, 0.00022413279)
+        float3 physics:diagonalInertia = (0.00003064615, 0.00024231059, 0.00025155093)
+        float physics:mass = 0.13274562
+        quatf physics:principalAxes = (0.99999505, -0.00071134296, -0.0006102599, 0.0030147866)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/link4>
+        )
+        {
+        }
+    }
+
+    over "link5" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0.044206753, 3.6839984e-7, 0.008914222)
+        float3 physics:diagonalInertia = (0.00008078715, 0.00007598047, 0.000093210976)
+        float physics:mass = 0.14327572
+        quatf physics:principalAxes = (0.99915695, 0, -0.04105357, 0)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/link5>
+        )
+        {
+        }
+    }
+
+    over "gripper_left_link" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0, 0, 0)
+        float3 physics:diagonalInertia = (0.000001, 0.000001, 0.000001)
+        float physics:mass = 0.001
+        quatf physics:principalAxes = (1, 0, 0, 0)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/gripper_left_link>
+        )
+        {
+        }
+    }
+
+    over "gripper_right_link" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0, 0, 0)
+        float3 physics:diagonalInertia = (0.000001, 0.000001, 0.000001)
+        float physics:mass = 0.001
+        quatf physics:principalAxes = (1, 0, 0, 0)
+
+        def Xform "collisions" (
+            instanceable = true
+            prepend references = </colliders/gripper_right_link>
+        )
+        {
+        }
+    }
+}
+
+over "colliders"
+{
+    over "link1"
+    {
+        over "link1"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    over "link2"
+    {
+        over "link2"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    over "link3"
+    {
+        over "link3"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    over "link4"
+    {
+        over "link4"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    over "link5"
+    {
+        over "link5"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    over "gripper_left_link"
+    {
+        over "gripper_left_palm"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    over "gripper_right_link"
+    {
+        over "gripper_right_palm"
+        {
+            over "node_STL_BINARY_" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    def PhysicsCollisionGroup "robotCollisionGroup"
+    {
+        prepend rel collection:colliders:includes = </open_manipulator_x>
+    }
+
+    def PhysicsCollisionGroup "collidersCollisionGroup"
+    {
+        prepend rel collection:colliders:includes = </colliders>
+        prepend rel physics:filteredGroups = </colliders/robotCollisionGroup>
+    }
+}
+
+def "Render" (
+    hide_in_stage_window = true
+    no_delete = true
+)
+{
+    def "OmniverseKit"
+    {
+        def "HydraTextures" (
+            hide_in_stage_window = true
+            no_delete = true
+        )
+        {
+            def RenderProduct "omni_kit_widget_viewport_ViewportTexture_0" (
+                prepend apiSchemas = ["OmniRtxSettingsCommonAdvancedAPI_1", "OmniRtxSettingsRtAdvancedAPI_1", "OmniRtxSettingsPtAdvancedAPI_1", "OmniRtxPostColorGradingAPI_1", "OmniRtxPostChromaticAberrationAPI_1", "OmniRtxPostBloomPhysicalAPI_1", "OmniRtxPostMatteObjectAPI_1", "OmniRtxPostCompositingAPI_1", "OmniRtxPostDofAPI_1", "OmniRtxPostMotionBlurAPI_1", "OmniRtxPostTvNoiseAPI_1", "OmniRtxPostTonemapIrayReinhardAPI_1", "OmniRtxPostDebugSettingsAPI_1", "OmniRtxDebugSettingsAPI_1"]
+                hide_in_stage_window = true
+                no_delete = true
+            )
+            {
+                rel camera = </OmniverseKit_Persp>
+                token omni:rtx:background:source:texture:textureMode = "repeatMirrored"
+                token omni:rtx:background:source:type = "domeLight"
+                bool omni:rtx:dlss:frameGeneration = 0
+                bool omni:rtx:material:db:nonVisualMaterialCSV:enabled = 0
+                bool omni:rtx:material:db:syncLoads = 1
+                token omni:rtx:post:dlss:execMode = "performance"
+                bool omni:rtx:post:registeredCompositing:invertColorCorrection = 1
+                bool omni:rtx:post:registeredCompositing:invertToneMap = 1
+                bool omni:rtx:pt:lightcache:cached:dontResolveConflicts = 1
+                int omni:rtx:pt:maxSamplesPerLaunch = 2073600
+                int omni:rtx:pt:mgpu:maxPixelsPerRegionExponent = 12
+                color3f omni:rtx:rt:ambientLight:color = (0.1, 0.1, 0.1)
+                bool omni:rtx:rt:demoire = 0
+                bool omni:rtx:rt:lightcache:spatialCache:dontResolveConflicts = 1
+                bool omni:rtx:scene:hydra:materialSyncLoads = 1
+                bool omni:rtx:scene:hydra:mdlMaterialWarmup = 1
+                uint omni:rtx:viewTile:limit = 4294967295
+                rel orderedVars = </Render/Vars/LdrColor>
+                custom bool overrideClipRange = 0
+                uniform int2 resolution = (1280, 720)
+            }
+        }
+    }
+
+    def RenderSettings "OmniverseGlobalRenderSettings" (
+        prepend apiSchemas = ["OmniRtxSettingsGlobalRtAdvancedAPI_1", "OmniRtxSettingsGlobalPtAdvancedAPI_1"]
+        no_delete = true
+    )
+    {
+        rel products = </Render/OmniverseKit/HydraTextures/omni_kit_widget_viewport_ViewportTexture_0>
+    }
+
+    def "Vars"
+    {
+        def RenderVar "LdrColor" (
+            hide_in_stage_window = true
+            no_delete = true
+        )
+        {
+            uniform string sourceName = "LdrColor"
+        }
+    }
+}
+
