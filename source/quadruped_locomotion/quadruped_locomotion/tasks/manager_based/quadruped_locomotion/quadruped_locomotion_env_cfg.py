@@ -59,7 +59,7 @@ from . import mdp
 # Pre-defined configs
 ##
 
-from isaaclab_assets.robots.unitree import UNITREE_GO2WITHARM_CFG  # isort: skip
+from .unitree_go2witharm_cfg import UNITREE_GO2WITHARM_CFG  # isort: skip
 
 
 ##
