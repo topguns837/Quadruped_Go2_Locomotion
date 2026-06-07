@@ -23,7 +23,7 @@ _RESOURCES_DIR = pathlib.Path(__file__).resolve().parent / "resources"
 
 UNITREE_GO2WITHARM_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"file://{_RESOURCES_DIR / 'go2withOpenXstatic.usd'}",
+        usd_path=f"file://{_RESOURCES_DIR / 'go2withArm' / 'go2withOpenXStatic.usda'}",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
