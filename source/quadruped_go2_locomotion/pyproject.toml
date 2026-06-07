@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools", "wheel", "toml"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quadruped_go2_locomotion"
+version = "1.1.0"
+description = "Training UnitreeGo2 robot using reinforcement learnig in Isaac Lab"
+requires-python = ">=3.10"
+dependencies = [
+    "psutil",
+]
+
+[tool.setuptools.packages.find]
+include = ["quadruped_go2_locomotion*"]

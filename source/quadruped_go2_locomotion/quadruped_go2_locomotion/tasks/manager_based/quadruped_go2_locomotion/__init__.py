@@ -17,7 +17,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.quadruped_locomotion_env_cfg:QuadrupedLocomotionEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.quadruped_go2_locomotion_env_cfg:QuadrupedLocomotionEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )
@@ -27,7 +27,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.quadruped_locomotion_env_cfg:QuadrupedLocomotionEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.quadruped_go2_locomotion_env_cfg:QuadrupedLocomotionEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )

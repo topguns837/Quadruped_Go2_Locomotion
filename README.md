@@ -10,7 +10,7 @@ This repository provides:
   - The Robot is customised to include a static version of the Open Manipulator X robot mounted on its head, for compensation of the weight.
 - RSL-RL training and playback scripts
 - Simple validation agents (`zero_agent.py` and `random_agent.py`)
-- Packaging as an Isaac Lab extension (`quadruped_locomotion`)
+- Packaging as an Isaac Lab extension (`quadruped_go2_locomotion`)
 
 ## Compatibility
 
@@ -38,7 +38,7 @@ Clone this repository **outside** your Isaac Lab directory.
 Use the same Python environment used by Isaac Lab:
 
 ```bash
-python -m pip install -e source/quadruped_locomotion
+python -m pip install -e source/quadruped_go2_locomotion
 ```
 
 # Modify robots\unitree.py in IsaacLab installation
@@ -109,6 +109,11 @@ Expected tasks include:
 python scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2
 ```
 
+### Distributed training
+```bash
+python -m torch.distributed.run -nproc_per_node=9 ../isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2 --headless --distributed
+```
+
 ### Play a trained checkpoint
 
 ```bash
@@ -151,7 +156,7 @@ Add your extension path to `.vscode/settings.json`:
 ```json
 {
   "python.analysis.extraPaths": [
-    "<path-to-repo>/source/quadruped_locomotion"
+    "<path-to-repo>/source/quadruped_go2_locomotion"
   ]
 }
 ```
@@ -164,14 +169,3 @@ If indexing is too heavy, reduce `python.analysis.extraPaths` entries for unused
 
 This project follows the license defined in the repository sources and metadata.
 
-## Citation
-
-If this repository is helpful for your work, please consider citing:
-
-```bibtex
-@article{ranasinghe2025review,
-  title={A Review of Reinforcement Learning Techniques for Quadruped Robot Control and Locomotion in Complex Terrains},
-  author={Ranasinghe, Udula and Islam, Rafiqul and Anavatti, Sreenatha and Garrat, Matthew},
-  journal={Available at SSRN 5183855}
-}
-```

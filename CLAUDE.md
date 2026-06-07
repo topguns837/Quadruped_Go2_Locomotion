@@ -15,10 +15,10 @@ Reinforcement learning project for training a Unitree Go2 quadruped robot in NVI
 ## Repository Structure
 
 ```
-source/quadruped_locomotion/          # Isaac Lab extension package
-  quadruped_locomotion/
-    tasks/manager_based/quadruped_locomotion/
-      quadruped_locomotion_env_cfg.py  # Main env config (scene, MDP, rewards, terminations)
+source/quadruped_go2_locomotion/          # Isaac Lab extension package
+  quadruped_go2_locomotion/
+    tasks/manager_based/quadruped_go2_locomotion/
+      quadruped_go2_locomotion_env_cfg.py  # Main env config (scene, MDP, rewards, terminations)
       __init__.py                      # Gym registration (Go2, Go2-Play)
       agents/rsl_rl_ppo_cfg.py        # PPO hyperparameters
       mdp/
@@ -82,7 +82,7 @@ Then use the same pattern: `isaaclab-python -c "..."`
 
 ```bash
 # Install the extension (requires Isaac Lab Python env)
-../IsaacLab/isaaclab.sh -p -m pip install -e source/quadruped_locomotion
+../IsaacLab/isaaclab.sh -p -m pip install -e source/quadruped_go2_locomotion
 
 # List available environments
 ../IsaacLab/isaaclab.sh -p scripts/list_envs.py
@@ -117,7 +117,7 @@ Then use the same pattern: `isaaclab-python -c "..."`
 
 ## Architecture
 
-### Environment Config (`quadruped_locomotion_env_cfg.py`)
+### Environment Config (`quadruped_go2_locomotion_env_cfg.py`)
 - `QuadrupedLocomotionSceneCfg` — scene entities (terrain, robot, contact sensors, sky light)
 - `QuadrupedLocomotionEnvCfg` — main training config, inherits `ManagerBasedRLEnvCfg`, sets scene/observations/actions/commands/rewards/terminations/events/curriculum
 - `QuadrupedLocomotionEnvCfg_PLAY` — play config: 50 envs, no observation corruption, closer viewer
@@ -132,7 +132,7 @@ Then use the same pattern: `isaaclab-python -c "..."`
 - PPO actor-critic network configs and algorithm hyperparameters
 - All standard RSL-RL settings (clip, entropy, learning rate schedule, etc.)
 
-### Gym Registration (`tasks/manager_based/quadruped_locomotion/__init__.py`)
+### Gym Registration (`tasks/manager_based/quadruped_go2_locomotion/__init__.py`)
 - Registers `Quadruped-Locomotion-Go2` (training) and `Quadruped-Locomotion-Go2-Play` (playback) via `gym.register()`
 - Both point to `ManagerBasedRLEnv` as the entry point
 
@@ -148,7 +148,7 @@ Then use the same pattern: `isaaclab-python -c "..."`
 
 ## Working with Rewards
 
-Reward terms in `mdp/rewards.py` follow the Isaac Lab MDP pattern: `def reward_term(env: ManagerBasedRLEnv, ...) -> torch.Tensor`. Each returns a tensor of shape `(num_envs,)`. To add or modify rewards, register the term in `RewardsCfg` within `quadruped_locomotion_env_cfg.py`.
+Reward terms in `mdp/rewards.py` follow the Isaac Lab MDP pattern: `def reward_term(env: ManagerBasedRLEnv, ...) -> torch.Tensor`. Each returns a tensor of shape `(num_envs,)`. To add or modify rewards, register the term in `RewardsCfg` within `quadruped_go2_locomotion_env_cfg.py`.
 
 ## Working with Commands
 
@@ -159,3 +159,7 @@ The pitch/lean command extension in `mdp/commands.py` adds components [3] and [4
 - Checkpoints saved to `logs/rsl_rl/<experiment_name>/<timestamp>/model_<N>.pt`
 - Exported policy (JIT + ONNX) in `logs/rsl_rl/<experiment_name>/<timestamp>/exported/policy.pt`
 - Config dumps in `logs/rsl_rl/<experiment_name>/<timestamp>/params/env.yaml` and `params/agent.yaml`
+
+## Git updates
+
+- Git adds / commits and pushes are only to be implemented after any code changes are tested and confirmed

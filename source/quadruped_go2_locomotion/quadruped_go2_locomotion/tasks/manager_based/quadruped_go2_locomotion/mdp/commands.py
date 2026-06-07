@@ -30,28 +30,29 @@ if TYPE_CHECKING:
 
 # Step 1: Define the command class first (no forward reference issues)
 class UniformVelocityCommandWithPitch(UniformVelocityCommand):
-    """Command generator that extends UniformVelocityCommand with a target pitch (lean) angle.
+    """Command generator that extends UniformVelocityCommand with target pitch, lean, and height.
 
-    The command buffer has shape (num_envs, 5) with components:
-    [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean]
+    The command buffer has shape (num_envs, 6) with components:
+    [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean, target_lin_pos_z]
     """
 
     def __init__(self, cfg, env: "ManagerBasedEnv"):
         super().__init__(cfg, env)
-        # Extend command buffer from (N, 3) to (N, 5)
-        new_cmd = torch.zeros(self.num_envs, 5, device=self.device)
+        # Extend command buffer from (N, 3) to (N, 6)
+        new_cmd = torch.zeros(self.num_envs, 6, device=self.device)
         new_cmd[:, :3] = self.vel_command_b
         del self.vel_command_b
         self.vel_command_b = new_cmd
         # Target pitch buffer
         self.target_pitch = torch.zeros(self.num_envs, device=self.device)
         self.target_lean  = torch.zeros(self.num_envs, device=self.device)
+        self.target_lin_pos_z = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
-        """The desired base velocity command in the base frame. Shape is (num_envs, 4).
+        """The desired base velocity command in the base frame. Shape is (num_envs, 6).
 
-        Components: [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean]
+        Components: [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean, target_lin_pos_z]
         """
         return self.vel_command_b
 
@@ -72,18 +73,27 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
             self.target_lean[env_ids] = q.uniform_(*pos_range)
         else:
             self.target_lean[env_ids] = 0.0
+        # Sample target lin_pos_z (height command)
+        h = torch.empty(len(env_ids), device=self.device)
+        if self.cfg.ranges.lin_pos_z is not None:
+            pos_range = self.cfg.ranges.lin_pos_z
+            self.target_lin_pos_z[env_ids] = h.uniform_(*pos_range)
+        else:
+            self.target_lin_pos_z[env_ids] = 0.0
 
 
     def _update_command(self):
         """Post-processes the velocity and pitch commands."""
         super()._update_command()
-        # Copy pitch and lean targets into the command buffer
+        # Copy pitch, lean, and height targets into the command buffer
         self.vel_command_b[:, 3] = self.target_pitch
         self.vel_command_b[:, 4] = self.target_lean
-        # Zero pitch and lean for standing envs
+        self.vel_command_b[:, 5] = self.target_lin_pos_z
+        # Zero pitch, lean, and height for standing envs
         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
         self.target_pitch[standing_env_ids] = 0.0
         self.target_lean[standing_env_ids] = 0.0
+        self.target_lin_pos_z[standing_env_ids] = 0.0
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         super()._set_debug_vis_impl(debug_vis)
@@ -117,13 +127,14 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
 # Step 2: Now the config can reference the already-defined command class
 @configclass
 class UniformVelocityCommandCfgWithPitch(_UVCCfg):
-    """Configuration for the uniform velocity command generator with pitch and lean angle command.
+    """Configuration for the uniform velocity command generator with pitch, lean, and height.
 
     The command comprises of:
     - Linear velocity in x and y direction (m/s)
     - Angular velocity around z-axis (rad/s)
-    - Target pitch  angle (rad)
+    - Target pitch angle (rad)
     - Target lean angle (rad)
+    - Target linear position z / height (m)
 
     The robot should lean forward/backward while walking toward the sampled pitch angle.
     """
@@ -147,15 +158,13 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
         """Range for the heading command (in rad)."""
 
         ang_pos_y: tuple[float, float] | None = None
-        """Range for the target pitch (lean) angle (in rad). Defaults to None. """
+        """Range for the target pitch angle (in rad). Defaults to None. """
 
         ang_pos_x: tuple[float, float] | None = None
-        """Range for the target pitch (lean) angle (in rad). Defaults to None. """
+        """Range for the target lean angle (in rad). Defaults to None. """
 
-        """       
-        If set, the command generator will sample a target pitch angle for each environment.
-        Positive values lean forward, negative values lean backward.
-        """
+        lin_pos_z: tuple[float, float] | None = None
+        """Range for the target linear position z / height command (in m). Defaults to None. """
 
     ranges: Ranges = Ranges()  # type: ignore
 
@@ -166,7 +175,7 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
 
 
 def get_pitch_command(env, command_name: str) -> torch.Tensor:
-    """Get the target pitch (lean) command from the command manager.
+    """Get the target pitch command from the command manager.
 
     Args:
         env: The environment.
@@ -179,14 +188,27 @@ def get_pitch_command(env, command_name: str) -> torch.Tensor:
     return cmd[:, 3]
 
 def get_lean_command(env, command_name: str) -> torch.Tensor:
-    """Get the target pitch (lean) command from the command manager.
+    """Get the target lean command from the command manager.
 
     Args:
         env: The environment.
         command_name: The name of the command to query.
 
     Returns:
-        The target pitch command tensor of shape (num_envs,).
+        The target lean command tensor of shape (num_envs,).
     """
     cmd = env.command_manager.get_command(command_name)
     return cmd[:, 4]
+
+def get_lin_pos_z_command(env, command_name: str) -> torch.Tensor:
+    """Get the target linear position z (height) command from the command manager.
+
+    Args:
+        env: The environment.
+        command_name: The name of the command to query.
+
+    Returns:
+        The target lin_pos_z command tensor of shape (num_envs,).
+    """
+    cmd = env.command_manager.get_command(command_name)
+    return cmd[:, 5]

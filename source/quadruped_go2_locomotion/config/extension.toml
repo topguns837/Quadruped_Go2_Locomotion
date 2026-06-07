@@ -11,7 +11,7 @@ title = "Quadruped Locomotion"
 author = "Udula Ranasinghe"
 maintainer = "Gavin Kane"
 description="Training UnitreeGo2 robot using reinforcement learnig in Isaac Lab"
-repository = "https://github.com/UdulaRana/quadruped_locomotion.git"
+repository = "https://github.com/UdulaRana/quadruped_go2_locomotion.git"
 keywords = ["extension", "template", "isaaclab"]
 
 [dependencies]
@@ -19,7 +19,7 @@ keywords = ["extension", "template", "isaaclab"]
 # NOTE: Add additional dependencies here
 
 [[python.module]]
-name = "quadruped_locomotion"
+name = "quadruped_go2_locomotion"
 
 [isaaclab_settings]
 # TODO: Uncomment and list any apt dependencies here.

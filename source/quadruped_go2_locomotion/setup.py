@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Installation script for the 'quadruped_locomotion' python package."""
+"""Installation script for the 'quadruped_go2_locomotion' python package."""
 
 import os
 
@@ -23,8 +23,8 @@ INSTALL_REQUIRES = [
 
 # Installation operation
 setup(
-    name="quadruped_locomotion",
-    packages=["quadruped_locomotion"],
+    name="quadruped_go2_locomotion",
+    packages=["quadruped_go2_locomotion"],
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],
