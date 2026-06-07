@@ -29,7 +29,6 @@ class LowLevelPolicyWrapper:
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
-from dataclasses import MISSING  # TODO: look into this
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
@@ -46,7 +45,7 @@ from isaaclab.scene import InteractiveSceneCfg
 
 # my libs
 from isaaclab.envs import ViewerCfg
-from isaaclab.sensors import ContactSensorCfg, TiledCameraCfg, RayCasterCfg, patterns
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
@@ -129,8 +128,13 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = UNITREE_GO2WITHARM_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # sensors
+    # Go2 contact sensor (monitors legs + feet)
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
+    )
+    # Open Manipulator X contact sensor
+    contact_forces_arm = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/open_manipulator_x_static/.*", history_length=3, track_air_time=True
     )
 
     """     depth_camera = TiledCameraCfg(
@@ -180,6 +184,7 @@ class CommandsCfg:
             heading=(-math.pi, math.pi),
             ang_pos_x=(-0.3, 0.3),
             ang_pos_y=(-0.6, 0.6),
+            lin_pos_z=(0.2, 0.4),
         ),
     )
 
@@ -241,7 +246,7 @@ class EventCfg:
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.2, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (-0.5, 0.5),
                 "y": (-0.3, 0.3),
@@ -269,7 +274,7 @@ class RewardsCfg:
     # -- task
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp,
-        weight=1.0,
+        weight=10.0,
         params={
             "command_name": "base_velocity",
             "std": math.sqrt(0.25),
@@ -300,7 +305,16 @@ class RewardsCfg:
         func=mdp.undesired_contacts,
         weight=-1.0,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*calf"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*calf", "Head_lower", "Head_upper"]),
+            "threshold": 1.0,
+        },
+    )
+    # Undesired contacts on Open Manipulator X links
+    undesired_contacts_arm = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces_arm", body_names=["link1", "link2", "link3", "link4", "link5", "gripper_left_link", "gripper_right_link"]),
             "threshold": 1.0,
         },
     )
@@ -309,7 +323,6 @@ class RewardsCfg:
         func=mdp.base_height_l2_pitch,
         weight=-1.65,
         params={
-            "target_height": 0.4,
             "command_name": "base_velocity",
             "pitch_sensitivity": -0.5,
             "lean_sensitivity": 0.05,
@@ -368,7 +381,15 @@ class TerminationsCfg:
     body_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["base", "Head_lower", "Head_upper"]),
+            "threshold": 1.0,
+        },
+    )
+    # Illegal contact on Open Manipulator X links
+    body_contact_arm = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces_arm", body_names=["link1", "link2", "link3", "link4", "link5", "gripper_left_link", "gripper_right_link"]),
             "threshold": 1.0,
         },
     )
