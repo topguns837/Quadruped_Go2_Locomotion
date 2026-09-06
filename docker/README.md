@@ -30,14 +30,37 @@ rebuild. Only restarting the container does.
   don't need to run it yourself. It only whitelists local Docker containers,
   not the whole network, and (like any `xhost` grant) only lasts for the
   current host X session, hence it's redone on every start rather than once.
+- A native GUI window (no `--headless`, no `--livestream`) needs three things
+  together in `docker-compose.yml`, and reproducibly failed with any one
+  missing (`vkCreateSwapchainKHR failed` / `advanceCurrentFrame: backbuffers
+  are not initialized!`, reproduced independently with `vkcube`, a minimal
+  reference Vulkan app, so this isn't Isaac-Sim-specific):
+  - the host's `/dev/dri` device, for Vulkan/X11 buffer sharing
+  - the host's `Xauthority` file (`XAUTHORITY` must be set on the host; GDM
+    sessions set it under `/run/user/<uid>/gdm/Xauthority`, not the
+    traditional `~/.Xauthority`) — `xhost` alone isn't enough
+  - NVIDIA Container Toolkit's `display` capability, which is separate from
+    `graphics` (that one only makes the OpenGL/Vulkan libraries available,
+    not X11 output access)
 
 ### The go2withArm USD asset
 
 `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXStatic.usda`
-is `.gitignore`d and is **not** in this repo. It must already exist at that
-path on your host before you start the container (it's picked up
-automatically by the bind mount). If it's missing, the env will fail to spawn
-the robot.
+is `.gitignore`d and is **not** in this repo (composed USD files like this are
+regenerated, not versioned). Generate it once per machine by running, inside
+the container:
+```bash
+isaaclab -p scripts/compose_go2_with_arm.py
+```
+This composes the standard Go2 (fetched from Nucleus) with the bundled
+OpenManipulator-X asset, mounted on top of the Go2's `base` body (a sibling
+in the USD hierarchy, not nested inside it — Isaac Lab's own contact-sensor
+activation never recurses past a rigid body, so nesting under the rigid
+`base` would make the arm's contact sensor unable to find any bodies) and
+rigidly attached via a fixed joint, with collision filtering between the arm
+and `base` to prevent self-collision at the mount point. It's picked up
+automatically by the bind mount once generated. If it's missing, the env
+will fail to spawn the robot.
 
 ## 2. Build the image
 

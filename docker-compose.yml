@@ -29,6 +29,9 @@ services:
       - DISPLAY=${DISPLAY}
       - TERM
       - QT_X11_NO_MITSHM=1
+      # See the XAUTHORITY volume mount below for why this is needed
+      # alongside DISPLAY for a native GUI window to actually render.
+      - XAUTHORITY=/root/.Xauthority
     volumes:
       # Everything project-specific is mounted, never baked into the image:
       # source code, scripts, USD/USDA assets, and training logs/checkpoints
@@ -37,6 +40,16 @@ services:
       # X11 passthrough for the Isaac Sim GUI (run `xhost +local:docker` on
       # the host first, see docker/README.md)
       - /tmp/.X11-unix:/tmp/.X11-unix
+      # `xhost +local:docker` alone is enough for basic X11 protocol access,
+      # but not for Vulkan to actually present to a window: without the
+      # host's own auth cookie, swapchain creation failed with
+      # `vkCreateSwapchainKHR failed` / `advanceCurrentFrame: backbuffers are
+      # not initialized!` even with /dev/dri passed through (confirmed
+      # directly: neither fix alone was sufficient, only both together).
+      # Requires XAUTHORITY to be set on the host (true for both X11 and
+      # XWayland desktop sessions; GDM in particular sets it under
+      # /run/user/<uid>/gdm/Xauthority, not the traditional ~/.Xauthority).
+      - ${XAUTHORITY}:/root/.Xauthority:ro
       - /etc/localtime:/etc/localtime:ro
       # Isaac Sim caches, persisted across container restarts so shaders/assets
       # aren't recompiled or re-downloaded every run
@@ -48,6 +61,18 @@ services:
       - isaac-logs:/root/.nvidia-omniverse/logs
       - isaac-data:/root/.local/share/ov/data
     network_mode: host
+    devices:
+      # NVIDIA's compute-oriented devices (/dev/nvidia0, nvidiactl, etc, from
+      # the `deploy.resources` GPU reservation below) are enough for physics
+      # and rendering compute, but a native GUI window additionally needs the
+      # DRM/KMS device for Vulkan to negotiate buffer sharing with the host's
+      # X server when presenting to a window. Without it, every native-window
+      # run failed identically (confirmed directly with vkcube, a minimal
+      # reference Vulkan app, independent of Isaac Sim: swapchain creation
+      # crashed with `demo_prepare_buffers: Assertion '!err' failed` and Isaac
+      # Sim logged `vkCreateSwapchainKHR failed` / `advanceCurrentFrame:
+      # backbuffers are not initialized!`; passing this device fixed both).
+      - /dev/dri:/dev/dri
     deploy:
       resources:
         reservations:
@@ -59,7 +84,18 @@ services:
               # frames to a connected client (observed directly: rendering
               # and physics ran fine, but nvstPushStreamData failed and
               # nvidia-smi showed 0 active encoder sessions the whole time).
-              capabilities: [gpu, video, graphics, compute, utility]
+              # "graphics" alone is also not enough for a native GUI window:
+              # it only makes the OpenGL/Vulkan/EGL libraries available, not
+              # X11/GLX output access, which is what NVIDIA Container
+              # Toolkit's separate "display" capability governs. Without it,
+              # this exact list (missing only "display") reproduced the same
+              # swapchain failure as the plain compute-only default, while a
+              # bare `--gpus all` (which falls back to this image's baked-in
+              # NVIDIA_DRIVER_CAPABILITIES=all, so implicitly includes
+              # "display") worked. Confirmed directly: adding "display" here
+              # was the one remaining change needed for vkcube (and then
+              # Isaac Sim) to render into a native window.
+              capabilities: [gpu, video, graphics, compute, utility, display]
     stdin_open: true
     tty: true
 
