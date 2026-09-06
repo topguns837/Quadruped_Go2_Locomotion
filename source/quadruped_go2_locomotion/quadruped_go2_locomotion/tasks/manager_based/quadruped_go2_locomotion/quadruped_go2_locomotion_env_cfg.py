@@ -132,9 +132,15 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
     )
-    # Open Manipulator X contact sensor
+    # Open Manipulator X contact sensor. Path matches how
+    # scripts/compose_go2_with_arm.py places the manipulator reference: as a
+    # sibling of base (not nested under it) named "OpenManipulatorX", fixed
+    # to base purely via a joint rather than USD parenting. See that script
+    # for why (Isaac Lab's activate_contact_sensors never recurses past a
+    # rigid body, so nesting under the rigid base body would leave it
+    # permanently unreachable).
     contact_forces_arm = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/open_manipulator_x_static/.*", history_length=3, track_air_time=True
+        prim_path="{ENV_REGEX_NS}/Robot/OpenManipulatorX/.*", history_length=3, track_air_time=True
     )
 
     """     depth_camera = TiledCameraCfg(
