@@ -47,6 +47,15 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.target_pitch = torch.zeros(self.num_envs, device=self.device)
         self.target_lean  = torch.zeros(self.num_envs, device=self.device)
         self.target_lin_pos_z = torch.zeros(self.num_envs, device=self.device)
+        # Commanded-value metrics: logged/printed the same way as the
+        # inherited error_vel_xy/error_vel_yaw metrics (Metrics/base_velocity/*
+        # in the RSL-RL console table and TensorBoard), so the raw command
+        # vector is visible alongside reward/error during training.
+        self.metrics["cmd_lin_vel_x"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["cmd_lin_vel_y"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["cmd_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["cmd_pitch"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["cmd_lean"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -94,6 +103,17 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.target_pitch[standing_env_ids] = 0.0
         self.target_lean[standing_env_ids] = 0.0
         self.target_lin_pos_z[standing_env_ids] = 0.0
+
+    def _update_metrics(self):
+        """Extends the base tracking-error metrics with the raw commanded values themselves."""
+        super()._update_metrics()
+        max_command_time = self.cfg.resampling_time_range[1]
+        max_command_step = max_command_time / self._env.step_dt
+        self.metrics["cmd_lin_vel_x"] += self.vel_command_b[:, 0] / max_command_step
+        self.metrics["cmd_lin_vel_y"] += self.vel_command_b[:, 1] / max_command_step
+        self.metrics["cmd_ang_vel_z"] += self.vel_command_b[:, 2] / max_command_step
+        self.metrics["cmd_pitch"] += self.vel_command_b[:, 3] / max_command_step
+        self.metrics["cmd_lean"] += self.vel_command_b[:, 4] / max_command_step
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         super()._set_debug_vis_impl(debug_vis)
