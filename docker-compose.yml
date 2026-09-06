@@ -1,0 +1,73 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# See docker/README.md for setup (NGC login, EULA, X11) and usage.
+#
+# Interactive work goes through ./start.sh, not `docker compose run`/`up`
+# directly: the helper scripts under docker/ always kill and recreate this
+# container before opening a shell, so there is only ever one project
+# container at a time. `command: sleep infinity` below just keeps a freshly
+# started container alive long enough for `docker exec` to attach into it.
+
+services:
+  quadruped-go2:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+      target: app
+      args:
+        ISAACSIM_VERSION: ${ISAACSIM_VERSION:-5.1.0}
+        ISAACLAB_VERSION: ${ISAACLAB_VERSION:-v2.3.2}
+    image: quadruped_go2_locomotion:latest
+    container_name: quadruped_go2_locomotion
+    command: ["sleep", "infinity"]
+    environment:
+      - ACCEPT_EULA=Y
+      - OMNI_KIT_ALLOW_ROOT=1
+      - DISPLAY=${DISPLAY}
+      - TERM
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      # Everything project-specific is mounted, never baked into the image:
+      # source code, scripts, USD/USDA assets, and training logs/checkpoints
+      # all live on the host and are picked up immediately, no rebuild needed.
+      - .:/workspace/quadruped_go2_locomotion
+      # X11 passthrough for the Isaac Sim GUI (run `xhost +local:docker` on
+      # the host first, see docker/README.md)
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /etc/localtime:/etc/localtime:ro
+      # Isaac Sim caches, persisted across container restarts so shaders/assets
+      # aren't recompiled or re-downloaded every run
+      - isaac-cache-kit:/isaac-sim/kit/cache
+      - isaac-cache-ov:/root/.cache/ov
+      - isaac-cache-pip:/root/.cache/pip
+      - isaac-cache-gl:/root/.cache/nvidia/GLCache
+      - isaac-cache-compute:/root/.nv/ComputeCache
+      - isaac-logs:/root/.nvidia-omniverse/logs
+      - isaac-data:/root/.local/share/ov/data
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              # "gpu" alone doesn't include NVENC/NVDEC hardware video
+              # encoding, which the WebRTC livestream needs to actually push
+              # frames to a connected client (observed directly: rendering
+              # and physics ran fine, but nvstPushStreamData failed and
+              # nvidia-smi showed 0 active encoder sessions the whole time).
+              capabilities: [gpu, video, graphics, compute, utility]
+    stdin_open: true
+    tty: true
+
+volumes:
+  isaac-cache-kit:
+  isaac-cache-ov:
+  isaac-cache-pip:
+  isaac-cache-gl:
+  isaac-cache-compute:
+  isaac-logs:
+  isaac-data:

@@ -90,6 +90,16 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
 """Configuration of Unitree Go2 with addition of static Open Manipulator Mounted using DC-Motor actuator model."""
 ```
 
+## Docker
+
+As an alternative to a bare-metal Isaac Sim/Isaac Lab install, run
+`./startScript.sh` for a menu-driven Docker workflow (build the image, open
+an Isaac Lab shell, or an empty debugging shell; see
+[docker/README.md](docker/README.md) for setup and details). The image only
+bundles Isaac Sim + Isaac Lab; this repo (source, scripts, assets, `logs/`)
+is bind-mounted at runtime, so editing project code never requires a
+rebuild.
+
 ## Quick Start
 
 ### List available environments
