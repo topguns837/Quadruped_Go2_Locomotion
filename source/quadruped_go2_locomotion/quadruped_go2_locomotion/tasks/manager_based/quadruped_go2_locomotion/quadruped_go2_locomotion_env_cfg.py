@@ -465,6 +465,15 @@ class QuadrupedLocomotionEnvCfg_PLAY(QuadrupedLocomotionEnvCfg):
         # terrain curriculum
         self.curriculum.terrain_levels = None
 
+        # NOTE: origin_type="asset_root" subscribes to a per-frame render
+        # callback that continuously re-reads the robot's live pose
+        # (isaaclab/envs/ui/viewport_camera_controller.py). On at least one
+        # low-VRAM laptop this caused full-laptop hangs; origin_type="env"
+        # (static, computed once) is a safe substitute with the same close
+        # framing. Rather than hardcode that workaround here for everyone,
+        # docker/isaaclab-shell.sh applies it via a Hydra CLI override
+        # (env.viewer.origin_type=env) only when it detects weak GPU
+        # hardware, so capable machines keep this original camera.
         # set the view to be closer
         self.viewer = ViewerCfg(
             eye=(2.0, 2.0, 1.0),

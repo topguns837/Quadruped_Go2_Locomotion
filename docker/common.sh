@@ -12,6 +12,28 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_NAME=quadruped-go2
 CONTAINER_NAME=quadruped_go2_locomotion
 
+# GPU VRAM (MiB) below which we treat this as a constrained machine and apply
+# laptop-style workarounds (small num_envs, lighter rendering, a smaller
+# terrain grid, a hang-safe play camera). Comfortably above this laptop's
+# 6144 MiB; adjust if a new constrained machine needs a different cutoff.
+WEAK_GPU_VRAM_THRESHOLD_MIB=8192
+
+# True (exit 0) if the first GPU's total VRAM is below the threshold above,
+# or if nvidia-smi isn't available at all, in which case we don't know this
+# machine's capability and default to the safe/constrained assumption rather
+# than assuming it can handle the full settings.
+is_weak_gpu() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        return 0
+    fi
+    local vram_mib
+    vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1)
+    if [ -z "${vram_mib}" ]; then
+        return 0
+    fi
+    [ "${vram_mib}" -lt "${WEAK_GPU_VRAM_THRESHOLD_MIB}" ]
+}
+
 # Ensures exactly one fresh container is running for this project: tears down
 # whatever is currently there (if anything) and starts a brand new one. This
 # means an in-progress process inside a previous container is lost. That's
