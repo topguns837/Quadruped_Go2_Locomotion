@@ -1,0 +1,49 @@
+#usda 1.0
+(
+    defaultPrim = "go2_description"
+)
+
+def Xform "go2_description" (
+    prepend references = @https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/IsaacLab/Robots/Unitree/Go2/go2.usd@
+)
+{
+    def Xform "OpenManipulatorX" (
+        prepend references = @../openManipulator/open_manipulator_x_static.usda@
+    )
+    {
+        quatd xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:translate = (0, 0, 0.109)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+        over "root_joint" (
+            active = false
+        )
+        {
+        }
+    }
+
+    def PhysicsFixedJoint "ArmMountJoint"
+    {
+        rel physics:body0 = </go2_description/base>
+        rel physics:body1 = </go2_description/OpenManipulatorX/world>
+        point3f physics:localPos0 = (0, 0, 0.02)
+        point3f physics:localPos1 = (0, 0, 0)
+    }
+
+    over "base" (
+        prepend apiSchemas = ["PhysicsFilteredPairsAPI"]
+    )
+    {
+        rel physics:filteredPairs = [
+            </go2_description/OpenManipulatorX/world>,
+            </go2_description/OpenManipulatorX/link1>,
+            </go2_description/OpenManipulatorX/link2>,
+            </go2_description/OpenManipulatorX/link3>,
+            </go2_description/OpenManipulatorX/link4>,
+            </go2_description/OpenManipulatorX/link5>,
+            </go2_description/OpenManipulatorX/gripper_left_link>,
+            </go2_description/OpenManipulatorX/gripper_right_link>,
+        ]
+    }
+}
+
