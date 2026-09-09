@@ -97,6 +97,21 @@ that step to keep `pkg_resources` available. If a future Isaac Lab version
 bump reintroduces a similar legacy-sdist dependency, this is the mechanism to
 reach for again.
 
+That constraint alone isn't sufficient, though: `pip` itself is also pinned
+(`pip<25`, installed as `pip==24.2`) in the same file. A newer pip (verified
+directly: 26.2.1) does not apply `PIP_CONSTRAINT` inside the isolated build
+environment it creates for `flatdict`'s legacy `setup.py`, so that isolated
+env pulls an unconstrained fresh `setuptools>=81` regardless of the pin
+above, reproducing the identical `pkg_resources` failure one layer deeper.
+Pinning `pip` itself also happens to double as the fix for a second, unrelated
+failure: letting `isaaclab.sh --install` upgrade pip live (its own internal
+pip calls attempt this) can corrupt pip's vendored submodules mid-write on
+Docker's OverlayFS (observed: `ModuleNotFoundError: No module named
+'pip._vendor.packaging._structures'`). Don't remove the `pip` pin, or bump it,
+without re-verifying `flatdict` still builds — see the Dockerfile comment
+above `RUN echo "setuptools<81" > /etc/pip-constraints.txt` for the full
+story.
+
 ## 3. Run
 
 From the repo root:

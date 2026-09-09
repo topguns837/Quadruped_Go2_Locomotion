@@ -13,7 +13,13 @@ EXTENSION_PATH="${PROJECT_PATH}/source/quadruped_go2_locomotion"
 READY_MARKER=/tmp/.entrypoint_ready
 
 if [ -f "${EXTENSION_PATH}/pyproject.toml" ]; then
-    "${ISAACLAB_PATH}/isaaclab.sh" -p -m pip install -q -e "${EXTENSION_PATH}"
+    # --no-build-isolation: the image already has this project's build-backend
+    # requirements (setuptools, wheel, toml — see the extension's
+    # pyproject.toml and the `pip install toml wheel` step in Dockerfile).
+    # Without this flag, pip builds a fresh isolated env and re-fetches those
+    # from PyPI on every container start, turning an otherwise instant
+    # editable install into a multi-minute network-dependent one.
+    "${ISAACLAB_PATH}/isaaclab.sh" -p -m pip install -q --no-build-isolation -e "${EXTENSION_PATH}"
 else
     echo "WARNING: ${EXTENSION_PATH} not found. Is the repo mounted at ${PROJECT_PATH}?" >&2
 fi
