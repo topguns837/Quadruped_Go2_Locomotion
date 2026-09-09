@@ -13,6 +13,8 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import wrap_to_pi
 
+from . import diagnostics
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -47,7 +49,9 @@ def track_pitch_exp(
     current_lean, current_pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
     # compute the exponential reward
     pitch_error = torch.square(target_pitch - current_pitch)
-    return torch.exp(-pitch_error / std**2)
+    reward = torch.exp(-pitch_error / std**2)
+    diagnostics.log_step(env, "reward.track_pitch_exp", reward)
+    return reward
 
 
 def track_lean_exp(
@@ -70,7 +74,9 @@ def track_lean_exp(
     current_lean, current_pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
     # compute the exponential reward
     lean_error = torch.square(target_lean - current_lean)
-    return torch.exp(-lean_error / std**2)
+    reward = torch.exp(-lean_error / std**2)
+    diagnostics.log_step(env, "reward.track_lean_exp", reward)
+    return reward
 
 
 def base_height_l2_pitch(
@@ -105,7 +111,9 @@ def base_height_l2_pitch(
     # Compute adaptive target height: commanded height + offset from commanded angles
     adaptive_target = cmd_height + pitch_sensitivity * torch.abs(cmd_pitch) + lean_sensitivity * torch.abs(cmd_lean)
     # L2 penalty from adaptive target
-    return torch.square(asset.data.root_pos_w[:, 2] - adaptive_target)
+    penalty = torch.square(asset.data.root_pos_w[:, 2] - adaptive_target)
+    diagnostics.log_step(env, "reward.base_height_l2_pitch", penalty)
+    return penalty
 
 
 def foot_sliding_exp(
@@ -230,7 +238,9 @@ def foot_sliding_exp(
     # Set non-contacted feet penalty to 0 (no penalty during swing phase)
     penalty_per_foot = torch.where(contacted_per_foot, penalty_per_foot, torch.zeros_like(penalty_per_foot))
 
-    return torch.mean(penalty_per_foot, dim=1)
+    penalty = torch.mean(penalty_per_foot, dim=1)
+    diagnostics.log_step(env, "reward.foot_sliding_exp", penalty)
+    return penalty
 
 
 def foot_lift_exp(
@@ -312,8 +322,10 @@ def foot_lift_exp(
     # --- height-based reward ---
     # height_above: positive when foot is above min_height
     height_above = foot_heights_w - min_height  # (N, n_feet)
-    reward_per_foot = torch.exp(-height_above / std)  # (N, n_feet), range (0, 1]
-    # reward is 1 when height = min_height, decreases as height drops below
+    # exponent clamped to <=0: reward saturates at 1 at/above min_height instead of growing past it, and
+    # decays toward 0 (never overflows to inf) the further a foot drags below it, however far that is.
+    reward_per_foot = torch.exp(torch.clamp(height_above, max=0.0) / std)  # (N, n_feet), range (0, 1]
+    diagnostics.log_step(env, "reward.foot_lift_exp", reward_per_foot)
 
     # Non-contacted feet (swing phase): reward based on height above threshold
     # Contacted feet (stance phase): reward = 1 (neutral)
@@ -358,4 +370,6 @@ def hip_crossing_l2(
     asset: Articulation = env.scene[asset_cfg.name]
     hip_angles = asset.data.joint_pos[:, joint_ids]
     penalty = torch.clamp(torch.abs(hip_angles) - threshold, min=0.0)
-    return torch.sum(torch.square(penalty), dim=1)
+    penalty = torch.sum(torch.square(penalty), dim=1)
+    diagnostics.log_step(env, "reward.hip_crossing_l2", penalty)
+    return penalty
