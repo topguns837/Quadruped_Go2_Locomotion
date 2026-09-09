@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
@@ -17,7 +18,7 @@ from typing import ClassVar
 import sys
 import isaaclab.utils.math as math_utils
 from isaaclab.markers import VisualizationMarkersCfg
-from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG
+from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG, RED_ARROW_X_MARKER_CFG
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils import configclass
 
@@ -56,6 +57,11 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_pitch"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_lean"] = torch.zeros(self.num_envs, device=self.device)
+        # Achieved-velocity metrics: lets a viewer plot commanded vs. actual on the same chart
+        # instead of only seeing the tracking-error magnitude (error_vel_xy/error_vel_yaw).
+        self.metrics["actual_lin_vel_x"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_lin_vel_y"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -114,6 +120,10 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] += self.vel_command_b[:, 2] / max_command_step
         self.metrics["cmd_pitch"] += self.vel_command_b[:, 3] / max_command_step
         self.metrics["cmd_lean"] += self.vel_command_b[:, 4] / max_command_step
+        # Achieved velocity, same base frame as vel_command_b, so directly comparable to the cmd_* values.
+        self.metrics["actual_lin_vel_x"] += self.robot.data.root_lin_vel_b[:, 0] / max_command_step
+        self.metrics["actual_lin_vel_y"] += self.robot.data.root_lin_vel_b[:, 1] / max_command_step
+        self.metrics["actual_ang_vel_z"] += self.robot.data.root_ang_vel_b[:, 2] / max_command_step
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         super()._set_debug_vis_impl(debug_vis)
@@ -125,6 +135,11 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
     def _debug_vis_callback(self, event):
         if not self.robot.is_initialized:
             return
+        # This override previously shadowed the base class's own _debug_vis_callback entirely, which is
+        # what updates the inherited velocity_goal/velocity_current arrows every frame -- without this,
+        # those two markers were only ever posed once at construction (frozen), never following the robot
+        # or the live command afterward.
+        super()._debug_vis_callback(event)
         self._set_debug_vis_impl(True)
         if self.cfg.ranges.ang_pos_y is None:
             return
@@ -188,10 +203,41 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
 
     ranges: Ranges = Ranges()  # type: ignore
 
-    pitch_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
+    pitch_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
         prim_path="/Visuals/Command/pitch_goal"
     )
     """The configuration for the pitch command visualization marker."""
+    # .replace() is a plain shallow dataclasses.replace() (confirmed in isaaclab.utils.configclass) -- it
+    # does NOT copy the nested `markers` dict, so without this deepcopy, mutating .scale below would
+    # mutate the same "arrow" marker object shared by RED_ARROW_X_MARKER_CFG itself and every other
+    # config anywhere that also does RED_ARROW_X_MARKER_CFG.replace(...), rather than just this one
+    # visualizer.
+    pitch_visualizer_cfg.markers = {"arrow": copy.deepcopy(pitch_visualizer_cfg.markers["arrow"])}
+    # Was (1.0, 1.0, 1.0) -- reported 2-3x too big relative to the robot once actually visible in the
+    # viewport (the earlier fix was for the arrows never updating at all, not their size). Shrunk by ~2.5x.
+    # _debug_vis_callback multiplies this base scale by the pitch magnitude every frame, so this stays
+    # consistent at every pitch value, not just one snapshot. Colored red (was green, same as the velocity
+    # arrows) so it's visually distinct from the commanded/current velocity arrows.
+    pitch_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+
+    goal_vel_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/velocity_goal"
+    )
+    """The configuration for the goal velocity visualization marker."""
+    goal_vel_visualizer_cfg.markers = {"arrow": copy.deepcopy(goal_vel_visualizer_cfg.markers["arrow"])}
+    # Base class default is (0.5, 0.5, 0.5) (isaaclab's UniformVelocityCommandCfg); halved again here per
+    # explicit request to shrink the commanded/current velocity arrows by half from their current size.
+    goal_vel_visualizer_cfg.markers["arrow"].scale = (0.2, 0.2, 0.2)
+
+    current_vel_visualizer_cfg: VisualizationMarkersCfg = BLUE_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/velocity_current"
+    )
+    """The configuration for the current velocity visualization marker."""
+    # Overridden here (base class leaves this at its own default of BLUE_ARROW_X_MARKER_CFG, scale
+    # (0.5, 0.5, 0.5)) purely to halve its size to match goal_vel_visualizer_cfg above -- same deepcopy
+    # requirement as the other two visualizers, to avoid mutating the shared BLUE_ARROW_X_MARKER_CFG.
+    current_vel_visualizer_cfg.markers = {"arrow": copy.deepcopy(current_vel_visualizer_cfg.markers["arrow"])}
+    current_vel_visualizer_cfg.markers["arrow"].scale = (0.25, 0.25, 0.25)
 
 
 def get_pitch_command(env, command_name: str) -> torch.Tensor:

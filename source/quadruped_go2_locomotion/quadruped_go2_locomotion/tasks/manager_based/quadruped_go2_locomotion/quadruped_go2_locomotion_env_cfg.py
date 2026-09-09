@@ -79,8 +79,8 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
         terrain_generator=TerrainGeneratorCfg(
             size=(8.0, 8.0),
             border_width=20.0,
-            num_rows=9,
-            num_cols=21,
+            num_rows=32,
+            num_cols=32,
             horizontal_scale=0.1,
             vertical_scale=0.005,
             slope_threshold=0.75,
@@ -211,16 +211,36 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        # func=mdp.logged_* wraps the underlying isaaclab.envs.mdp function to log a per-step
+        # min/max/mean/finite summary for every term to this session's step_diagnostics.log (see
+        # mdp/diagnostics.py), without changing the term's value. clip on the velocity terms bounds a
+        # runaway inf/huge-finite physics-solver spike (doesn't catch true NaN, see diagnostics.py's
+        # finite-check for that).
+        base_lin_vel = ObsTerm(
+            func=mdp.logged_base_lin_vel,
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+            clip=(-50.0, 50.0),
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.logged_base_ang_vel,
+            noise=Unoise(n_min=-0.2, n_max=0.2),
+            clip=(-50.0, 50.0),
+        )
         projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
+            func=mdp.logged_projected_gravity,
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
-        actions = ObsTerm(func=mdp.last_action)
+        velocity_commands = ObsTerm(
+            func=mdp.logged_generated_commands,
+            params={"command_name": "base_velocity"},
+        )
+        joint_pos = ObsTerm(func=mdp.logged_joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(
+            func=mdp.logged_joint_vel_rel,
+            noise=Unoise(n_min=-1.5, n_max=1.5),
+            clip=(-50.0, 50.0),
+        )
+        actions = ObsTerm(func=mdp.logged_last_action)
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -399,6 +419,9 @@ class TerminationsCfg:
             "threshold": 1.0,
         },
     )
+    # Safety net for non-finite (NaN/Inf) root/joint state from a rare physics-solver edge case,
+    # independent of body_contact's base/head-only scope. See mdp/terminations.py.
+    invalid_state = DoneTerm(func=mdp.invalid_state)
 
 
 @configclass

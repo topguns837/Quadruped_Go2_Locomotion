@@ -27,3 +27,17 @@ from .rewards import (
     foot_sliding_exp,
     foot_lift_exp,  # noqa: F401
 )
+
+# Safety-net termination for non-finite (NaN/Inf) simulation state
+from .terminations import invalid_state  # noqa: F401
+
+# Per-step diagnostic file logging (see mdp/diagnostics.py)
+from .diagnostics import (
+    logged_base_lin_vel,
+    logged_base_ang_vel,
+    logged_projected_gravity,
+    logged_joint_pos_rel,
+    logged_joint_vel_rel,
+    logged_last_action,
+    logged_generated_commands,  # noqa: F401
+)

@@ -68,7 +68,7 @@ over "open_manipulator_x"
     )
     {
         float3 physics:diagonalInertia = (0.0001, 0.0001, 0.0001)
-        float physics:mass = 0
+        float physics:mass = 0.01
 
         def Xform "collisions"
         {

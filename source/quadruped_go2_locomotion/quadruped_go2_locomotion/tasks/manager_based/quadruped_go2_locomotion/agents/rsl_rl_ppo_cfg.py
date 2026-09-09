@@ -14,7 +14,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 10000
     save_interval = 500
     experiment_name = "go2_with_pitch_lean_and_height_control_ppo"
-    empirical_normalization = False
+    empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         noise_std_type="log",
@@ -27,7 +27,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=0.5,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.0075, #NOTE 0.00275 is stable value  # increased from 0.00275 to 0.0075 to encourage more exploration
+        entropy_coef=0.0075, #NOTE 0.00275 is stable value
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,
