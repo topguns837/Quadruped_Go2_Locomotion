@@ -34,17 +34,8 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 # (panel title, [(tag, line label), ...]) -- one subplot per entry, one line per tag.
 PANELS = [
     ("Mean reward", [("Train/mean_reward", "reward")]),
-    ("Episode terminations", [
-        ("Episode_Termination/invalid_state", "invalid_state"),
-        ("Episode_Termination/body_contact", "body_contact"),
-        ("Episode_Termination/time_out", "time_out"),
-    ]),
     ("Mean episode length", [("Train/mean_episode_length", "length")]),
     ("Mean action noise std", [("Policy/mean_noise_std", "std")]),
-    ("PPO losses", [
-        ("Loss/value_function", "value_function"),
-        ("Loss/surrogate", "surrogate"),
-    ]),
     ("Linear vel x: commanded vs actual", [
         ("Metrics/base_velocity/cmd_lin_vel_x", "commanded"),
         ("Metrics/base_velocity/actual_lin_vel_x", "actual"),
@@ -56,6 +47,18 @@ PANELS = [
     ("Angular vel z: commanded vs actual", [
         ("Metrics/base_velocity/cmd_ang_vel_z", "commanded"),
         ("Metrics/base_velocity/actual_ang_vel_z", "actual"),
+    ]),
+    ("Pitch: commanded vs actual", [
+        ("Metrics/base_velocity/cmd_pitch", "commanded"),
+        ("Metrics/base_velocity/actual_pitch", "actual"),
+    ]),
+    ("Lean: commanded vs actual", [
+        ("Metrics/base_velocity/cmd_lean", "commanded"),
+        ("Metrics/base_velocity/actual_lean", "actual"),
+    ]),
+    ("Height: commanded vs actual", [
+        ("Metrics/base_velocity/cmd_height", "commanded"),
+        ("Metrics/base_velocity/actual_height", "actual"),
     ]),
     ("Velocity tracking error", [
         ("Metrics/base_velocity/error_vel_xy", "error_vel_xy"),
@@ -92,7 +95,7 @@ class LiveDashboard:
         # spread across the whole run.
         self.accumulator = EventAccumulator(logdir, size_guidance={"scalars": 0})
 
-        self.fig, axes = plt.subplots(3, 3, figsize=(16, 10))
+        self.fig, axes = plt.subplots(4, 3, figsize=(16, 13))
         self.fig.canvas.manager.set_window_title(f"Live training dashboard -- {logdir}")
         self.axes = axes.flatten()
         self.lines: dict[str, dict[str, plt.Line2D]] = {}

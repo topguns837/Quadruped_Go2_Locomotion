@@ -14,6 +14,12 @@
 **/*.usdc
 **/*.usdz
 
+# Deliberate exception: the combined Go2 + Open Manipulator X asset (with the corrected arm mounting
+# position) has no other distribution mechanism today -- unlike most USD assets here, it's not pulled from
+# Nucleus at runtime, so unitree_go2witharm_cfg.py can't load the robot at all without this file present.
+# Single-file exception, not a blanket unblock -- every other USD file in the repo stays ignored.
+!/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd
+
 # Python
 .DS_Store
 **/*.egg-info/

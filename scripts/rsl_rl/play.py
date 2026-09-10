@@ -34,6 +34,21 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--manual_commands",
+    action="store_true",
+    default=False,
+    help=(
+        "Set an exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command via a slider window "
+        "(auto-launched) instead of the policy's usual random commands, without closing the Isaac Sim window."
+    ),
+)
+parser.add_argument(
+    "--command_file",
+    type=str,
+    default="/tmp/manual_command.json",
+    help="Path the manual-command slider window and this script agree on (see --manual_commands).",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -53,7 +68,11 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import atexit
+import json
 import os
+import subprocess
+import threading
 import time
 
 import gymnasium as gym
@@ -78,6 +97,36 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import quadruped_go2_locomotion.tasks  # noqa: F401
+
+
+def _manual_command_file_poll_loop(cmd_term, path: str, poll_interval: float = 0.1):
+    """Polls `path` (written by scripts/manual_command_slider.py, a separate process) for changes and
+    applies them to cmd_term, without blocking the main thread's simulation/render loop.
+
+    Tolerates the file not existing yet (slider window hasn't started/written its first value yet) and
+    transient malformed reads (a torn read racing the slider's write, despite it writing atomically via
+    temp-file + os.replace) by simply retrying next poll -- never raises, never stops the loop.
+    """
+    last_mtime = None
+    while True:
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime != last_mtime:
+                with open(path) as f:
+                    data = json.load(f)
+                values = [
+                    data["lin_vel_x"],
+                    data["lin_vel_y"],
+                    data["ang_vel_z"],
+                    data["pitch"],
+                    data["lean"],
+                    data["height"],
+                ]
+                cmd_term.set_manual_command(values)
+                last_mtime = mtime
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+        time.sleep(poll_interval)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -171,6 +220,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+
+    if args_cli.manual_commands:
+        cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+        cmd_term.enable_manual_override()
+        threading.Thread(
+            target=_manual_command_file_poll_loop, args=(cmd_term, args_cli.command_file), daemon=True
+        ).start()
+        # Slider window is a separate process on the plain system python3 (never isaaclab -p) -- Isaac
+        # Sim's bundled Python has no tkinter. See docker/Dockerfile's note next to the python3-tk install.
+        # Absolute path, not just "python3": this container's own ~/.bashrc aliases the bare name to Isaac
+        # Sim's python for interactive shells (see docker/Dockerfile's `alias python3=...` line). subprocess
+        # bypasses shell aliases either way (no shell involved), but using the absolute path here keeps
+        # this call and the manual-relaunch instructions below consistent with each other.
+        scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        slider_script = os.path.join(scripts_dir, "manual_command_slider.py")
+        # subprocess.Popen inherits the full parent environment by default, including PYTHONPATH/
+        # LD_LIBRARY_PATH set by /isaac-sim/setup_python_env.sh to point at Isaac Sim's *own* Python 3.11
+        # stdlib/site-packages/libs. Left in place, the system python3 spawned below picks up that 3.11
+        # PYTHONPATH ahead of its own stdlib and crashes on a compiled-extension ABI mismatch
+        # ("AssertionError: SRE module mismatch", confirmed directly). Stripping these two vars lets it use
+        # its own, correct sys.path and shared libraries instead.
+        slider_env = os.environ.copy()
+        slider_env.pop("PYTHONPATH", None)
+        slider_env.pop("LD_LIBRARY_PATH", None)
+        slider_proc = subprocess.Popen(
+            ["/usr/bin/python3", slider_script, "--command_file", args_cli.command_file], env=slider_env
+        )
+        atexit.register(slider_proc.terminate)
+        print(f"[INFO] Manual command mode: slider window launched (writing to {args_cli.command_file}).")
 
     dt = env.unwrapped.step_dt
 

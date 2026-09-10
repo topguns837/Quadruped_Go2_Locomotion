@@ -57,11 +57,20 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_pitch"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_lean"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["cmd_height"] = torch.zeros(self.num_envs, device=self.device)
         # Achieved-velocity metrics: lets a viewer plot commanded vs. actual on the same chart
         # instead of only seeing the tracking-error magnitude (error_vel_xy/error_vel_yaw).
         self.metrics["actual_lin_vel_x"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["actual_lin_vel_y"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["actual_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_pitch"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_lean"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_height"] = torch.zeros(self.num_envs, device=self.device)
+        # Manual command override (see enable_manual_override/set_manual_command) -- used by play.py's
+        # --manual_commands mode to replace automatic resampling with an exact, user-typed command.
+        # Off by default: training and the existing random-command play mode are unaffected.
+        self.manual_override = False
+        self.manual_command = torch.zeros(6, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -97,8 +106,23 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
             self.target_lin_pos_z[env_ids] = 0.0
 
 
+    def enable_manual_override(self):
+        """Switch from automatic resampling to a fixed, externally-set command (see set_manual_command).
+
+        Used by play.py's --manual_commands mode. _resample_command may still fire on its usual timer, but
+        once manual_override is on, _update_command no longer reads anything it wrote, so it's harmless.
+        """
+        self.manual_override = True
+
+    def set_manual_command(self, values: list[float]):
+        """Set the exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command for every env."""
+        self.manual_command = torch.tensor(values, device=self.device, dtype=torch.float32)
+
     def _update_command(self):
         """Post-processes the velocity and pitch commands."""
+        if self.manual_override:
+            self.vel_command_b[:] = self.manual_command
+            return
         super()._update_command()
         # Copy pitch, lean, and height targets into the command buffer
         self.vel_command_b[:, 3] = self.target_pitch
@@ -120,10 +144,18 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] += self.vel_command_b[:, 2] / max_command_step
         self.metrics["cmd_pitch"] += self.vel_command_b[:, 3] / max_command_step
         self.metrics["cmd_lean"] += self.vel_command_b[:, 4] / max_command_step
+        self.metrics["cmd_height"] += self.vel_command_b[:, 5] / max_command_step
         # Achieved velocity, same base frame as vel_command_b, so directly comparable to the cmd_* values.
         self.metrics["actual_lin_vel_x"] += self.robot.data.root_lin_vel_b[:, 0] / max_command_step
         self.metrics["actual_lin_vel_y"] += self.robot.data.root_lin_vel_b[:, 1] / max_command_step
         self.metrics["actual_ang_vel_z"] += self.robot.data.root_ang_vel_b[:, 2] / max_command_step
+        self.metrics["actual_height"] += self.robot.data.root_pos_w[:, 2] / max_command_step
+        # Same pitch/lean extraction track_pitch_exp/track_lean_exp use in rewards.py -- euler_xyz_from_quat
+        # returns (lean, pitch, yaw); each call only keeps the component it needs.
+        _, current_pitch, _ = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)
+        current_lean, _, _ = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)
+        self.metrics["actual_pitch"] += current_pitch / max_command_step
+        self.metrics["actual_lean"] += current_lean / max_command_step
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         super()._set_debug_vis_impl(debug_vis)

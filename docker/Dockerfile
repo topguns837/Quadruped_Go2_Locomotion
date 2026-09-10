@@ -64,9 +64,16 @@ USER root
 # image's own system libraries (not a redistributable bundle), with `--reload <n>` to auto-refresh a
 # PNG file on an interval. Do not add a Python Qt/GTK binding back to "fix" the dashboard window; the
 # --output + feh combination is the working, deliberate solution.
+#
+# python3 + python3-tk: scripts/manual_command_slider.py's GUI (play.py's --manual_commands mode). Same
+# constraint as feh above -- Isaac Sim's bundled Python (isaaclab -p) has no tkinter, and this is a
+# *separate*, plain system Python installed specifically so that script can run outside that environment
+# entirely, rather than trying to add a GUI toolkit into Isaac Sim's Python (the same dead end feh's
+# comment already documents). python3-tk is the apt-packaged Tk binding, linked against this image's own
+# system X11 libs like feh is -- not a pip wheel, so it doesn't hit the XCB problem either.
 RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake dbus-x11 feh git libglib2.0-0 ncurses-term tmux wget zenity && \
+        build-essential cmake dbus-x11 feh git libglib2.0-0 ncurses-term python3 python3-tk tmux wget zenity && \
     apt -y autoremove && apt clean autoclean && rm -rf /var/lib/apt/lists/*
 
 # Fetch Isaac Lab pinned to the tag this project is compatible with
