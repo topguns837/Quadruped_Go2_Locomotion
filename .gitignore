@@ -66,6 +66,12 @@ _build
 **/*.pt
 **/*.pth
 
+# Curated trained models checked into the repo on purpose -- see models/README.md. Only the run's final
+# checkpoint + exported policy should actually be staged per run; intermediate model_N.pt checkpoints stay
+# untracked even here (that's a staging discipline, not enforced by a pattern -- there's no reliable way to
+# gitignore "everything except the highest N" by filename).
+!models/**/*.pt
+
 # Teleop Recorded Dataset
 /datasets/
 
