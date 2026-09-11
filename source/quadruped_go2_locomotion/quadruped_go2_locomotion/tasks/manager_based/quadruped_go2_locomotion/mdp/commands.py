@@ -160,9 +160,17 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
     def _set_debug_vis_impl(self, debug_vis: bool):
         super()._set_debug_vis_impl(debug_vis)
         if debug_vis and self.cfg.ranges.ang_pos_y is not None:
-            if not hasattr(self, "pitch_goal_visualizer"):
-                self.pitch_goal_visualizer = VisualizationMarkers(self.cfg.pitch_visualizer_cfg)
-            self.pitch_goal_visualizer.set_visibility(True)
+            if not hasattr(self, "cmd_pitch_visualizer"):
+                self.cmd_pitch_visualizer = VisualizationMarkers(self.cfg.cmd_pitch_visualizer_cfg)
+                self.actual_pitch_visualizer = VisualizationMarkers(self.cfg.actual_pitch_visualizer_cfg)
+            self.cmd_pitch_visualizer.set_visibility(True)
+            self.actual_pitch_visualizer.set_visibility(True)
+        if debug_vis and self.cfg.ranges.ang_pos_x is not None:
+            if not hasattr(self, "cmd_lean_visualizer"):
+                self.cmd_lean_visualizer = VisualizationMarkers(self.cfg.cmd_lean_visualizer_cfg)
+                self.actual_lean_visualizer = VisualizationMarkers(self.cfg.actual_lean_visualizer_cfg)
+            self.cmd_lean_visualizer.set_visibility(True)
+            self.actual_lean_visualizer.set_visibility(True)
 
     def _debug_vis_callback(self, event):
         if not self.robot.is_initialized:
@@ -173,22 +181,49 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         # or the live command afterward.
         super()._debug_vis_callback(event)
         self._set_debug_vis_impl(True)
-        if self.cfg.ranges.ang_pos_y is None:
-            return
-        # Visualize pitch targets
-        base_pos_w = self.robot.data.root_pos_w.clone()
-        base_pos_w[:, 2] += 0.3
-        pitch_rad = self.target_pitch
-        pitch_quat = math_utils.quat_from_euler_xyz(
-            torch.zeros_like(pitch_rad), pitch_rad, torch.zeros_like(pitch_rad)
-        )
-        scale = torch.tensor(
-            self.pitch_goal_visualizer.cfg.markers["arrow"].scale, device=self.device
-        ).repeat(len(pitch_rad), 1)
-        scale[:, 0] *= torch.abs(pitch_rad) * 2.0 + 0.05
-        scale[:, 1] *= torch.abs(pitch_rad) * 2.0 + 0.05
+
+        # Commanded values come from vel_command_b (the live active command), not target_pitch/target_lean
+        # -- in --manual_commands mode, _update_command's manual branch only ever writes vel_command_b, so
+        # target_pitch/target_lean stay frozen at whatever they were before manual override was enabled.
+        # Reading vel_command_b here keeps these arrows correct in both auto and manual modes.
+        # euler_xyz_from_quat returns (lean, pitch, yaw) -- same extraction _update_metrics already uses
+        # for the actual_pitch/actual_lean metrics.
+        current_lean, current_pitch, _ = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)
+
+        if self.cfg.ranges.ang_pos_y is not None:
+            pitch_pos_w = self.robot.data.root_pos_w.clone()
+            pitch_pos_w[:, 2] += 0.3
+            self._visualize_angle_arrow(
+                self.cmd_pitch_visualizer, pitch_pos_w, self.vel_command_b[:, 3], axis="pitch"
+            )
+            self._visualize_angle_arrow(self.actual_pitch_visualizer, pitch_pos_w, current_pitch, axis="pitch")
+
+        if self.cfg.ranges.ang_pos_x is not None:
+            lean_pos_w = self.robot.data.root_pos_w.clone()
+            lean_pos_w[:, 2] += 0.45
+            self._visualize_angle_arrow(
+                self.cmd_lean_visualizer, lean_pos_w, self.vel_command_b[:, 4], axis="lean"
+            )
+            self._visualize_angle_arrow(self.actual_lean_visualizer, lean_pos_w, current_lean, axis="lean")
+
+    def _visualize_angle_arrow(
+        self, visualizer: VisualizationMarkers, pos_w: torch.Tensor, angle_rad: torch.Tensor, axis: str
+    ):
+        """Poses `visualizer`'s arrow at `pos_w`, rotated by `angle_rad` about the pitch (Y) or lean/roll
+        (X) axis, with arrow length scaled by the angle's magnitude."""
+        if axis == "pitch":
+            quat = math_utils.quat_from_euler_xyz(
+                torch.zeros_like(angle_rad), angle_rad, torch.zeros_like(angle_rad)
+            )
+        else:
+            quat = math_utils.quat_from_euler_xyz(
+                angle_rad, torch.zeros_like(angle_rad), torch.zeros_like(angle_rad)
+            )
+        scale = torch.tensor(visualizer.cfg.markers["arrow"].scale, device=self.device).repeat(len(angle_rad), 1)
+        scale[:, 0] *= torch.abs(angle_rad) * 2.0 + 0.05
+        scale[:, 1] *= torch.abs(angle_rad) * 2.0 + 0.05
         scale[:, 2] *= 0.1
-        self.pitch_goal_visualizer.visualize(base_pos_w, pitch_quat, scale)
+        visualizer.visualize(pos_w, quat, scale)
 
 
 # Step 2: Now the config can reference the already-defined command class
@@ -235,22 +270,41 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
 
     ranges: Ranges = Ranges()  # type: ignore
 
-    pitch_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/pitch_goal"
+    # Four pitch/lean arrows (commanded + actual, per axis), mirroring the goal/current pattern the base
+    # class already uses for linear velocity (green=commanded, blue=actual). .replace() is a plain shallow
+    # dataclasses.replace() (confirmed in isaaclab.utils.configclass) -- it does NOT copy the nested
+    # `markers` dict, so every one of these deepcopies it before mutating scale/color, or they'd all end up
+    # sharing (and stomping) the same underlying "arrow" marker object.
+    cmd_pitch_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/pitch_cmd"
     )
-    """The configuration for the pitch command visualization marker."""
-    # .replace() is a plain shallow dataclasses.replace() (confirmed in isaaclab.utils.configclass) -- it
-    # does NOT copy the nested `markers` dict, so without this deepcopy, mutating .scale below would
-    # mutate the same "arrow" marker object shared by RED_ARROW_X_MARKER_CFG itself and every other
-    # config anywhere that also does RED_ARROW_X_MARKER_CFG.replace(...), rather than just this one
-    # visualizer.
-    pitch_visualizer_cfg.markers = {"arrow": copy.deepcopy(pitch_visualizer_cfg.markers["arrow"])}
-    # Was (1.0, 1.0, 1.0) -- reported 2-3x too big relative to the robot once actually visible in the
-    # viewport (the earlier fix was for the arrows never updating at all, not their size). Shrunk by ~2.5x.
-    # _debug_vis_callback multiplies this base scale by the pitch magnitude every frame, so this stays
-    # consistent at every pitch value, not just one snapshot. Colored red (was green, same as the velocity
-    # arrows) so it's visually distinct from the commanded/current velocity arrows.
-    pitch_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+    """Commanded pitch arrow (red)."""
+    cmd_pitch_visualizer_cfg.markers = {"arrow": copy.deepcopy(cmd_pitch_visualizer_cfg.markers["arrow"])}
+    cmd_pitch_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+
+    actual_pitch_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/pitch_actual"
+    )
+    """Actual (measured) pitch arrow (orange)."""
+    actual_pitch_visualizer_cfg.markers = {"arrow": copy.deepcopy(actual_pitch_visualizer_cfg.markers["arrow"])}
+    actual_pitch_visualizer_cfg.markers["arrow"].visual_material.diffuse_color = (1.0, 0.5, 0.0)
+    actual_pitch_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+
+    cmd_lean_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/lean_cmd"
+    )
+    """Commanded lean arrow (purple)."""
+    cmd_lean_visualizer_cfg.markers = {"arrow": copy.deepcopy(cmd_lean_visualizer_cfg.markers["arrow"])}
+    cmd_lean_visualizer_cfg.markers["arrow"].visual_material.diffuse_color = (0.6, 0.0, 1.0)
+    cmd_lean_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+
+    actual_lean_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/lean_actual"
+    )
+    """Actual (measured) lean arrow (cyan)."""
+    actual_lean_visualizer_cfg.markers = {"arrow": copy.deepcopy(actual_lean_visualizer_cfg.markers["arrow"])}
+    actual_lean_visualizer_cfg.markers["arrow"].visual_material.diffuse_color = (0.0, 1.0, 1.0)
+    actual_lean_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
 
     goal_vel_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
         prim_path="/Visuals/Command/velocity_goal"

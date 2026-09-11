@@ -35,7 +35,6 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 PANELS = [
     ("Mean reward", [("Train/mean_reward", "reward")]),
     ("Mean episode length", [("Train/mean_episode_length", "length")]),
-    ("Mean action noise std", [("Policy/mean_noise_std", "std")]),
     ("Linear vel x: commanded vs actual", [
         ("Metrics/base_velocity/cmd_lin_vel_x", "commanded"),
         ("Metrics/base_velocity/actual_lin_vel_x", "actual"),
@@ -95,7 +94,7 @@ class LiveDashboard:
         # spread across the whole run.
         self.accumulator = EventAccumulator(logdir, size_guidance={"scalars": 0})
 
-        self.fig, axes = plt.subplots(4, 3, figsize=(16, 13))
+        self.fig, axes = plt.subplots(3, 3, figsize=(16, 10))
         self.fig.canvas.manager.set_window_title(f"Live training dashboard -- {logdir}")
         self.axes = axes.flatten()
         self.lines: dict[str, dict[str, plt.Line2D]] = {}
