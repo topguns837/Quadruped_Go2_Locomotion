@@ -245,6 +245,62 @@ RUN cuda_libs=$(for f in $(find ${ISAACSIM_ROOT_PATH}/kit/python/lib/python3.11/
 # it, on an otherwise identical container.
 RUN rm -rf ${ISAACSIM_ROOT_PATH}/exts/omni.isaac.ml_archive/pip_prebundle/torch
 
+# unitree_sdk2py: real-hardware deployment (deploy/deploy_real.py, see deploy.md). Not on PyPI at all
+# (confirmed directly: `pip install unitree_sdk2py` finds no matching distribution) -- installed from its
+# GitHub source, matching how Unitree themselves document installing it.
+#
+# Pinned to a specific commit (not a branch/tag) -- this project has no control over unitree_sdk2py's
+# upstream, and an unpinned `git+https://.../unitree_sdk2_python.git` would silently pick up whatever
+# is on master at image-build time, risking a future rebuild breaking (API changes, or re-hitting/regressing
+# the exact packaging gaps documented below in ways not yet seen). ${UNITREE_SDK2PY_COMMIT} is defined once
+# and reused for both this install and the .so-file fix further down so they can never drift apart from
+# each other.
+ARG UNITREE_SDK2PY_COMMIT=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+#
+# unitree_sdk2py's own dependency, cyclonedds==0.10.2 (the Python DDS bindings), also has no prebuilt wheel for this
+# platform and needs the native CycloneDDS C library present to build against (`Could not locate
+# cyclonedds. Try to set CYCLONEDDS_HOME or CMAKE_PREFIX_PATH`, confirmed directly) -- there's no apt
+# package for it either (`apt-cache search cyclonedds` returns nothing in this image). build-essential and
+# cmake are already installed above (line ~76), so no new apt packages are needed, just building this one
+# library from source and pointing pip at it via CYCLONEDDS_HOME.
+RUN git clone --branch releases/0.10.x --depth 1 https://github.com/eclipse-cyclonedds/cyclonedds.git /tmp/cyclonedds && \
+    cmake -S /tmp/cyclonedds -B /tmp/cyclonedds/build -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF && \
+    cmake --build /tmp/cyclonedds/build -j$(nproc) && \
+    cmake --install /tmp/cyclonedds/build && \
+    ldconfig && \
+    rm -rf /tmp/cyclonedds
+
+# unitree_sdk2py's install silently upgrades numpy to 2.x as a transitive dependency (observed directly:
+# pip pulled numpy-2.4.6, no version ceiling declared anywhere in its own requirements) -- which then
+# breaks isaaclab/isaaclab-rl/isaaclab-tasks, all of which pin numpy<2 (confirmed directly: pip's own
+# dependency-conflict warnings named all three after this install, and would have broken every future
+# `isaaclab -p` launch in this image, though an already-running process is unaffected since Python doesn't
+# hot-reload site-packages). The `pip install "numpy<2"` immediately after re-pins it back down; verified
+# directly afterward that unitree_sdk2py's own imports (ChannelFactoryInitialize, LowCmd_/LowState_/
+# SportModeState_, CRC, RecurrentThread, SportClient, MotionSwitcherClient) all still work fine against the
+# older numpy -- nothing in the actual code paths this project uses needs 2.x. opencv-python (also pulled
+# in transitively, unused by deploy_real.py, and left version-mismatched by this repin) is harmless as long
+# as nothing imports cv2 -- deploy_real.py doesn't.
+RUN CYCLONEDDS_HOME=/usr/local CMAKE_PREFIX_PATH=/usr/local \
+    ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install "git+https://github.com/unitreerobotics/unitree_sdk2_python.git@${UNITREE_SDK2PY_COMMIT}" && \
+    ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install "numpy<2"
+
+# unitree_sdk2py.utils.crc.CRC (used to stamp every outgoing LowCmd -- required, not optional) loads a
+# prebuilt native library, crc_amd64.so, via ctypes at runtime. That file exists in the upstream source
+# repo (unitree_sdk2py/utils/lib/crc_amd64.so) but the pip install above silently drops it -- confirmed
+# directly: `CRC()` raised `OSError: .../utils/lib/crc_amd64.so: cannot open shared object file`, and the
+# installed package has no `utils/lib/` directory at all. This is an upstream packaging gap (the .so isn't
+# declared as package data for a PEP 517 wheel build), not something fixable via pip flags -- so fetch the
+# exact same pinned commit again just for this one directory and copy it into the already-installed package
+# by hand. Verified directly afterward: CRC().Crc(...) computes successfully.
+RUN git clone --depth 1 https://github.com/unitreerobotics/unitree_sdk2_python.git /tmp/unitree_sdk2_python_src && \
+    git -C /tmp/unitree_sdk2_python_src fetch --depth 1 origin ${UNITREE_SDK2PY_COMMIT} && \
+    git -C /tmp/unitree_sdk2_python_src checkout ${UNITREE_SDK2PY_COMMIT} && \
+    UNITREE_SDK2PY_DIR=$(${ISAACLAB_PATH}/_isaac_sim/python.sh -c "import unitree_sdk2py, os; print(os.path.dirname(unitree_sdk2py.__file__))") && \
+    mkdir -p ${UNITREE_SDK2PY_DIR}/utils/lib && \
+    cp /tmp/unitree_sdk2_python_src/unitree_sdk2py/utils/lib/*.so ${UNITREE_SDK2PY_DIR}/utils/lib/ && \
+    rm -rf /tmp/unitree_sdk2_python_src
+
 # ---------------------------------------------------------------------------
 # Stage: app
 # ---------------------------------------------------------------------------

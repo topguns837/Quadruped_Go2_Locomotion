@@ -1,0 +1,90 @@
+# Real-hardware deployment config for the vanilla / experimental Go2 policies.
+#
+# Values here (default joint pose, PD gains, action scale) are copied directly from the sim actuator
+# config that trained these policies (unitree_go2witharm_cfg.py's UNITREE_GO2WITHARM_CFG, and
+# quadruped_go2_locomotion_env_cfg.py's ActionsCfg) -- NOT generic "reasonable Go2 defaults". The policy
+# was calibrated against this exact stiffness/damping/scale combination; using different real-hardware PD
+# gains would silently change what each action value means to the robot.
+
+policy_path: models/9_13_26_pitch_lean_height_weights_experimental/exported/policy.pt  # JIT export -- takes
+  # the raw observation vector and returns actions directly (obs normalization baked in). NOT model_17999.pt
+  # (that's the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic
+  # class to load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
+control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
+
+network_interface: null  # REQUIRED before first run -- e.g. "enp3s0" (host NIC cabled to the robot). See
+                          # deploy.md Stage 0 ("ifconfig" after connecting). Left null so a real run refuses
+                          # to start unset (fails loud, not with a silent wrong-interface bind).
+
+# --- action scale/offset (from ActionsCfg: mdp.JointPositionActionCfg(scale=0.25, use_default_offset=True)) ---
+action_scale: 0.25
+
+# --- per-joint PD gains and effort limit (from UNITREE_GO2WITHARM_CFG's "base_legs" DCMotorCfg) ---
+# Applied identically to all 12 leg joints -- the sim actuator config uses one shared DCMotorCfg for all of
+# them, so there's no per-joint variation to carry over.
+kp: 25.0
+kd: 0.5
+effort_limit: 23.5  # saturation_effort in sim; also usable as a real-hardware torque safety clamp
+
+# --- joint order, Isaac Lab side (the order this policy's action vector is in) ---
+# Names come from unitree_go2witharm_cfg.py's init_state.joint_pos regexes -- standard Unitree Go2 naming.
+# The ORDER below is NOT yet ground-truth: Isaac Lab's articulation joint order is USD-authoring-dependent,
+# not guaranteed to be FL/FR/RL/RR-hip/thigh/calf in this sequence. Run `deploy/dump_joint_order.py` (see
+# that file's docstring) to get the real order from the loaded asset and replace this list before ANY
+# hardware use -- this is Stage 2 of deploy.md's pipeline, done once for this asset, offline, no robot
+# needed. Placeholder order shown here (alphabetical-ish guess) exists only so the config parses.
+isaac_joint_order:
+  - FL_hip_joint
+  - FL_thigh_joint
+  - FL_calf_joint
+  - FR_hip_joint
+  - FR_thigh_joint
+  - FR_calf_joint
+  - RL_hip_joint
+  - RL_thigh_joint
+  - RL_calf_joint
+  - RR_hip_joint
+  - RR_thigh_joint
+  - RR_calf_joint
+
+# Default (standing) joint position per joint name, in radians -- from
+# UNITREE_GO2WITHARM_CFG.init_state.joint_pos. The action the policy outputs is an OFFSET from these values
+# (scaled by action_scale above), not an absolute target.
+default_joint_pos:
+  FL_hip_joint: 0.1
+  FR_hip_joint: -0.1
+  RL_hip_joint: 0.1
+  RR_hip_joint: -0.1
+  FL_thigh_joint: 0.8
+  FR_thigh_joint: 0.8
+  RL_thigh_joint: 1.0
+  RR_thigh_joint: 1.0
+  FL_calf_joint: -1.5
+  FR_calf_joint: -1.5
+  RL_calf_joint: -1.5
+  RR_calf_joint: -1.5
+
+# --- Unitree SDK LowCmd/LowState motor index order (the OTHER order deploy_real.py must reconcile) ---
+# CONFIRMED this session directly against unitree_sdk2py's own reference example
+# (example/go2/low_level/unitree_legged_const.py, fetched and read verbatim -- not just "standard
+# convention" as previously noted): FR(0,1,2), FL(3,4,5), RR(6,7,8), RL(9,10,11), each triplet
+# (hip, thigh, calf), unchanged across the A1/Go1/Go2/B1 SDK generations. Still worth a final sanity check
+# against your specific unit's firmware docs before first use, but this is sourced, not guessed.
+sdk_joint_order:
+  - FR_hip_joint
+  - FR_thigh_joint
+  - FR_calf_joint
+  - FL_hip_joint
+  - FL_thigh_joint
+  - FL_calf_joint
+  - RR_hip_joint
+  - RR_thigh_joint
+  - RR_calf_joint
+  - RL_hip_joint
+  - RL_thigh_joint
+  - RL_calf_joint
+
+# Height tracking is not working yet -- deploy_real.py uses a fixed DEFAULT_HEIGHT_M=0.3 constant instead
+# of a real estimate for now (see that file's module docstring). No height_source config choice here
+# anymore: nothing to configure until a real estimator (SportModeState post-release, or forward
+# kinematics) is implemented and verified against hardware -- see deploy.md Stage 3.

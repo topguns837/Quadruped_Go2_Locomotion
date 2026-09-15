@@ -62,6 +62,31 @@ VIEW_CMD="feh --reload 3 /tmp/dashboard.png"
 PLAY_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/play_dashboard --output /tmp/play_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
 PLAY_VIEW_CMD="feh --reload 3 /tmp/play_dashboard.png"
 
+# Real-hardware deployment (see deploy.md, deploy/deploy_real.py). Unlike TRAIN_CMD/PLAY_CMD this does NOT
+# use the `isaaclab -p` wrapper -- deploy_real.py never touches pxr/Omniverse/SimulationApp, so launching
+# the full Kit app would be pure waste (slow startup, unneeded GPU/rendering init). It's run directly under
+# Isaac Sim's bundled Python instead, which already has torch/tensorboard without launching Kit (same
+# interpreter this session's TensorBoard log-reading checks used) -- only unitree_sdk2py needs installing
+# into it separately (see deploy_real.py's own module docstring).
+#
+# --dry_run is deliberately the pre-typed default -- this command is one Enter-press away from powering
+# real motors once --network_interface and --dry_run are edited out, so it must never be pre-filled ready
+# to send real commands. REPLACE_WITH_NIC_NAME is a literal placeholder (e.g. "enp3s0", found via
+# `ifconfig` after connecting the Ethernet cable to the robot per deploy.md Stage 0) -- replace it before
+# removing --dry_run. Deliberately NOT wrapped in <angle brackets>: those are shell redirection operators
+# when unquoted, and this string is typed directly into the pane's own shell -- confirmed directly that
+# `<FILL_IN_NIC>` silently drops --manual_commands from the command line (swallowed as a redirect target)
+# and fails on a missing "FILL_IN_NIC" input file, instead of erroring obviously. A bare placeholder word
+# has no such failure mode. network_mode: host (docker-compose.yml) is what makes binding a specific host
+# NIC from inside this container possible at all.
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface REPLACE_WITH_NIC_NAME --manual_commands --live_plot --dry_run"
+
+# Same live-dashboard setup as play's, reading deploy_real.py's --live_plot output instead (logs/hardware_dashboard/,
+# same tag names as play.py's --live_plot -- see deploy_real.py's log_live_plot). Same --exclude-panels/
+# --y-range-multiplier reasoning as PLAY_DASHBOARD_CMD above; training's DASHBOARD_CMD is unaffected.
+HARDWARE_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/hardware_dashboard --output /tmp/hardware_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
+HARDWARE_VIEW_CMD="feh --reload 3 /tmp/hardware_dashboard.png"
+
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
   tmux send-keys -t isaaclab:list-envs "isaaclab -p scripts/list_envs.py"
@@ -79,6 +104,13 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   PLAY_VIEW_PANE=$(tmux split-window -v -t "$PLAY_DASH_PANE" -P -F "#{pane_id}")
   tmux send-keys -t "$PLAY_VIEW_PANE" "'"${PLAY_VIEW_CMD}"'"
   tmux select-pane -t isaaclab:play.0
+  tmux new-window -t isaaclab -n hardware
+  tmux send-keys -t isaaclab:hardware "'"${HARDWARE_CMD}"'"
+  HW_DASH_PANE=$(tmux split-window -h -t isaaclab:hardware -P -F "#{pane_id}")
+  tmux send-keys -t "$HW_DASH_PANE" "'"${HARDWARE_DASHBOARD_CMD}"'"
+  HW_VIEW_PANE=$(tmux split-window -v -t "$HW_DASH_PANE" -P -F "#{pane_id}")
+  tmux send-keys -t "$HW_VIEW_PANE" "'"${HARDWARE_VIEW_CMD}"'"
+  tmux select-pane -t isaaclab:hardware.0
   tmux select-window -t isaaclab:list-envs
   tmux attach -t isaaclab
 '

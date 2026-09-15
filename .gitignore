@@ -62,7 +62,7 @@ _build
 # RL-Games
 **/runs/*
 **/logs/rsl_rl/
-# **/logs/*
+**/logs/*
 **/recordings/*
 
 # Pre-Trained Checkpoints
