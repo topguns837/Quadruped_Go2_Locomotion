@@ -35,7 +35,7 @@ else
 fi
 
 TRAIN_CMD="isaaclab -p scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2 ${TRAIN_ARGS}"
-PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play ${PLAY_ARGS}"
+PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play ${PLAY_ARGS} --manual_commands --live_plot"
 
 # live_dashboard.py's default matplotlib backend crashes in this container (no working Qt/GTK binding --
 # see docker/Dockerfile's note next to the feh apt install), so it runs in --output mode: periodically
@@ -44,6 +44,23 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # whichever run is most recently modified.
 DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_with_pitch_lean_and_height_control_ppo --output /tmp/dashboard.png"
 VIEW_CMD="feh --reload 3 /tmp/dashboard.png"
+
+# Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate
+# TensorBoard log under logs/play_dashboard/, written only when --live_plot is on -- see play.py). Same
+# script (--exclude-panels/--y-range-multiplier default to "show everything, tight fit", so training's
+# DASHBOARD_CMD above is completely unaffected by these -- they're only passed here):
+#   --max-points 500: play logs per physics step, not per training iteration, so the default 100-point
+#     window is only ~2s of history; 500 gives a much more readable rolling window.
+#   --exclude-panels: reward/episode-length/tracking-error are training concepts play.py never logs, so
+#     they'd just render as blank panels -- explicitly dropped instead.
+#   --y-range-multiplier 2.0: doubles each panel's y-axis range around its tight auto-fit, for more visual
+#     headroom comparing the (usually flat) commanded line against the noisier actual line.
+# Single-quotes (not escaped double-quotes) around the panel list below are deliberate: this string passes
+# through host-level variable expansion, then a tmux send-keys splice, before finally being typed into the
+# pane and parsed by ITS shell -- single-quoting survives that whole chain without premature quote-closing,
+# where escaped double-quotes would have broken partway through (verified directly).
+PLAY_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/play_dashboard --output /tmp/play_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
+PLAY_VIEW_CMD="feh --reload 3 /tmp/play_dashboard.png"
 
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
@@ -57,6 +74,11 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux select-pane -t isaaclab:train.0
   tmux new-window -t isaaclab -n play
   tmux send-keys -t isaaclab:play "'"${PLAY_CMD}"'"
+  PLAY_DASH_PANE=$(tmux split-window -h -t isaaclab:play -P -F "#{pane_id}")
+  tmux send-keys -t "$PLAY_DASH_PANE" "'"${PLAY_DASHBOARD_CMD}"'"
+  PLAY_VIEW_PANE=$(tmux split-window -v -t "$PLAY_DASH_PANE" -P -F "#{pane_id}")
+  tmux send-keys -t "$PLAY_VIEW_PANE" "'"${PLAY_VIEW_CMD}"'"
+  tmux select-pane -t isaaclab:play.0
   tmux select-window -t isaaclab:list-envs
   tmux attach -t isaaclab
 '
