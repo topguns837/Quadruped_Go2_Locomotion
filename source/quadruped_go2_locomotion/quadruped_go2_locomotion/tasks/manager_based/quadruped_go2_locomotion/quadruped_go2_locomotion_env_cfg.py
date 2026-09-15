@@ -132,15 +132,14 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True
     )
-    # Open Manipulator X contact sensor. Path matches how
-    # scripts/compose_go2_with_arm.py places the manipulator reference: as a
-    # sibling of base (not nested under it) named "OpenManipulatorX", fixed
-    # to base purely via a joint rather than USD parenting. See that script
-    # for why (Isaac Lab's activate_contact_sensors never recurses past a
-    # rigid body, so nesting under the rigid base body would leave it
-    # permanently unreachable).
+    # Open Manipulator X contact sensor. The manipulator is a sibling of base (not nested under it) named
+    # "open_manipulator_x_static" in the current go2withOpenXstatic.usd (verified directly by traversing
+    # the stage -- was "OpenManipulatorX" in the earlier, incorrect-mounting .usda, renamed by whatever
+    # exported the corrected-mounting version), fixed to base purely via a joint rather than USD parenting.
+    # It must stay a sibling, not nested under base: Isaac Lab's activate_contact_sensors never recurses
+    # past a rigid body, so nesting under the rigid base body would leave it permanently unreachable.
     contact_forces_arm = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/OpenManipulatorX/.*", history_length=3, track_air_time=True
+        prim_path="{ENV_REGEX_NS}/Robot/open_manipulator_x_static/.*", history_length=3, track_air_time=True
     )
 
     """     depth_camera = TiledCameraCfg(
@@ -320,7 +319,7 @@ class RewardsCfg:
         func=mdp.track_lean_exp,
         weight=0.3,
         params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
-    )    
+    )
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
@@ -387,7 +386,7 @@ class RewardsCfg:
             "min_height": 0.05,  # 5 cm
         },
     )
-    # -- optional penalties 
+    # -- optional penalties
     #flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
 

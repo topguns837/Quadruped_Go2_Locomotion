@@ -34,6 +34,30 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--manual_commands",
+    action="store_true",
+    default=False,
+    help=(
+        "Set an exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command via a slider window "
+        "(auto-launched) instead of the policy's usual random commands, without closing the Isaac Sim window."
+    ),
+)
+parser.add_argument(
+    "--command_file",
+    type=str,
+    default="/tmp/manual_command.json",
+    help="Path the manual-command slider window and this script agree on (see --manual_commands).",
+)
+parser.add_argument(
+    "--live_plot",
+    action="store_true",
+    default=False,
+    help=(
+        "Log per-step commanded-vs-actual velocity/pitch/lean/height to a TensorBoard file under "
+        "logs/play_dashboard/, viewable live with scripts/live_dashboard.py --logdir logs/play_dashboard."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -53,13 +77,19 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import atexit
+import json
 import os
+import subprocess
+import threading
 import time
+from datetime import datetime
 
 import gymnasium as gym
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
+import isaaclab.utils.math as math_utils
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
@@ -78,6 +108,65 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import quadruped_go2_locomotion.tasks  # noqa: F401
+
+
+def _manual_command_file_poll_loop(cmd_term, path: str, poll_interval: float = 0.1):
+    """Polls `path` (written by scripts/manual_command_slider.py, a separate process) for changes and
+    applies them to cmd_term, without blocking the main thread's simulation/render loop.
+
+    Tolerates the file not existing yet (slider window hasn't started/written its first value yet) and
+    transient malformed reads (a torn read racing the slider's write, despite it writing atomically via
+    temp-file + os.replace) by simply retrying next poll -- never raises, never stops the loop.
+    """
+    last_mtime = None
+    while True:
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime != last_mtime:
+                with open(path) as f:
+                    data = json.load(f)
+                values = [
+                    data["lin_vel_x"],
+                    data["lin_vel_y"],
+                    data["ang_vel_z"],
+                    data["pitch"],
+                    data["lean"],
+                    data["height"],
+                ]
+                cmd_term.set_manual_command(values)
+                last_mtime = mtime
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+        time.sleep(poll_interval)
+
+
+def _log_live_plot(writer, env):
+    """Logs one step's commanded vs. actual [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] for
+    env 0 to `writer`, using the exact tag names scripts/live_dashboard.py's PANELS already expects
+    (Metrics/base_velocity/{cmd,actual}_*) -- no dashboard changes needed to read this.
+
+    Unlike mdp/commands.py's training-time metrics, these are instantaneous per-step values, not
+    accumulated over a resample cycle: play is "watch one robot," so there's no per-episode aggregation to
+    get right or wrong here, just the current value at each step.
+    """
+    cmd = env.unwrapped.command_manager.get_command("base_velocity")[0]
+    robot = env.unwrapped.scene["robot"]
+    lean, pitch, _ = math_utils.euler_xyz_from_quat(robot.data.root_quat_w[0:1])
+    step = env.unwrapped.common_step_counter
+
+    writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_x", cmd[0].item(), step)
+    writer.add_scalar("Metrics/base_velocity/actual_lin_vel_x", robot.data.root_lin_vel_b[0, 0].item(), step)
+    writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_y", cmd[1].item(), step)
+    writer.add_scalar("Metrics/base_velocity/actual_lin_vel_y", robot.data.root_lin_vel_b[0, 1].item(), step)
+    writer.add_scalar("Metrics/base_velocity/cmd_ang_vel_z", cmd[2].item(), step)
+    writer.add_scalar("Metrics/base_velocity/actual_ang_vel_z", robot.data.root_ang_vel_b[0, 2].item(), step)
+    writer.add_scalar("Metrics/base_velocity/cmd_pitch", cmd[3].item(), step)
+    writer.add_scalar("Metrics/base_velocity/actual_pitch", pitch.item(), step)
+    writer.add_scalar("Metrics/base_velocity/cmd_lean", cmd[4].item(), step)
+    writer.add_scalar("Metrics/base_velocity/actual_lean", lean.item(), step)
+    writer.add_scalar("Metrics/base_velocity/cmd_height", cmd[5].item(), step)
+    writer.add_scalar("Metrics/base_velocity/actual_height", robot.data.root_pos_w[0, 2].item(), step)
+    writer.flush()
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -172,6 +261,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
+    if args_cli.manual_commands:
+        cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+        cmd_term.enable_manual_override()
+        threading.Thread(
+            target=_manual_command_file_poll_loop, args=(cmd_term, args_cli.command_file), daemon=True
+        ).start()
+        # Slider window is a separate process on the plain system python3 (never isaaclab -p) -- Isaac
+        # Sim's bundled Python has no tkinter. See docker/Dockerfile's note next to the python3-tk install.
+        # Absolute path, not just "python3": this container's own ~/.bashrc aliases the bare name to Isaac
+        # Sim's python for interactive shells (see docker/Dockerfile's `alias python3=...` line). subprocess
+        # bypasses shell aliases either way (no shell involved), but using the absolute path here keeps
+        # this call and the manual-relaunch instructions below consistent with each other.
+        scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        slider_script = os.path.join(scripts_dir, "manual_command_slider.py")
+        # subprocess.Popen inherits the full parent environment by default, including PYTHONPATH/
+        # LD_LIBRARY_PATH set by /isaac-sim/setup_python_env.sh to point at Isaac Sim's *own* Python 3.11
+        # stdlib/site-packages/libs. Left in place, the system python3 spawned below picks up that 3.11
+        # PYTHONPATH ahead of its own stdlib and crashes on a compiled-extension ABI mismatch
+        # ("AssertionError: SRE module mismatch", confirmed directly). Stripping these two vars lets it use
+        # its own, correct sys.path and shared libraries instead.
+        slider_env = os.environ.copy()
+        slider_env.pop("PYTHONPATH", None)
+        slider_env.pop("LD_LIBRARY_PATH", None)
+        slider_proc = subprocess.Popen(
+            ["/usr/bin/python3", slider_script, "--command_file", args_cli.command_file], env=slider_env
+        )
+        atexit.register(slider_proc.terminate)
+        print(f"[INFO] Manual command mode: slider window launched (writing to {args_cli.command_file}).")
+
+    live_plot_writer = None
+    if args_cli.live_plot:
+        from torch.utils.tensorboard import SummaryWriter
+
+        live_plot_dir = os.path.join("logs", "play_dashboard", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        live_plot_writer = SummaryWriter(log_dir=live_plot_dir)
+        print(f"[INFO] Live plot logging to: {live_plot_dir}")
+
     dt = env.unwrapped.step_dt
 
     # reset environment
@@ -188,6 +314,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+        if live_plot_writer is not None:
+            _log_live_plot(live_plot_writer, env)
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

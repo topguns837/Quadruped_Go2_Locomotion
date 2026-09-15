@@ -57,11 +57,20 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_pitch"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_lean"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["cmd_height"] = torch.zeros(self.num_envs, device=self.device)
         # Achieved-velocity metrics: lets a viewer plot commanded vs. actual on the same chart
         # instead of only seeing the tracking-error magnitude (error_vel_xy/error_vel_yaw).
         self.metrics["actual_lin_vel_x"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["actual_lin_vel_y"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["actual_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_pitch"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_lean"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["actual_height"] = torch.zeros(self.num_envs, device=self.device)
+        # Manual command override (see enable_manual_override/set_manual_command) -- used by play.py's
+        # --manual_commands mode to replace automatic resampling with an exact, user-typed command.
+        # Off by default: training and the existing random-command play mode are unaffected.
+        self.manual_override = False
+        self.manual_command = torch.zeros(6, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -96,9 +105,41 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         else:
             self.target_lin_pos_z[env_ids] = 0.0
 
+        # Reset our own cmd_*/actual_* metrics here, not just at episode end. CommandManager.reset() (the
+        # base framework) only zeros self.metrics on a full episode reset, not on this mid-episode resample
+        # -- fine for tasks where resampling_time_range roughly matches episode_length_s, but this task's
+        # episode_length_s=40s spans 4 full resampling_time_range=10s cycles, so without this, the
+        # accumulator in _update_metrics (`+= value / max_command_step`, where max_command_step normalizes
+        # ONE resample cycle) keeps summing across all 4 cycles before ever resetting -- inflating every
+        # cmd_*/actual_* metric ~4x by episode end (observed directly: actual_height reading ~1.0-1.3
+        # instead of the physically sane ~0.3). Resetting here makes each accumulation window match exactly
+        # one resample cycle, whichever ends first (next resample, or episode end). error_vel_xy/error_vel_yaw
+        # are the base class's own metrics, accumulated by its own code we don't control -- not touched here.
+        for key in (
+            "cmd_lin_vel_x", "cmd_lin_vel_y", "cmd_ang_vel_z", "cmd_pitch", "cmd_lean", "cmd_height",
+            "actual_lin_vel_x", "actual_lin_vel_y", "actual_ang_vel_z", "actual_pitch", "actual_lean",
+            "actual_height",
+        ):
+            self.metrics[key][env_ids] = 0.0
+
+
+    def enable_manual_override(self):
+        """Switch from automatic resampling to a fixed, externally-set command (see set_manual_command).
+
+        Used by play.py's --manual_commands mode. _resample_command may still fire on its usual timer, but
+        once manual_override is on, _update_command no longer reads anything it wrote, so it's harmless.
+        """
+        self.manual_override = True
+
+    def set_manual_command(self, values: list[float]):
+        """Set the exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command for every env."""
+        self.manual_command = torch.tensor(values, device=self.device, dtype=torch.float32)
 
     def _update_command(self):
         """Post-processes the velocity and pitch commands."""
+        if self.manual_override:
+            self.vel_command_b[:] = self.manual_command
+            return
         super()._update_command()
         # Copy pitch, lean, and height targets into the command buffer
         self.vel_command_b[:, 3] = self.target_pitch
@@ -120,17 +161,29 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] += self.vel_command_b[:, 2] / max_command_step
         self.metrics["cmd_pitch"] += self.vel_command_b[:, 3] / max_command_step
         self.metrics["cmd_lean"] += self.vel_command_b[:, 4] / max_command_step
+        self.metrics["cmd_height"] += self.vel_command_b[:, 5] / max_command_step
         # Achieved velocity, same base frame as vel_command_b, so directly comparable to the cmd_* values.
         self.metrics["actual_lin_vel_x"] += self.robot.data.root_lin_vel_b[:, 0] / max_command_step
         self.metrics["actual_lin_vel_y"] += self.robot.data.root_lin_vel_b[:, 1] / max_command_step
         self.metrics["actual_ang_vel_z"] += self.robot.data.root_ang_vel_b[:, 2] / max_command_step
+        self.metrics["actual_height"] += self.robot.data.root_pos_w[:, 2] / max_command_step
+        # Same pitch/lean extraction track_pitch_exp/track_lean_exp use in rewards.py -- euler_xyz_from_quat
+        # returns (lean, pitch, yaw); each call only keeps the component it needs.
+        _, current_pitch, _ = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)
+        current_lean, _, _ = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)
+        self.metrics["actual_pitch"] += current_pitch / max_command_step
+        self.metrics["actual_lean"] += current_lean / max_command_step
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         super()._set_debug_vis_impl(debug_vis)
         if debug_vis and self.cfg.ranges.ang_pos_y is not None:
-            if not hasattr(self, "pitch_goal_visualizer"):
-                self.pitch_goal_visualizer = VisualizationMarkers(self.cfg.pitch_visualizer_cfg)
-            self.pitch_goal_visualizer.set_visibility(True)
+            if not hasattr(self, "cmd_pitch_visualizer"):
+                self.cmd_pitch_visualizer = VisualizationMarkers(self.cfg.cmd_pitch_visualizer_cfg)
+            self.cmd_pitch_visualizer.set_visibility(True)
+        if debug_vis and self.cfg.ranges.ang_pos_x is not None:
+            if not hasattr(self, "cmd_lean_visualizer"):
+                self.cmd_lean_visualizer = VisualizationMarkers(self.cfg.cmd_lean_visualizer_cfg)
+            self.cmd_lean_visualizer.set_visibility(True)
 
     def _debug_vis_callback(self, event):
         if not self.robot.is_initialized:
@@ -141,22 +194,65 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         # or the live command afterward.
         super()._debug_vis_callback(event)
         self._set_debug_vis_impl(True)
-        if self.cfg.ranges.ang_pos_y is None:
-            return
-        # Visualize pitch targets
-        base_pos_w = self.robot.data.root_pos_w.clone()
-        base_pos_w[:, 2] += 0.3
-        pitch_rad = self.target_pitch
-        pitch_quat = math_utils.quat_from_euler_xyz(
-            torch.zeros_like(pitch_rad), pitch_rad, torch.zeros_like(pitch_rad)
-        )
-        scale = torch.tensor(
-            self.pitch_goal_visualizer.cfg.markers["arrow"].scale, device=self.device
-        ).repeat(len(pitch_rad), 1)
-        scale[:, 0] *= torch.abs(pitch_rad) * 2.0 + 0.05
-        scale[:, 1] *= torch.abs(pitch_rad) * 2.0 + 0.05
+
+        # Commanded values come from vel_command_b (the live active command), not target_pitch/target_lean
+        # -- in --manual_commands mode, _update_command's manual branch only ever writes vel_command_b, so
+        # target_pitch/target_lean stay frozen at whatever they were before manual override was enabled.
+        # Reading vel_command_b here keeps these arrows correct in both auto and manual modes.
+        #
+        # Yaw-only heading quaternion, composed into both arrows below (see _visualize_angle_arrow): pitch
+        # and lean are absolute targets measured from level/flat, not an offset on top of the robot's
+        # current attitude, so only yaw (which way the robot is currently facing) should be folded in --
+        # composing with the robot's *full* current orientation (like isaaclab's own velocity arrows do,
+        # correctly, for body-frame velocity) would double-count any existing pitch/roll disturbance here.
+        # Without composing in yaw at all (the previous behavior), the arrow only ever pointed along a
+        # fixed world axis regardless of which way the robot was actually facing -- confirmed directly to
+        # be the reported bug ("doesn't point in the same direction as the robot's heading sometimes").
+        _, _, yaw = math_utils.euler_xyz_from_quat(self.robot.data.root_quat_w)
+        zeros = torch.zeros_like(yaw)
+        heading_quat = math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
+
+        if self.cfg.ranges.ang_pos_y is not None:
+            pitch_pos_w = self.robot.data.root_pos_w.clone()
+            pitch_pos_w[:, 2] += 0.3
+            self._visualize_angle_arrow(
+                self.cmd_pitch_visualizer, pitch_pos_w, self.vel_command_b[:, 3], heading_quat, axis="pitch"
+            )
+
+        if self.cfg.ranges.ang_pos_x is not None:
+            lean_pos_w = self.robot.data.root_pos_w.clone()
+            lean_pos_w[:, 2] += 0.45
+            self._visualize_angle_arrow(
+                self.cmd_lean_visualizer, lean_pos_w, self.vel_command_b[:, 4], heading_quat, axis="lean"
+            )
+
+    def _visualize_angle_arrow(
+        self,
+        visualizer: VisualizationMarkers,
+        pos_w: torch.Tensor,
+        angle_rad: torch.Tensor,
+        heading_quat: torch.Tensor,
+        axis: str,
+    ):
+        """Poses `visualizer`'s arrow at `pos_w`, rotated by `angle_rad` about the pitch (Y) or lean/roll
+        (X) axis *in the robot's current heading frame* (`heading_quat`, yaw-only), then transformed into
+        world frame -- so the arrow points along wherever the robot is currently facing, tilted by
+        `angle_rad`, instead of always pointing along a fixed world axis. Arrow length scales with the
+        angle's magnitude."""
+        if axis == "pitch":
+            local_quat = math_utils.quat_from_euler_xyz(
+                torch.zeros_like(angle_rad), angle_rad, torch.zeros_like(angle_rad)
+            )
+        else:
+            local_quat = math_utils.quat_from_euler_xyz(
+                angle_rad, torch.zeros_like(angle_rad), torch.zeros_like(angle_rad)
+            )
+        quat = math_utils.quat_mul(heading_quat, local_quat)
+        scale = torch.tensor(visualizer.cfg.markers["arrow"].scale, device=self.device).repeat(len(angle_rad), 1)
+        scale[:, 0] *= torch.abs(angle_rad) * 2.0 + 0.05
+        scale[:, 1] *= torch.abs(angle_rad) * 2.0 + 0.05
         scale[:, 2] *= 0.1
-        self.pitch_goal_visualizer.visualize(base_pos_w, pitch_quat, scale)
+        visualizer.visualize(pos_w, quat, scale)
 
 
 # Step 2: Now the config can reference the already-defined command class
@@ -203,22 +299,24 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
 
     ranges: Ranges = Ranges()  # type: ignore
 
-    pitch_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/pitch_goal"
+    # Commanded pitch/lean arrows only (no actual-value counterparts -- deliberately dropped to cut visual
+    # clutter). .replace() is a plain shallow dataclasses.replace() (confirmed in isaaclab.utils.configclass)
+    # -- it does NOT copy the nested `markers` dict, so every one of these deepcopies it before mutating
+    # scale/color, or they'd end up sharing (and stomping) the same underlying "arrow" marker object.
+    cmd_pitch_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/pitch_cmd"
     )
-    """The configuration for the pitch command visualization marker."""
-    # .replace() is a plain shallow dataclasses.replace() (confirmed in isaaclab.utils.configclass) -- it
-    # does NOT copy the nested `markers` dict, so without this deepcopy, mutating .scale below would
-    # mutate the same "arrow" marker object shared by RED_ARROW_X_MARKER_CFG itself and every other
-    # config anywhere that also does RED_ARROW_X_MARKER_CFG.replace(...), rather than just this one
-    # visualizer.
-    pitch_visualizer_cfg.markers = {"arrow": copy.deepcopy(pitch_visualizer_cfg.markers["arrow"])}
-    # Was (1.0, 1.0, 1.0) -- reported 2-3x too big relative to the robot once actually visible in the
-    # viewport (the earlier fix was for the arrows never updating at all, not their size). Shrunk by ~2.5x.
-    # _debug_vis_callback multiplies this base scale by the pitch magnitude every frame, so this stays
-    # consistent at every pitch value, not just one snapshot. Colored red (was green, same as the velocity
-    # arrows) so it's visually distinct from the commanded/current velocity arrows.
-    pitch_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+    """Commanded pitch arrow (red)."""
+    cmd_pitch_visualizer_cfg.markers = {"arrow": copy.deepcopy(cmd_pitch_visualizer_cfg.markers["arrow"])}
+    cmd_pitch_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+
+    cmd_lean_visualizer_cfg: VisualizationMarkersCfg = RED_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/lean_cmd"
+    )
+    """Commanded lean arrow (purple)."""
+    cmd_lean_visualizer_cfg.markers = {"arrow": copy.deepcopy(cmd_lean_visualizer_cfg.markers["arrow"])}
+    cmd_lean_visualizer_cfg.markers["arrow"].visual_material.diffuse_color = (0.6, 0.0, 1.0)
+    cmd_lean_visualizer_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
 
     goal_vel_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
         prim_path="/Visuals/Command/velocity_goal"

@@ -1,0 +1,244 @@
+diff --git a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/__init__.py b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/__init__.py
+index ada4442..92a506c 100644
+--- a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/__init__.py
++++ b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/__init__.py
+@@ -25,7 +25,8 @@ from .rewards import (
+     base_height_l2_pitch,
+     hip_crossing_l2,
+     foot_sliding_exp,
+-    foot_lift_exp,  # noqa: F401
++    foot_lift_exp,
++    gait_diagonal_coordination,  # noqa: F401
+ )
+ 
+ # Safety-net termination for non-finite (NaN/Inf) simulation state
+@@ -35,6 +36,7 @@ from .terminations import invalid_state  # noqa: F401
+ from .diagnostics import (
+     logged_base_lin_vel,
+     logged_base_ang_vel,
++    logged_base_pos_z,
+     logged_projected_gravity,
+     logged_joint_pos_rel,
+     logged_joint_vel_rel,
+diff --git a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/commands.py b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/commands.py
+index bed5810..a1a6d70 100644
+--- a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/commands.py
++++ b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/commands.py
+@@ -128,11 +128,17 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
+         self.vel_command_b[:, 3] = self.target_pitch
+         self.vel_command_b[:, 4] = self.target_lean
+         self.vel_command_b[:, 5] = self.target_lin_pos_z
+-        # Zero pitch, lean, and height for standing envs
++        # Zero pitch and lean for standing envs. Height is deliberately NOT zeroed here anymore: it used to
++        # be, which meant a standing env's height target was forced to 0 for virtually its entire standing
++        # duration (this line runs every step; the copy above only picks up the zero on the *next* step),
++        # while the robot's actual natural standing height is ~0.3-0.4m -- so height_penalty was
++        # continuously penalizing standing robots for not being at height 0, and the policy never once saw
++        # a "stand still + hold a real commanded height" training example. Leaving target_lin_pos_z alone
++        # for standing envs lets it keep whatever value _resample_command sampled from the full (0.2, 0.4)
++        # range, so that combination actually gets trained on.
+         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
+         self.target_pitch[standing_env_ids] = 0.0
+         self.target_lean[standing_env_ids] = 0.0
+-        self.target_lin_pos_z[standing_env_ids] = 0.0
+ 
+     def _update_metrics(self):
+         """Extends the base tracking-error metrics with the raw commanded values themselves."""
+diff --git a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/diagnostics.py b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/diagnostics.py
+index 5172d4b..38c1ad8 100644
+--- a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/diagnostics.py
++++ b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/diagnostics.py
+@@ -77,6 +77,12 @@ def logged_base_ang_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scen
+     return value
+ 
+ 
++def logged_base_pos_z(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
++    value = isaaclab_mdp.base_pos_z(env, asset_cfg)
++    log_step(env, "obs.base_pos_z", value)
++    return value
++
++
+ def logged_projected_gravity(
+     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+ ) -> torch.Tensor:
+diff --git a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py
+index 8670384..192b092 100644
+--- a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py
++++ b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py
+@@ -347,6 +347,90 @@ def foot_lift_exp(
+     return torch.mean(reward_per_foot, dim=1)
+ 
+ 
++def gait_diagonal_coordination(
++    env: ManagerBasedRLEnv,
++    sensor_cfg: SceneEntityCfg,
++    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
++    feet_body_names: list[str] | None = None,
++    command_name: str = "base_velocity",
++    contact_threshold: float = 0.5,
++    contact_softness: float = 10.0,
++    cmd_speed_gate: float = 0.15,
++) -> torch.Tensor:
++    """Reward trot-like diagonal foot coordination: FL+RR in sync, FR+RL in sync, and roughly one
++    diagonal pair supporting the robot while the other swings.
++
++    Uses a soft (sigmoid) contact value per foot instead of a hard boolean, since a hard threshold flickers
++    around ``contact_threshold``. Only active while the robot is actually commanded to move linearly
++    (``cmd_speed_gate``) -- without this gate, the policy could learn to shuffle its feet while a near-zero
++    velocity command asks it to stand still, just to collect this reward.
++
++    Args:
++        sensor_cfg: Contact sensor configuration covering all robot bodies (indices must align with
++            ``asset_cfg`` -- same requirement as ``foot_sliding_exp``/``foot_lift_exp``).
++        feet_body_names: **Required**, and must be given in ``["FL_foot", "FR_foot", "RL_foot", "RR_foot"]``
++            order -- the diagonal pairing (FL+RR vs FR+RL) is determined positionally, not by name.
++        command_name: Name of the velocity command used for the speed gate.
++        contact_threshold: Contact-force magnitude (N) at which the soft contact value crosses 0.5.
++        contact_softness: Larger values make the sigmoid transition (swing -> stance) sharper.
++        cmd_speed_gate: Minimum commanded horizontal speed (m/s) below which the gait reward is zeroed out.
++    """
++    # extract the used quantities (to enable type-hinting)
++    asset: Articulation = env.scene[asset_cfg.name]
++    contact_sensor = env.scene.sensors[sensor_cfg.name]
++
++    if feet_body_names is None or len(feet_body_names) != 4:
++        raise ValueError(
++            "gait_diagonal_coordination requires 'feet_body_names' as exactly "
++            "[\"FL_foot\", \"FR_foot\", \"RL_foot\", \"RR_foot\"] (diagonal pairing is positional)."
++        )
++    feet_list, resolved_names = asset.find_bodies(feet_body_names)
++    num_art_bodies = asset.data.body_com_vel_w.shape[1]
++    for fid in feet_list:
++        if fid < 0 or fid >= num_art_bodies:
++            raise RuntimeError(
++                f"Resolved foot body index {fid} is out of bounds [0, {num_art_bodies}). "
++                f"feet_body_names={feet_body_names}, resolved_names={resolved_names}"
++            )
++
++    # --- map sensor body names -> feet local sensor indices (same pattern as foot_sliding_exp) ---
++    sensor_name_to_idx = {name: i for i, name in enumerate(contact_sensor.body_names)}
++    n_feet = len(resolved_names)
++    foot_to_sensor = torch.zeros(
++        len(contact_sensor.body_names), n_feet, dtype=torch.float32, device=asset.device
++    )
++    for art_idx, fname in enumerate(resolved_names):
++        if fname in sensor_name_to_idx:
++            foot_to_sensor[sensor_name_to_idx[fname], art_idx] = 1.0
++
++    # --- per-foot contact force magnitude, in the fixed FL/FR/RL/RR order given by feet_body_names ---
++    net_forces = contact_sensor.data.net_forces_w  # (N, num_sensor_bodies, 3)
++    force_mag_all = torch.norm(net_forces, dim=-1)  # (N, num_sensor_bodies)
++    force_mag_per_foot = force_mag_all @ foot_to_sensor  # (N, n_feet) -- order: FL, FR, RL, RR
++
++    # --- soft contact value: ~0 in swing, ~1 in stance ---
++    c = torch.sigmoid((force_mag_per_foot - contact_threshold) / contact_softness)
++    c_fl, c_fr, c_rl, c_rr = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
++
++    # diagonal synchronization: high when FL~=RR and FR~=RL
++    sync = 1.0 - (torch.abs(c_fl - c_rr) + torch.abs(c_fr - c_rl)) / 2.0
++    # alternating support: high when roughly one diagonal pair supports (D1+D2 ~= 1), not all-up/all-down
++    d1 = (c_fl + c_rr) / 2.0
++    d2 = (c_fr + c_rl) / 2.0
++    support = 1.0 - torch.abs(d1 + d2 - 1.0)
++
++    gait = sync * support  # bounded in [0, 1]
++
++    # --- command-speed gate: only reward gait coordination while actually commanded to move ---
++    cmd = env.command_manager.get_command(command_name)
++    cmd_speed = torch.norm(cmd[:, :2], dim=-1)
++    gate = (cmd_speed > cmd_speed_gate).float()
++
++    reward = gait * gate
++    diagnostics.log_step(env, "reward.gait_diagonal_coordination", reward)
++    return reward
++
++
+ def hip_crossing_l2(
+     env: ManagerBasedRLEnv,
+     joint_ids: list[int],
+diff --git a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py
+index 0a76b48..df9be24 100644
+--- a/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py
++++ b/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py
+@@ -177,7 +177,11 @@ class CommandsCfg:
+     base_velocity = mdp.UniformVelocityCommandCfgWithPitch(
+         asset_name="robot",
+         resampling_time_range=(10.0, 10.0),
+-        rel_standing_envs=0.02,
++        # Round 3: raised from 0.02 -- standing envs were only ~2% of training exposure, which was too rare
++        # for the policy to reliably learn "stand still + hold a real commanded height/zero pitch" (see the
++        # step_diagnostics.log analysis this session). 0.12 gives meaningfully more standing exposure
++        # without letting it dominate walking-gait training.
++        rel_standing_envs=0.12,
+         rel_heading_envs=1.0,
+         heading_command=True,
+         heading_control_stiffness=0.5,
+@@ -229,6 +233,13 @@ class ObservationsCfg:
+             func=mdp.logged_projected_gravity,
+             noise=Unoise(n_min=-0.05, n_max=0.05),
+         )
++        # Root height (world-frame Z) -- gives the policy a direct proprioceptive height readout, which it
++        # previously lacked entirely (only ever penalized for wrong height via the reward, never observed
++        # it). No clip: unlike the velocity terms, this isn't guarding against a solver-spike runaway.
++        base_height = ObsTerm(
++            func=mdp.logged_base_pos_z,
++            noise=Unoise(n_min=-0.02, n_max=0.02),
++        )
+         velocity_commands = ObsTerm(
+             func=mdp.logged_generated_commands,
+             params={"command_name": "base_velocity"},
+@@ -307,17 +318,19 @@ class RewardsCfg:
+     )
+     track_ang_vel_z_exp = RewTerm(
+         func=mdp.track_ang_vel_z_exp,
+-        weight=0.5,
++        weight=5.0,
+         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+     )
+     track_pitch_exp = RewTerm(
+         func=mdp.track_pitch_exp,
+-        weight=0.5,
++        # Round 3: 2.0 -> 3.0 (1.5x, not doubling) -- Round 2's larger jump on the angular/pitch/lean
++        # weights already measurably regressed lin_vel_xy tracking, so this round goes moderate.
++        weight=3.0,
+         params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+     )
+     track_lean_exp = RewTerm(
+         func=mdp.track_lean_exp,
+-        weight=0.3,
++        weight=3.0,  # Round 3: kept equal to track_pitch_exp, same reasoning as Round 2
+         params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+     )
+     # -- penalties
+@@ -346,7 +359,7 @@ class RewardsCfg:
+     # additional penalties to encourage more natural motions
+     height_penalty = RewTerm(
+         func=mdp.base_height_l2_pitch,
+-        weight=-1.65,
++        weight=-2.5,  # Round 3: -1.65 -> -2.5 (~1.5x), consistent scaling with the pitch/lean bump above
+         params={
+             "command_name": "base_velocity",
+             "pitch_sensitivity": -0.5,
+@@ -383,7 +396,21 @@ class RewardsCfg:
+             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
+             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+-            "min_height": 0.05,  # 5 cm
++            "min_height": 0.10,  # Round 2: raised from 0.05m -- see go2_round2_reward_engineering_plan.md
++        },
++    )
++    # Round 2: trot-like diagonal gait coordination (see go2_round2_reward_engineering_plan.md).
++    # Weight kept deliberately small relative to the primary velocity-tracking reward (10.0) -- this is a
++    # secondary shaping term, not the main objective.
++    gait_coordination = RewTerm(
++        func=mdp.gait_diagonal_coordination,
++        weight=0.30,
++        params={
++            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
++            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
++            "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
++            "command_name": "base_velocity",
++            "cmd_speed_gate": 0.15,
+         },
+     )
+     # -- optional penalties

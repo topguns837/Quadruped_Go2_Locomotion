@@ -23,6 +23,7 @@ with an auto-reloading image viewer like `feh --reload <interval> <path>`):
 
 import argparse
 import glob
+import math
 import os
 import time
 
@@ -34,17 +35,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 # (panel title, [(tag, line label), ...]) -- one subplot per entry, one line per tag.
 PANELS = [
     ("Mean reward", [("Train/mean_reward", "reward")]),
-    ("Episode terminations", [
-        ("Episode_Termination/invalid_state", "invalid_state"),
-        ("Episode_Termination/body_contact", "body_contact"),
-        ("Episode_Termination/time_out", "time_out"),
-    ]),
     ("Mean episode length", [("Train/mean_episode_length", "length")]),
-    ("Mean action noise std", [("Policy/mean_noise_std", "std")]),
-    ("PPO losses", [
-        ("Loss/value_function", "value_function"),
-        ("Loss/surrogate", "surrogate"),
-    ]),
     ("Linear vel x: commanded vs actual", [
         ("Metrics/base_velocity/cmd_lin_vel_x", "commanded"),
         ("Metrics/base_velocity/actual_lin_vel_x", "actual"),
@@ -56,6 +47,18 @@ PANELS = [
     ("Angular vel z: commanded vs actual", [
         ("Metrics/base_velocity/cmd_ang_vel_z", "commanded"),
         ("Metrics/base_velocity/actual_ang_vel_z", "actual"),
+    ]),
+    ("Pitch: commanded vs actual", [
+        ("Metrics/base_velocity/cmd_pitch", "commanded"),
+        ("Metrics/base_velocity/actual_pitch", "actual"),
+    ]),
+    ("Lean: commanded vs actual", [
+        ("Metrics/base_velocity/cmd_lean", "commanded"),
+        ("Metrics/base_velocity/actual_lean", "actual"),
+    ]),
+    ("Height: commanded vs actual", [
+        ("Metrics/base_velocity/cmd_height", "commanded"),
+        ("Metrics/base_velocity/actual_height", "actual"),
     ]),
     ("Velocity tracking error", [
         ("Metrics/base_velocity/error_vel_xy", "error_vel_xy"),
@@ -83,21 +86,37 @@ def resolve_logdir(path: str) -> str:
 
 
 class LiveDashboard:
-    def __init__(self, logdir: str, max_points: int = 100):
+    def __init__(
+        self,
+        logdir: str,
+        max_points: int = 100,
+        exclude_panels: set[str] | None = None,
+        y_range_multiplier: float = 1.0,
+    ):
         self.logdir = logdir
         self.max_points = max_points
+        self.y_range_multiplier = y_range_multiplier
         # size_guidance scalars=0 means "keep all points", not TensorBoard's default reservoir-sampled
         # subset -- we read the true full history each reload, then slice to the last max_points in
         # _update (below) for display, so "last N steps" always means the N most recent, not a sample
         # spread across the whole run.
         self.accumulator = EventAccumulator(logdir, size_guidance={"scalars": 0})
 
-        self.fig, axes = plt.subplots(3, 3, figsize=(16, 10))
+        exclude_panels = exclude_panels or set()
+        self.panels = [p for p in PANELS if p[0] not in exclude_panels]
+
+        # Grid sized to fit exactly however many panels remain after exclusion (e.g. 9 -> 3x3, 6 -> 3x2),
+        # rather than a hardcoded 3x3 that leaves blank cells whenever panels are excluded. For the default
+        # (no exclusions, 9 panels) this computes to the same 3x3 as before -- unchanged behavior.
+        n = len(self.panels)
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        self.fig, axes = plt.subplots(rows, cols, figsize=(cols * 16 / 3, rows * 10 / 3))
         self.fig.canvas.manager.set_window_title(f"Live training dashboard -- {logdir}")
-        self.axes = axes.flatten()
+        self.axes = [axes] if n == 1 else axes.flatten()
         self.lines: dict[str, dict[str, plt.Line2D]] = {}
 
-        for ax, (title, tags) in zip(self.axes, PANELS):
+        for ax, (title, tags) in zip(self.axes, self.panels):
             ax.set_title(title, fontsize=10)
             ax.set_xlabel("step")
             self.lines[title] = {}
@@ -112,8 +131,9 @@ class LiveDashboard:
         self.accumulator.Reload()
         available = set(self.accumulator.Tags().get("scalars", []))
 
-        for ax, (title, tags) in zip(self.axes, PANELS):
+        for ax, (title, tags) in zip(self.axes, self.panels):
             changed = False
+            all_values: list[float] = []
             for tag, _label in tags:
                 if tag not in available:
                     continue
@@ -121,10 +141,20 @@ class LiveDashboard:
                 steps = [e.step for e in events]
                 values = [e.value for e in events]
                 self.lines[title][tag].set_data(steps, values)
+                all_values.extend(values)
                 changed = True
             if changed:
                 ax.relim()
                 ax.autoscale_view()
+                if self.y_range_multiplier != 1.0 and all_values:
+                    # Computed fresh from this frame's actual data every time -- NOT from ax.get_ylim(),
+                    # which would already reflect the *previous* frame's multiplied range and compound the
+                    # multiplier every redraw (verified directly: after ~20 redraw cycles at multiplier=2.0,
+                    # a true ~1.0 range had exploded to ~30000, i.e. roughly 2^20 -- exactly this bug).
+                    data_lo, data_hi = min(all_values), max(all_values)
+                    center = (data_lo + data_hi) / 2
+                    half_range = max((data_hi - data_lo) / 2, 1e-6) * self.y_range_multiplier
+                    ax.set_ylim(center - half_range, center + half_range)
 
         return [line for panel in self.lines.values() for line in panel.values()]
 
@@ -182,6 +212,20 @@ def main():
             "image viewer, e.g. `feh --reload <interval> <path>`."
         ),
     )
+    parser.add_argument(
+        "--exclude-panels",
+        type=str,
+        default=None,
+        help='Comma-separated panel titles to skip, e.g. "Mean reward,Mean episode length" (must match '
+        "PANELS titles exactly). Default: show every panel that has data, same as before this flag existed.",
+    )
+    parser.add_argument(
+        "--y-range-multiplier",
+        type=float,
+        default=1.0,
+        help="After auto-fitting each panel's y-axis tightly to its data, expand the visible range by this "
+        "factor around the center (e.g. 2.0 doubles it). Default 1.0 leaves the tight auto-fit unchanged.",
+    )
     args = parser.parse_args()
 
     if args.output is not None:
@@ -196,7 +240,13 @@ def main():
     logdir = resolve_logdir(args.logdir)
     print(f"[INFO] Watching: {logdir}")
 
-    dashboard = LiveDashboard(logdir, max_points=args.max_points)
+    exclude_panels = set(p.strip() for p in args.exclude_panels.split(",")) if args.exclude_panels else None
+    dashboard = LiveDashboard(
+        logdir,
+        max_points=args.max_points,
+        exclude_panels=exclude_panels,
+        y_range_multiplier=args.y_range_multiplier,
+    )
     dashboard.run(interval_ms=int(args.interval * 1000), output_path=args.output)
 
 
