@@ -87,6 +87,14 @@ HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --n
 HARDWARE_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/hardware_dashboard --output /tmp/hardware_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
 HARDWARE_VIEW_CMD="feh --reload 3 /tmp/hardware_dashboard.png"
 
+# Tier-1 read-only pre-flight check (deploy/preflight_check.py) -- structurally incapable of publishing
+# anything (no ChannelPublisher/LowCmd_ import in that file at all), so it's safe to run alongside
+# HARDWARE_CMD without any risk of the two fighting over control. Same interpreter choice as HARDWARE_CMD
+# (Isaac Sim's bundled Python directly, not `isaaclab -p`) for the same reason -- no Kit/SimulationApp
+# involved. Shares REPLACE_WITH_NIC_NAME with HARDWARE_CMD; same placeholder-safety reasoning applies (see
+# HARDWARE_CMD's comment on why it's not wrapped in <angle brackets>).
+PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.py --network_interface REPLACE_WITH_NIC_NAME"
+
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
   tmux send-keys -t isaaclab:list-envs "isaaclab -p scripts/list_envs.py"
@@ -105,12 +113,15 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux send-keys -t "$PLAY_VIEW_PANE" "'"${PLAY_VIEW_CMD}"'"
   tmux select-pane -t isaaclab:play.0
   tmux new-window -t isaaclab -n hardware
-  tmux send-keys -t isaaclab:hardware "'"${HARDWARE_CMD}"'"
-  HW_DASH_PANE=$(tmux split-window -h -t isaaclab:hardware -P -F "#{pane_id}")
+  HW_CMD_PANE=$(tmux display-message -p -t isaaclab:hardware -F "#{pane_id}")
+  tmux send-keys -t "$HW_CMD_PANE" "'"${HARDWARE_CMD}"'"
+  HW_DASH_PANE=$(tmux split-window -h -t "$HW_CMD_PANE" -P -F "#{pane_id}")
   tmux send-keys -t "$HW_DASH_PANE" "'"${HARDWARE_DASHBOARD_CMD}"'"
+  HW_PREFLIGHT_PANE=$(tmux split-window -v -t "$HW_CMD_PANE" -P -F "#{pane_id}")
+  tmux send-keys -t "$HW_PREFLIGHT_PANE" "'"${PREFLIGHT_CMD}"'"
   HW_VIEW_PANE=$(tmux split-window -v -t "$HW_DASH_PANE" -P -F "#{pane_id}")
   tmux send-keys -t "$HW_VIEW_PANE" "'"${HARDWARE_VIEW_CMD}"'"
-  tmux select-pane -t isaaclab:hardware.0
+  tmux select-pane -t "$HW_CMD_PANE"
   tmux select-window -t isaaclab:list-envs
   tmux attach -t isaaclab
 '

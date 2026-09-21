@@ -228,22 +228,55 @@ Two tools exist specifically so you can exercise the whole pipeline with zero ro
   `LowCmd` messages round-tripped correctly, joint targets converged to sane values) without any physical
   robot — see git history / session notes for the exact test if you want to reproduce it.
 
-### 4. First real connection (robot hoisted, per Stage 0)
+### 4. First real connection — Tier 1: connect and read only, zero movement
+
+Correction from an earlier version of this doc: `--dry_run` does **not** connect to real DDS or call
+`release_motion_control()` — it always uses zeroed stand-in state, robot or no robot
+(`deploy_real.py:547`, `if _UNITREE_SDK_AVAILABLE and not args.dry_run:`). The actual first-contact tool is
+`deploy/preflight_check.py` — a separate script that subscribes to `rt/lowstate`/`rt/sportmodestate` and
+prints diagnostics, and structurally cannot publish anything (it never imports `ChannelPublisher`/`LowCmd_`
+at all), so it's incapable of moving the robot, not just configured not to.
 
 1. Ethernet cable from your dev machine to the robot; power the robot on.
 2. Identify your NIC: `ifconfig` (look for the interface that came up when you plugged in).
 3. Edit `deploy/configs/go2_locomotion.yaml`'s `network_interface`, or pass `--network_interface` on the
    command line (the CLI flag overrides the config file).
-4. Run with `--dry_run` still on, but now against the real robot:
+4. Run it:
    ```bash
-   /workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp3s0 --dry_run
+   /workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.py --network_interface enp3s0
    ```
-   This *does* call `release_motion_control()` for real (it's only the final `Write()` that's skipped under
-   `--dry_run`) — confirm you see `"[INFO] Onboard motion-control mode released"` and the robot visibly
-   relaxes/stops resisting manual movement, and that the printed `[DRY_RUN]` target joint positions look
-   physically sane (close to the robot's actual current pose, not wildly different) before proceeding.
+   Every ~1s it prints a labeled snapshot with automated PASS/WARN checks where possible. Read each one:
+   - **Connectivity** (`rt/lowstate`/`rt/sportmodestate` message counts and staleness) — confirms the NIC is
+     right and DDS traffic is actually flowing before trusting anything else it prints.
+   - **Per-joint positions**, labeled by name, compared against `default_joint_pos` — while the robot stands
+     normally (not yet released), these won't match exactly, but they should be in the right *ballpark* and,
+     critically, each joint's value should look physically plausible for that specific joint (a hip reading
+     like a calf's typical range is the signature of a joint-order mismatch in `sdk_joint_order`).
+   - **`projected_gravity`** — should read close to `(0, 0, -1)` with the robot standing level; a `WARN`
+     here means the IMU quaternion convention assumption (`w,x,y,z`) may not match this firmware.
+   - **Full observation vector** — sanity-check it holistically: velocities near zero, nothing wildly out of
+     range.
+   - It also reminds you to physically tape-measure the robot's standing height and compare against
+     `DEFAULT_HEIGHT_M=0.3` — not automated, no `SportModeState`-based estimate is attempted here (same open
+     question as Stage 3).
 
-### 5. Go live (hoisted)
+   Tested against `deploy/fake_robot.py` this session (no rig needed for that dry-run-the-tool-itself
+   check) — every check reports PASS against the synthetic robot's known-good data, confirming the script
+   itself works before you ever point it at real hardware.
+
+### 5. Tier 2: release the robot's onboard control (small, controlled movement)
+
+This is the first step that actually moves the robot — via the robot's own built-in `StandDown()`, not
+anything this project's policy is computing. Confirm everything in Tier 1 looked sane first.
+
+There is currently **no dedicated "connect, release, read live data, but never `Write()`" mode** —
+`--dry_run` doesn't do this (see the correction above), and building that flag properly is future work, not
+yet done. Right now, the first time `release_motion_control()` actually runs against the real robot is as
+part of the full live run in step 6 below (`--manual_commands` with every slider left at zero is the
+practical near-zero-risk equivalent). If you want that dedicated flag built before going further, ask for it
+explicitly rather than assuming it exists.
+
+### 6. Go live (hoisted)
 
 ```bash
 /workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp3s0 --manual_commands --live_plot
@@ -258,7 +291,7 @@ Two tools exist specifically so you can exercise the whole pipeline with zero ro
   `default_joint_pos`, not twitch, drift, or fight the hoist. `Ctrl+C` sends a damping command
   (`kp=0, kd=3.0`) and exits cleanly — use it the moment anything looks wrong.
 
-### 6. Ground contact
+### 7. Ground contact
 
 Only after a clean hoisted run: lower the robot per the standard Unitree procedure, keeping a hand near
 `Ctrl+C` the whole time. Start with small nonzero commands on the slider once grounded, not full-speed
