@@ -64,6 +64,31 @@ PANELS = [
         ("Metrics/base_velocity/error_vel_xy", "error_vel_xy"),
         ("Metrics/base_velocity/error_vel_yaw", "error_vel_yaw"),
     ]),
+    # Written by deploy/preflight_check.py --live_plot (Joints/<joint_name> tags, one per leg joint) --
+    # grouped by leg rather than by joint type so "wiggle one leg, watch one panel" reads naturally. These
+    # tags never appear in training/play/hardware logdirs, so --exclude-panels is what keeps them out of
+    # those dashboards (see docker/isaaclab-shell.sh) -- no auto-detection here, to avoid a startup race
+    # where a panel's tags don't exist yet on the very first reload and silently never reappear.
+    ("FL leg joint angles", [
+        ("Joints/FL_hip_joint", "hip"),
+        ("Joints/FL_thigh_joint", "thigh"),
+        ("Joints/FL_calf_joint", "calf"),
+    ]),
+    ("FR leg joint angles", [
+        ("Joints/FR_hip_joint", "hip"),
+        ("Joints/FR_thigh_joint", "thigh"),
+        ("Joints/FR_calf_joint", "calf"),
+    ]),
+    ("RL leg joint angles", [
+        ("Joints/RL_hip_joint", "hip"),
+        ("Joints/RL_thigh_joint", "thigh"),
+        ("Joints/RL_calf_joint", "calf"),
+    ]),
+    ("RR leg joint angles", [
+        ("Joints/RR_hip_joint", "hip"),
+        ("Joints/RR_thigh_joint", "thigh"),
+        ("Joints/RR_calf_joint", "calf"),
+    ]),
 ]
 
 
@@ -194,7 +219,7 @@ def main():
             "(e.g. logs/rsl_rl/<experiment_name>) -- in which case the most recently modified run is used."
         ),
     )
-    parser.add_argument("--interval", type=float, default=3.0, help="Refresh interval in seconds.")
+    parser.add_argument("--interval", type=float, default=0.5, help="Refresh interval in seconds.")
     parser.add_argument(
         "--max-points",
         type=int,

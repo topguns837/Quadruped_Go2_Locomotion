@@ -20,19 +20,34 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Print the loaded Go2 articulation's joint order.")
 parser.add_argument("--task", type=str, default="Quadruped-Locomotion-Go2-Play", help="Task name to load.")
 parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument(
+    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
+)
 AppLauncher.add_app_launcher_args(parser)
-args_cli = parser.parse_args()
+args_cli, hydra_args = parser.parse_known_args()
+
+import sys
+
+sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 import gymnasium as gym
 
+from isaaclab_tasks.utils.hydra import hydra_task_config
+
 import quadruped_go2_locomotion.tasks  # noqa: F401
 
 
-def main():
-    env = gym.make(args_cli.task, num_envs=args_cli.num_envs)
+@hydra_task_config(args_cli.task, args_cli.agent)
+def main(env_cfg, agent_cfg):
+    """`agent_cfg` is required by hydra_task_config's calling convention (matches scripts/rsl_rl/play.py)
+    but unused here -- this script only needs env_cfg to construct the environment and read its
+    articulation's joint order, no RL runner involved."""
+    del agent_cfg
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env = gym.make(args_cli.task, cfg=env_cfg)
     robot = env.unwrapped.scene["robot"]
     print("\n[INFO] Isaac Lab articulation joint order (this is what deploy/configs/go2_locomotion.yaml's "
           "isaac_joint_order must match, in this exact order):")

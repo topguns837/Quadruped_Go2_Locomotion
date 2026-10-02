@@ -18,6 +18,27 @@ cross-compiling/pushing code to the robot) and is the recommended starting point
 the robot's own Jetson) can be revisited later purely as a "cut the cable" convenience once the dev-machine
 pipeline is proven safe and correct — it changes nothing about the control logic itself.
 
+## Current open items (before a first live policy test)
+
+Everything else in this doc's staged plan (physical safety setup, the `deploy/` code itself, the SDK/CRC/
+Dockerfile work) is done and committed. What's left, in rough priority order:
+
+1. **`isaac_joint_order` in `deploy/configs/go2_locomotion.yaml` is still the placeholder guess**
+   (alphabetical `FL/FR/RL/RR × hip/thigh/calf`) — `deploy/dump_joint_order.py` has never actually been run.
+   Pure sim task, no robot needed, do this first (see Stage 2).
+2. **Manual single-joint-wiggle confirmation not yet done** — the first real `preflight_check.py` run (Stage
+   1 below) flagged a consistent calf-joint deviation that's *probably* just a different resting pose, not a
+   mapping bug, but that's not independently confirmed yet.
+3. **Physical height measurement not yet reported** — compare against `DEFAULT_HEIGHT_M=0.3` (Stage 3).
+4. **`release_motion_control()` never run against the real robot** — only verified on loopback (where it
+   correctly fails loud with no responder). Confirming it actually releases a real robot's onboard
+   controller is Tier 2, and hasn't happened yet.
+5. **`SportModeState`-after-`ReleaseMode()` still unconfirmed** — affects `base_lin_vel`, which is still
+   live-wired to it (see Stage 3).
+6. **No dedicated "connect + release + read, never `Write()`" mode exists yet** — flagged as future work in
+   Section 5 below; currently the first real `release_motion_control()` call happens inside the same run as
+   the first live test (Section 6), not as a separate lower-risk step.
+
 ## Sim2real gaps specific to this repo (resolved)
 
 - **Depth camera observation**: NOT a real gap — `mdp.observations.depth_array` and the `depth_camera`
@@ -65,9 +86,26 @@ pipeline is proven safe and correct — it changes nothing about the control log
 ## Proposed pipeline (staged, safety-first)
 
 ### Stage 0 — Physical safety setup (no code)
-Robot hoisted off the ground for all initial tests. Learn the controller's debug-mode sequence
-(`L2+R2` → damping mode) and emergency stop (`select` button / `Ctrl+C` → damping) before running anything.
+**The authoritative step-by-step procedure is [`deploy/Checklist.md`](deploy/Checklist.md)** — follow that, not
+this section, when they differ.
+
+Correction (an earlier version of this doc used G1/H1 conventions that are wrong for the Go2): on the Go2's
+handheld controller, **`L2`(hold)`+B` = damping (soft e-stop)**, `L2+A` = lock stand / again = prone, and
+`SELECT` is "make a pose", **not** an e-stop. After `ReleaseMode` the sport service that normally handles these
+keys is gone, so the controller is only a usable stop if `deploy_real.py`'s own check passes (it reads
+`LowState.wireless_remote` and treats `L2+B` as `Ctrl+C`; see Checklist phases 2-3). `Ctrl+C` and the power
+button are the stops to rely on.
+
+Rules learned the hard way (see Checklist "Known incidents"): never lift or hoist a robot that is powered in
+sport mode (Unitree manual) — release control on the ground first, then hoist; never leave a deploy script
+running through a cable or power change; run `deploy/verify_joint_mapping.py` before every session.
 Direct Ethernet cable from dev machine to Go2; identify the network interface (`ifconfig` after connecting).
+
+**Done** — on this dev machine, the robot's interface was identified as `enp2s0` (IP `192.168.123.51`,
+Unitree's documented default subnet for a direct wired connection). Found via `/sys/class/net/*/carrier`
+(no `ip`/`ifconfig` binaries in the container) plus a Python `socket`/`ioctl` IP check, then confirmed for
+real by Stage 1's first `preflight_check.py` run below actually receiving data on it. If you reconnect on a
+different port later, re-check with the same method rather than assuming `enp2s0` still applies.
 
 ### Stage 1 — `deploy/` directory — **done, and now checked against the real SDK, not just documentation**
 - `deploy/configs/go2_locomotion.yaml` — joint order/index mapping (both `isaac_joint_order` and
@@ -264,10 +302,28 @@ at all), so it's incapable of moving the robot, not just configured not to.
    check) — every check reports PASS against the synthetic robot's known-good data, confirming the script
    itself works before you ever point it at real hardware.
 
+**Results from the actual first real-robot run** (`--network_interface enp2s0`, ~15s):
+- **Connectivity: solid.** `rt/lowstate` ~500Hz, `rt/sportmodestate` ~300Hz, both steady the whole run, no
+  staleness. This is the core question Tier 1 exists to answer, and it's confirmed working.
+- **`projected_gravity`: PASS** (`(-0.086, -0.007, -0.996)`, error 0.086, well under the 0.2 tolerance) —
+  confirms the IMU quaternion convention is right.
+- **Hips and thighs**: in the expected ballpark.
+- **Calves: consistent ~-1.25 to -1.32 rad deviation from `default_joint_pos` on all four legs** (actual
+  readings ≈ -2.75 to -2.82 rad vs. trained default -1.5). Read as *likely* the robot's own onboard-mode
+  standing pose differing from this policy's trained default (not obviously a mapping bug — the values are
+  physically calf-like, deeply negative, not swapped into another joint's typical range) — **but this has
+  not been independently confirmed**. The recommended next step, not yet done: physically move one joint by
+  hand while `preflight_check.py --verbose` runs and confirm only that joint's reading changes.
+- **Height**: not yet reported back — still need a physical tape-measurement to compare against
+  `DEFAULT_HEIGHT_M=0.3`.
+
 ### 5. Tier 2: release the robot's onboard control (small, controlled movement)
 
-This is the first step that actually moves the robot — via the robot's own built-in `StandDown()`, not
-anything this project's policy is computing. Confirm everything in Tier 1 looked sane first.
+This step releases the robot's onboard controller (`ReleaseMode()` only, following Unitree's official C++
+example; `StandDown()` is now opt-in via `--stand_down`, ground only). The motors go limp at release, so the
+robot must be **prone on the ground** (or already hanging), never standing. `deploy_real.py` asks for an
+explicit checklist confirmation before releasing, then holds the legs damped and pauses so you can hoist.
+Confirm everything in Tier 1 looked sane first.
 
 There is currently **no dedicated "connect, release, read live data, but never `Write()`" mode** —
 `--dry_run` doesn't do this (see the correction above), and building that flag properly is future work, not

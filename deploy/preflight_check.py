@@ -34,6 +34,10 @@ Testable right now, no rig needed, against deploy/fake_robot.py:
 from __future__ import annotations
 
 import argparse
+import atexit
+import os
+import subprocess
+import sys
 import time
 
 import deploy_real as dr
@@ -218,6 +222,70 @@ def print_summary(
     print("=" * 74)
 
 
+# Panel titles in scripts/live_dashboard.py's PANELS that don't apply to preflight_check.py's data (it only
+# ever logs Joints/* tags, never Train/* or Metrics/base_velocity/* -- those are training/play/deploy_real
+# concepts) -- excluded so the dashboard shows only the 4 leg-joint panels, not 9 panels where 5 are
+# permanently blank.
+_DASHBOARD_EXCLUDE_PANELS = (
+    "Mean reward,Mean episode length,Linear vel x: commanded vs actual,Linear vel y: commanded vs actual,"
+    "Angular vel z: commanded vs actual,Pitch: commanded vs actual,Lean: commanded vs actual,"
+    "Height: commanded vs actual,Velocity tracking error"
+)
+
+
+def launch_live_dashboard(logdir: str, interval: float, startup_timeout: float = 15.0) -> None:
+    """Spawns scripts/live_dashboard.py (PNG-output mode) and feh as subprocesses, same
+    Popen+atexit.register(proc.terminate) pattern deploy_real.py's launch_slider() already uses for the
+    manual-command slider -- both child processes are cleaned up automatically when this script exits.
+
+    Unlike launch_slider() (which runs the slider under a *different*, system Python and must strip
+    PYTHONPATH/LD_LIBRARY_PATH to avoid an ABI mismatch), live_dashboard.py is launched here under
+    `sys.executable` -- the exact same interpreter this script is already running under -- since it never
+    touches pxr/Omniverse/SimulationApp either (matches deploy_real.py's own interpreter-choice reasoning),
+    so no environment stripping is needed. `feh` is a plain system binary, no Python env concerns at all.
+
+    `feh` is started only after `output_png` actually exists, not at the same time as the dashboard-gen
+    subprocess -- confirmed directly that `feh --reload` does NOT wait for a missing file, it prints
+    "No loadable images specified" and exits immediately (exit code 1) if the target doesn't exist yet at
+    startup. The manual, hand-typed-into-tmux-panes version of this (dashboard-gen pane started first,
+    feh pane started after, with a human naturally pausing in between) never hit this; launching both
+    programmatically back-to-back does, every time, since live_dashboard.py takes a few seconds to import
+    matplotlib/tensorboard and render its first frame. Polling for the file closes that race.
+    """
+    scripts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    live_dashboard_script = os.path.join(scripts_dir, "live_dashboard.py")
+    output_png = "/tmp/preflight_dashboard.png"
+
+    dashboard_proc = subprocess.Popen([
+        sys.executable, live_dashboard_script,
+        "--logdir", logdir,
+        "--output", output_png,
+        "--interval", str(interval),
+        "--exclude-panels", _DASHBOARD_EXCLUDE_PANELS,
+    ])
+    atexit.register(dashboard_proc.terminate)
+
+    print(f"[INFO] Dashboard generator started, waiting for its first frame before opening the viewer...")
+    waited = 0.0
+    poll_interval = 0.2
+    while not os.path.exists(output_png):
+        if dashboard_proc.poll() is not None:
+            print(f"[WARN] live_dashboard.py exited early (code {dashboard_proc.returncode}) before "
+                  f"producing {output_png} -- not launching feh. Check the error output above.")
+            return
+        if waited >= startup_timeout:
+            print(f"[WARN] Gave up waiting for {output_png} after {startup_timeout}s -- not launching feh. "
+                  "The dashboard generator is still running in the background; check its output above.")
+            return
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    feh_proc = subprocess.Popen(["feh", "--reload", str(interval), output_png])
+    atexit.register(feh_proc.terminate)
+
+    print(f"[INFO] Live dashboard launched: generating {output_png} every {interval}s, viewer window opened.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Read-only Tier-1 pre-flight checks (see deploy.md).")
     parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
@@ -231,6 +299,19 @@ def parse_args():
         "--verbose", action="store_true", default=False,
         help="Also print the full per-joint breakdown and full observation vector every interval, not just "
         "the compact status line.",
+    )
+    parser.add_argument(
+        "--live_plot", action="store_true", default=False,
+        help="Log each joint's angle to logs/preflight_dashboard/<timestamp>/ as it's received (not just "
+        "once per --interval), viewable live with scripts/live_dashboard.py --logdir logs/preflight_dashboard "
+        "(see deploy.md) -- for watching joint angles update on a screen from a few feet away, e.g. while "
+        "physically moving a joint by hand to confirm the sdk_joint_order mapping. Implied by --live_dashboard.",
+    )
+    parser.add_argument(
+        "--live_dashboard", action="store_true", default=False,
+        help="Everything --live_plot does, plus automatically launches scripts/live_dashboard.py and feh so "
+        "the joint-angle graph just appears -- no separate commands to type/run yourself. Both child "
+        "processes are cleaned up automatically on exit.",
     )
     return parser.parse_args()
 
@@ -247,11 +328,37 @@ def main():
     joint_tracker = JointTracker(cfg.sdk_joint_order)
     gravity_tracker = GravityTracker()
 
+    live_plot_writer = None
+    if args.live_plot or args.live_dashboard:
+        from torch.utils.tensorboard import SummaryWriter
+
+        live_plot_dir = os.path.join("logs", "preflight_dashboard", time.strftime("%Y-%m-%d_%H-%M-%S"))
+        live_plot_writer = SummaryWriter(log_dir=live_plot_dir)
+        print(f"[INFO] Live joint-angle plot logging to: {live_plot_dir}")
+        if args.live_dashboard:
+            launch_live_dashboard(live_plot_dir, args.interval)
+        else:
+            print("[INFO] View with: isaaclab -p scripts/live_dashboard.py --logdir logs/preflight_dashboard "
+                  "--output /tmp/preflight_dashboard.png --exclude-panels 'Mean reward,Mean episode length,"
+                  "Linear vel x: commanded vs actual,Linear vel y: commanded vs actual,Angular vel z: commanded "
+                  "vs actual,Pitch: commanded vs actual,Lean: commanded vs actual,Height: commanded vs actual,"
+                  "Velocity tracking error'   (+ feh --reload 0.5 /tmp/preflight_dashboard.png) -- or just "
+                  "pass --live_dashboard instead to skip typing these yourself.")
+
     ChannelFactoryInitialize(0, cfg.network_interface)
 
     def _on_low_state(msg: LowState_):
         state.update_from_low_state(msg)
         low_state_health.mark()
+        if live_plot_writer is not None:
+            # Logged here (every received message, ~500Hz typical) rather than once per --interval, so
+            # physically moving a joint by hand shows up on the live dashboard immediately -- that
+            # immediacy is the whole point of this flag (see its --help text).
+            step = low_state_health.count
+            for name, q in zip(cfg.sdk_joint_order, state.joint_pos):
+                live_plot_writer.add_scalar(f"Joints/{name}", q, step)
+            if step % 10 == 0:
+                live_plot_writer.flush()
 
     def _on_sportmode_state(msg: SportModeState_):
         state.update_from_sportmode_state(msg)

@@ -27,24 +27,23 @@ kd: 0.5
 effort_limit: 23.5  # saturation_effort in sim; also usable as a real-hardware torque safety clamp
 
 # --- joint order, Isaac Lab side (the order this policy's action vector is in) ---
-# Names come from unitree_go2witharm_cfg.py's init_state.joint_pos regexes -- standard Unitree Go2 naming.
-# The ORDER below is NOT yet ground-truth: Isaac Lab's articulation joint order is USD-authoring-dependent,
-# not guaranteed to be FL/FR/RL/RR-hip/thigh/calf in this sequence. Run `deploy/dump_joint_order.py` (see
-# that file's docstring) to get the real order from the loaded asset and replace this list before ANY
-# hardware use -- this is Stage 2 of deploy.md's pipeline, done once for this asset, offline, no robot
-# needed. Placeholder order shown here (alphabetical-ish guess) exists only so the config parses.
+# CONFIRMED ground truth via `deploy/dump_joint_order.py` (run this session against the real loaded asset,
+# `env.scene["robot"].joint_names`) -- NOT the placeholder guess this used to be. The real order groups by
+# joint TYPE across all four legs (all hips, then all thighs, then all calves), each in FL/FR/RL/RR order --
+# structurally different from the per-leg grouping (FL_hip,FL_thigh,FL_calf,FR_hip,...) the placeholder
+# assumed. Re-run dump_joint_order.py if the asset/USD ever changes; this list must always match exactly.
 isaac_joint_order:
   - FL_hip_joint
-  - FL_thigh_joint
-  - FL_calf_joint
   - FR_hip_joint
-  - FR_thigh_joint
-  - FR_calf_joint
   - RL_hip_joint
-  - RL_thigh_joint
-  - RL_calf_joint
   - RR_hip_joint
+  - FL_thigh_joint
+  - FR_thigh_joint
+  - RL_thigh_joint
   - RR_thigh_joint
+  - FL_calf_joint
+  - FR_calf_joint
+  - RL_calf_joint
   - RR_calf_joint
 
 # Default (standing) joint position per joint name, in radians -- from

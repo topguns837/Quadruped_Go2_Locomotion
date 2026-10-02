@@ -43,7 +43,7 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # same interval. --logdir points at the experiment root, not one specific run, so it always picks up
 # whichever run is most recently modified.
 DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_with_pitch_lean_and_height_control_ppo --output /tmp/dashboard.png"
-VIEW_CMD="feh --reload 3 /tmp/dashboard.png"
+VIEW_CMD="feh --reload 0.5 /tmp/dashboard.png"
 
 # Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate
 # TensorBoard log under logs/play_dashboard/, written only when --live_plot is on -- see play.py). Same
@@ -60,7 +60,7 @@ VIEW_CMD="feh --reload 3 /tmp/dashboard.png"
 # pane and parsed by ITS shell -- single-quoting survives that whole chain without premature quote-closing,
 # where escaped double-quotes would have broken partway through (verified directly).
 PLAY_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/play_dashboard --output /tmp/play_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
-PLAY_VIEW_CMD="feh --reload 3 /tmp/play_dashboard.png"
+PLAY_VIEW_CMD="feh --reload 0.5 /tmp/play_dashboard.png"
 
 # Real-hardware deployment (see deploy.md, deploy/deploy_real.py). Unlike TRAIN_CMD/PLAY_CMD this does NOT
 # use the `isaaclab -p` wrapper -- deploy_real.py never touches pxr/Omniverse/SimulationApp, so launching
@@ -79,24 +79,30 @@ PLAY_VIEW_CMD="feh --reload 3 /tmp/play_dashboard.png"
 # and fails on a missing "FILL_IN_NIC" input file, instead of erroring obviously. A bare placeholder word
 # has no such failure mode. network_mode: host (docker-compose.yml) is what makes binding a specific host
 # NIC from inside this container possible at all.
-HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface REPLACE_WITH_NIC_NAME --manual_commands --live_plot --dry_run"
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --dry_run"
 
 # Same live-dashboard setup as play's, reading deploy_real.py's --live_plot output instead (logs/hardware_dashboard/,
 # same tag names as play.py's --live_plot -- see deploy_real.py's log_live_plot). Same --exclude-panels/
 # --y-range-multiplier reasoning as PLAY_DASHBOARD_CMD above; training's DASHBOARD_CMD is unaffected.
 HARDWARE_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/hardware_dashboard --output /tmp/hardware_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
-HARDWARE_VIEW_CMD="feh --reload 3 /tmp/hardware_dashboard.png"
+HARDWARE_VIEW_CMD="feh --reload 0.5 /tmp/hardware_dashboard.png"
 
 # Tier-1 read-only pre-flight check (deploy/preflight_check.py) -- structurally incapable of publishing
 # anything (no ChannelPublisher/LowCmd_ import in that file at all), so it's safe to run alongside
 # HARDWARE_CMD without any risk of the two fighting over control. Same interpreter choice as HARDWARE_CMD
 # (Isaac Sim's bundled Python directly, not `isaaclab -p`) for the same reason -- no Kit/SimulationApp
-# involved. Shares REPLACE_WITH_NIC_NAME with HARDWARE_CMD; same placeholder-safety reasoning applies (see
-# HARDWARE_CMD's comment on why it's not wrapped in <angle brackets>).
-PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.py --network_interface REPLACE_WITH_NIC_NAME"
+# involved.
+#
+# --live_dashboard auto-launches scripts/live_dashboard.py + feh as its own subprocesses (see
+# preflight_check.py's launch_live_dashboard()) -- a live per-leg joint-angle graph just appears, no extra
+# panes or commands needed for it. Those subprocesses are independent of this tmux grid entirely (feh opens
+# its own window, same as every other VIEW_CMD in this file), so this pane alone is self-sufficient; it
+# doesn't need (and doesn't use) a paired dashboard-gen/viewer pane the way HARDWARE_CMD's does.
+PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.py --network_interface enp2s0 --live_dashboard"
 
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
+  tmux set-option -g history-limit 50000
   tmux send-keys -t isaaclab:list-envs "isaaclab -p scripts/list_envs.py"
   tmux new-window -t isaaclab -n train
   tmux send-keys -t isaaclab:train "'"${TRAIN_CMD}"'"

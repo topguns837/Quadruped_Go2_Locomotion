@@ -46,6 +46,22 @@ def parse_args():
         "robot standing at its actual default pose, not all-zeros.",
     )
     parser.add_argument("--rate_hz", type=float, default=50.0, help="Publish rate for LowState/SportModeState.")
+    parser.add_argument(
+        "--start_offset_deg", type=float, default=0.0,
+        help="Added to every joint's published start position, so deploy_real.py's ramp has real distance to "
+        "cover (default 0 = the robot already sits at default_joint_pos).",
+    )
+    parser.add_argument(
+        "--responsive", action="store_true", default=False,
+        help="Joints track the commanded q (when the command's kp > 0) and tau_est reports kp*error. Without "
+        "this the fake robot is 'dead': it never moves and reports tau_est=0 -- the signature the "
+        "torque-response watchdog in deploy_real.py exists to catch.",
+    )
+    parser.add_argument(
+        "--press_estop_after", type=float, default=None,
+        help="After this many seconds, publish the handheld-controller bits for L2+B (the e-stop combo) in "
+        "LowState.wireless_remote.",
+    )
     return parser.parse_args()
 
 
@@ -55,7 +71,12 @@ def main():
         cfg = yaml.safe_load(f)
     sdk_joint_order = cfg["sdk_joint_order"]
     default_joint_pos = cfg["default_joint_pos"]
-    default_q_sdk_order = [default_joint_pos[name] for name in sdk_joint_order]
+    offset_rad = args.start_offset_deg * 3.141592653589793 / 180.0
+    default_q_sdk_order = [default_joint_pos[name] + offset_rad for name in sdk_joint_order]
+    q_state = list(default_q_sdk_order)  # current published joint positions (only move when --responsive)
+    tau_state = [0.0] * 12
+    last_cmd = {"q": [0.0] * 12, "kp": [0.0] * 12}
+    start_time = time.monotonic()
 
     ChannelFactoryInitialize(0, args.network_interface)
 
@@ -69,19 +90,34 @@ def main():
     def _on_low_cmd(msg: "LowCmd_"):
         nonlocal received_lowcmd_count
         received_lowcmd_count += 1
+        last_cmd["q"] = [m.q for m in msg.motor_cmd[:12]]
+        last_cmd["kp"] = [m.kp for m in msg.motor_cmd[:12]]
         if received_lowcmd_count % 50 == 1:
             qs = [f"{m.q:.3f}" for m in msg.motor_cmd[:12]]
+            kp0 = msg.motor_cmd[0].kp  # kp is uniform across all 12 joints in this project -- one is enough
             print(f"[FAKE_ROBOT] received LowCmd #{received_lowcmd_count}: head={list(msg.head)} "
-                  f"level_flag={msg.level_flag} mode0={msg.motor_cmd[0].mode} crc={msg.crc} q={qs}")
+                  f"level_flag={msg.level_flag} mode0={msg.motor_cmd[0].mode} kp0={kp0:.2f} crc={msg.crc} q={qs}")
 
     low_cmd_sub = ChannelSubscriber("rt/lowcmd", LowCmd_)
     low_cmd_sub.Init(_on_low_cmd, 10)
 
     def _publish_state():
         low_state = unitree_go_msg_dds__LowState_()
-        for i, q in enumerate(default_q_sdk_order):
-            low_state.motor_state[i].q = q
+        for i in range(12):
+            if args.responsive and last_cmd["kp"][i] > 0.0:
+                err = last_cmd["q"][i] - q_state[i]
+                tau_state[i] = last_cmd["kp"][i] * err
+                q_state[i] += 0.5 * err
+            else:
+                tau_state[i] = 0.0
+            low_state.motor_state[i].q = q_state[i]
             low_state.motor_state[i].dq = 0.0
+            low_state.motor_state[i].tau_est = tau_state[i]
+        if args.press_estop_after is not None and time.monotonic() - start_time >= args.press_estop_after:
+            remote = [0] * 40
+            remote[2] |= 1 << 5  # L2
+            remote[3] |= 1 << 1  # B
+            low_state.wireless_remote = remote
         low_state.imu_state.quaternion = [1.0, 0.0, 0.0, 0.0]  # identity: level, facing +x
         low_state.imu_state.gyroscope = [0.0, 0.0, 0.0]
         low_state_pub.Write(low_state)
