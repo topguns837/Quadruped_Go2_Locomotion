@@ -34,6 +34,8 @@ scripts/
   list_envs.py                        # List available environments
 continualTraining.sh                  # Script for resuming training
 logs/rsl_rl/<experiment_name>/        # Training checkpoints and logs (go2_with_pitch, unitree_go2_flat)
+deploy/                               # Real-hardware deployment over unitree_sdk2py (see deploy.md, deploy/Checklist.md)
+sim2sim/                              # MuJoCo sim2sim runner for exported policies (see sim2sim/README.md)
 ```
 
 ## Running Python Scripts
@@ -101,6 +103,10 @@ Then use the same pattern: `isaaclab-python -c "..."`
 
 # Validate environment wiring (random action)
 ../IsaacLab/isaaclab.sh -p scripts/random_agent.py --task=Quadruped-Locomotion-Go2
+
+# Sim2sim: run an exported policy in MuJoCo (no Kit needed; fetch the model once first)
+./sim2sim/fetch_go2_model.sh
+../IsaacLab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --headless --scenario sim2sim/scenarios/basic.yaml
 ```
 
 ## Training Configuration
@@ -109,11 +115,11 @@ Then use the same pattern: `isaaclab-python -c "..."`
 - **Robot**: Unitree GO2WITHARM (from `isaaclab_assets`)
 - **Terrain**: 8x8m generator with flat (20%) + random_rough (20%), 9x21 grid
 - **Observations**: base_lin_vel, base_ang_vel, projected_gravity, velocity_commands, joint_pos, joint_vel, last_action (with additive uniform noise)
-- **Commands**: lin_vel_x [-1,1], lin_vel_y [-1,1], ang_vel_z [-1,1], heading [-pi,pi], pitch [-0.3,0.3], lean [-0.6,0.6]
+- **Commands** (6-dim: lin_x, lin_y, ang_z, pitch, lean, height): lin_vel_x [-1,1], lin_vel_y [-1,1], ang_vel_z [-1,1], heading [-pi,pi], pitch (`ang_pos_y`) [-0.6,0.6], lean (`ang_pos_x`) [-0.3,0.3], height (`lin_pos_z`) [0.2,0.4]
 - **Actions**: joint position control (scale=0.25, default offset)
-- **Rewards**: track_lin_vel_xy_exp(1.0), track_ang_vel_z_exp(0.5), track_pitch_exp(0.5), track_lean_exp(0.3), lin_vel_z_l2(-2.0), ang_vel_xy_l2(-0.05), dof_torques_l2(-1e-5), dof_acc_l2(-2.5e-7), action_rate_l2(-0.01), undesired_contacts(-1.0), height_penalty(-1.65), hip_crossing_l2(-0.5), joint_deviation_l1(-0.005), joint_pos_limits(-1.0)
+- **Rewards**: track_lin_vel_xy_exp(10.0), track_ang_vel_z_exp(0.5), track_pitch_exp(0.5), track_lean_exp(0.3), lin_vel_z_l2(-2.0), ang_vel_xy_l2(-0.05), dof_torques_l2(-1e-5), dof_acc_l2(-2.5e-7), action_rate_l2(-0.01), undesired_contacts(-1.0), undesired_contacts_arm(-1.0), height_penalty(-1.65), hip_crossing(-0.5), foot_sliding(-1.0), foot_lift(0.1), dof_pos_limits(-1.0), joint_deviation(-0.005). Round 3 weights live in `patches/round3_weights_and_height.patch`
 - **Terminations**: time_out (40s), body_contact (base touch >1.0N)
-- **PPO**: 30000 max iterations, 24 steps/env, lr=1e-3, gamma=0.99, hidden=[256,256,128], elu
+- **PPO**: 10000 max iterations, 24 steps/env, lr=1e-3, gamma=0.99, hidden=[256,512,128], elu
 
 ## Architecture
 
@@ -123,7 +129,7 @@ Then use the same pattern: `isaaclab-python -c "..."`
 - `QuadrupedLocomotionEnvCfg_PLAY` — play config: 50 envs, no observation corruption, closer viewer
 
 ### MDP Module (`mdp/`)
-- `commands.py` — `UniformVelocityCommandCfgWithPitch` extends isaac-lab's `UniformVelocityCommand` to include pitch/lean angle components (command buffer shape: [N, 5])
+- `commands.py` — `UniformVelocityCommandCfgWithPitch` extends isaac-lab's `UniformVelocityCommand` to include pitch/lean angle components (command buffer shape: [N, 6])
 - `rewards.py` — custom Isaac Lab MDP reward terms for pitch tracking, lean tracking, adaptive height penalty (accounts for pitch/lean COM shift), and hip-crossing penalty
 - `observations.py` — depth observation term (sampled from tiled camera output)
 - `curriculums.py` — terrain level progression based on commanded vs. actual distance
@@ -152,7 +158,7 @@ Reward terms in `mdp/rewards.py` follow the Isaac Lab MDP pattern: `def reward_t
 
 ## Working with Commands
 
-The pitch/lean command extension in `mdp/commands.py` adds components [3] and [4] to the base command buffer. The robot should lean forward/backward while walking toward the sampled pitch angle. When modifying commands, ensure observation terms (e.g., `velocity_commands`) correctly feed the command values to the policy.
+The pitch/lean command extension in `mdp/commands.py` adds components [3] (pitch), [4] (lean) and [5] (height) to the base command buffer. The robot should lean forward/backward while walking toward the sampled pitch angle. When modifying commands, ensure observation terms (e.g., `velocity_commands`) correctly feed the command values to the policy.
 
 ## Training Artifacts
 

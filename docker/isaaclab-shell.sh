@@ -100,6 +100,13 @@ HARDWARE_VIEW_CMD="feh --reload 0.5 /tmp/hardware_dashboard.png"
 # doesn't need (and doesn't use) a paired dashboard-gen/viewer pane the way HARDWARE_CMD's does.
 PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.py --network_interface enp2s0 --live_dashboard"
 
+# MuJoCo sim2sim (sim2sim/sim2sim_mujoco.py, see sim2sim/README.md): runs an exported policy in MuJoCo with the
+# same slider and dashboard as play/hardware. Isaac Sim's bundled Python directly, no Kit, same as HARDWARE_CMD.
+# The Menagerie Go2 model is fetched on first use (gitignored, not baked into the image).
+SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --manual_commands --live_plot"
+SIM2SIM_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/sim2sim_dashboard --output /tmp/sim2sim_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
+SIM2SIM_VIEW_CMD="feh --reload 0.5 /tmp/sim2sim_dashboard.png"
+
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
   tmux set-option -g history-limit 50000
@@ -128,6 +135,13 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   HW_VIEW_PANE=$(tmux split-window -v -t "$HW_DASH_PANE" -P -F "#{pane_id}")
   tmux send-keys -t "$HW_VIEW_PANE" "'"${HARDWARE_VIEW_CMD}"'"
   tmux select-pane -t "$HW_CMD_PANE"
+  tmux new-window -t isaaclab -n sim2sim
+  tmux send-keys -t isaaclab:sim2sim "'"${SIM2SIM_CMD}"'"
+  S2S_DASH_PANE=$(tmux split-window -h -t isaaclab:sim2sim -P -F "#{pane_id}")
+  tmux send-keys -t "$S2S_DASH_PANE" "'"${SIM2SIM_DASHBOARD_CMD}"'"
+  S2S_VIEW_PANE=$(tmux split-window -v -t "$S2S_DASH_PANE" -P -F "#{pane_id}")
+  tmux send-keys -t "$S2S_VIEW_PANE" "'"${SIM2SIM_VIEW_CMD}"'"
+  tmux select-pane -t isaaclab:sim2sim.0
   tmux select-window -t isaaclab:list-envs
   tmux attach -t isaaclab
 '

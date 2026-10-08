@@ -929,8 +929,10 @@ def build_observation(
     default_joint_pos_isaac_order: list[float],
     manual_cmd: list[float],
     last_action: list[float],
+    base_height: float = DEFAULT_HEIGHT_M,
 ) -> torch.Tensor:
-    lean, pitch = quat_to_pitch_lean(state.quat_wxyz)
+    """`base_height` defaults to the hardware stand-in constant; sim2sim/sim2sim_mujoco.py passes the true
+    simulated height instead."""
     gravity_b = quat_rotate_inverse_wxyz(state.quat_wxyz, (0.0, 0.0, -1.0))
 
     joint_pos_isaac = [state.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
@@ -942,7 +944,7 @@ def build_observation(
     parts += list(state.gyro)  # base_ang_vel (body frame), 3
     parts += list(gravity_b)  # projected_gravity, 3
     if cfg.has_height_obs:
-        parts += [DEFAULT_HEIGHT_M]  # base_height, 1 -- fixed constant for now, see module docstring
+        parts += [base_height]  # base_height, 1 -- DEFAULT_HEIGHT_M on hardware for now, see module docstring
     parts += list(manual_cmd)  # velocity_commands, 6: [lin_x, lin_y, ang_z, pitch, lean, height]
     parts += joint_pos_rel  # joint_pos, 12
     parts += joint_vel_isaac  # joint_vel, 12
