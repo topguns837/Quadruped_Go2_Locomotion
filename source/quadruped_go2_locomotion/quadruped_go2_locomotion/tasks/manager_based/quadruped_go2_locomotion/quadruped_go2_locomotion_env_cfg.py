@@ -189,7 +189,6 @@ class CommandsCfg:
             heading=(-math.pi, math.pi),
             ang_pos_x=(-0.3, 0.3),
             ang_pos_y=(-0.6, 0.6),
-            lin_pos_z=(0.2, 0.4),
         ),
     )
 
@@ -266,7 +265,41 @@ class EventCfg:
         },
     )
 
-    # reset 
+    # Corrects 2.0 kg of phantom mass, 13% of the robot. `imu` and `radar` are massless sensor frames in
+    # Unitree's URDF and are authored `physics:mass = 0.0` in our USD, but a rigid body cannot have zero mass
+    # in PhysX, so it silently substitutes its 1.0 kg default for EACH of them. Measured via
+    # root_physx_view.get_masses(): the robot loaded at 17.623 kg against a ~15.6 kg real weight, and because
+    # `radar` sits at (+0.289, 0, -0.047) that put 1 kg at the nose, 29 cm forward of the base origin, shifting
+    # the centre of mass ~1 cm forward and inflating pitch inertia. Our hardware has no radar fitted at all.
+    #
+    # Notes on the specific arguments:
+    #  - "abs" sets an absolute value and the degenerate (x, x) range makes this a deterministic setter, the
+    #    same trick physics_material above uses. 1 g rather than 0 because the term clamps at min_mass=1e-6.
+    #  - mode="startup" runs once after sim start, by which point the actuator's cached default_mass holds
+    #    PhysX's substituted 1.0 kg; "abs" then overwrites it. The term re-reads default_mass before applying,
+    #    so it is idempotent. "prestartup" would not work with replicate_physics=True.
+    #  - recompute_inertia=False because PhysX substituted only the MASS: the authored
+    #    physics:diagonalInertia = 1e-5 is non-zero and was kept. Rescaling it to 1e-8 buys nothing, and these
+    #    are not uniform-density solids. Either way both bodies are welded to `base` by fixed joints, so 2e-5
+    #    against the base's ~0.1 kg*m^2 is a 0.02% effect.
+    #  - body_names are literals matched with re.fullmatch, so they hit exactly these two bodies and raise at
+    #    startup if either name ever disappears, instead of silently doing nothing. Neither body has any child
+    #    prim, geometry or CollisionAPI, and neither appears in any reward/termination/contact body_names list,
+    #    so this change is confined to dynamics.
+    #  - UsdFileCfg.mass_props cannot do this: modify_mass_properties is @apply_nested and would overwrite all
+    #    47 rigid bodies' masses.
+    fix_massless_sensor_bodies = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["imu", "radar"]),
+            "mass_distribution_params": (0.001, 0.001),
+            "operation": "abs",
+            "recompute_inertia": False,
+        },
+    )
+
+    # reset
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
@@ -344,13 +377,22 @@ class RewardsCfg:
         },
     )
     # additional penalties to encourage more natural motions
+    #
+    # target_height=0.337 is the base height the default joint pose produces (thigh 0.8/1.0, calf -1.5, plus
+    # the foot collision radius) -- matches what joint_deviation_l1 already pulls toward, so the two rewards
+    # agree instead of fighting. pitch_sensitivity lowered from -0.5 (which drove the target to an
+    # unreachable 0.037m at the +-0.6 rad pitch limit) to -0.1, allowing ~6cm of crouch at full pitch instead
+    # of 30cm -- the base barely moves vertically under pitch anyway, since the hips are +-0.193m fore/aft of
+    # center. There is no height COMMAND any more (see mdp.commands' module docstring): no reliable height
+    # measurement exists on real hardware, so this fixed target is the only height regulation left.
     height_penalty = RewTerm(
         func=mdp.base_height_l2_pitch,
         weight=-1.65,
         params={
             "command_name": "base_velocity",
-            "pitch_sensitivity": -0.5,
-            "lean_sensitivity": 0.05,
+            "target_height": 0.337,
+            "pitch_sensitivity": -0.1,
+            "lean_sensitivity": 0.0,
         },
     )
 

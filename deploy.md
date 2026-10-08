@@ -29,7 +29,12 @@ Dockerfile work) is done and committed. What's left, in rough priority order:
 2. **Manual single-joint-wiggle confirmation not yet done** — the first real `preflight_check.py` run (Stage
    1 below) flagged a consistent calf-joint deviation that's *probably* just a different resting pose, not a
    mapping bug, but that's not independently confirmed yet.
-3. **Physical height measurement not yet reported** — compare against `DEFAULT_HEIGHT_M=0.3` (Stage 3).
+3. **Resolved by removal, not measurement**: height is no longer a command or an observation at all (see
+   `mdp/commands.py`'s module docstring) -- there was never a reliable way to measure it on real hardware,
+   so the training-side fix was to hold the robot near a fixed default stance height purely via a reward,
+   and drop the `base_height` observation and `DEFAULT_HEIGHT_M` hardware stand-in entirely. The old
+   "Stage 3" items below (tape-measure the standing height, resolve SportModeState-for-height) are
+   therefore moot, and marked so in place rather than renumbered, to keep this list's history intact.
 4. **`release_motion_control()` never run against the real robot** — only verified on loopback (where it
    correctly fails loud with no responder). Confirming it actually releases a real robot's onboard
    controller is Tier 2, and hasn't happened yet.
@@ -44,14 +49,15 @@ Dockerfile work) is done and committed. What's left, in rough priority order:
 - **Depth camera observation**: NOT a real gap — `mdp.observations.depth_array` and the `depth_camera`
   `TiledCameraCfg` in `quadruped_go2_locomotion_env_cfg.py` are dead code (the camera cfg is wrapped in a
   docstring, and `depth_array` is never referenced in `ObservationsCfg.PolicyCfg`). Ignore entirely.
-- **`base_pos_z` (height) observation**: real gap, **currently unresolved, deliberately deferred**. Original
-  plan was to read it from `SportModeState`'s fused body-position estimate, falling back to forward
-  kinematics if that proved unreliable — but `SportModeState`'s real-hardware availability *after* releasing
-  the onboard motion-control service (a required step for `LowCmd` to work at all, see Stage 2.5) is
-  unconfirmed (web research suggests it may stop publishing once released; not yet checked against Unitree's
-  own docs or hardware). Rather than build either path on that uncertain footing, `deploy_real.py` currently
-  sends a **fixed constant** (`DEFAULT_HEIGHT_M = 0.3`) for this observation. Revisit once hardware is
-  available — see Stage 3.
+- **`base_pos_z` (height) observation**: ~~real gap, currently unresolved, deliberately deferred~~ --
+  **RESOLVED BY REMOVAL.** The plan here used to be reading it from `SportModeState`'s fused body-position
+  estimate, falling back to forward kinematics, but `SportModeState`'s real-hardware availability *after*
+  releasing the onboard motion-control service (Stage 2.5) was never confirmed, and `deploy_real.py` was
+  sending a fixed constant (`DEFAULT_HEIGHT_M = 0.3`) in the meantime. Rather than keep building on that
+  uncertain footing, the training config itself no longer has a height command or a `base_height`
+  observation at all -- see `mdp/commands.py`'s module docstring. `DEFAULT_HEIGHT_M` and `has_height_obs`
+  are gone from `deploy_real.py`; the robot is held near a fixed default stance height purely by a training
+  reward (`height_penalty`, target 0.337m), with nothing for the real control loop to read or send.
 - **Joint order mapping (the classic sim2real bug)**: Isaac Lab's articulation joint order (USD-defined, via
   `unitree_go2witharm_cfg.py`) will NOT match the Go2 SDK's `LowCmd`/`LowState` motor index order. The SDK
   side is now **confirmed** (not just documented convention) — fetched and read `unitree_sdk2py`'s own
@@ -59,11 +65,12 @@ Dockerfile work) is done and committed. What's left, in rough priority order:
   The Isaac Lab side is still a placeholder guess pending `deploy/dump_joint_order.py` — see Stage 2. Same
   applies to action scale (0.25) + default joint offsets, which must be reproduced exactly (done, copied
   directly from `unitree_go2witharm_cfg.py`/`ActionsCfg`, not generic hardware defaults).
-- **Command vector shape**: this repo's commands are 6-dim (lin_x, lin_y, ang_z, pitch, lean, height) vs.
-  stock Go2's 3-dim joystick (lin_x, lin_y, yaw rate). The existing `scripts/manual_command_slider.py` GUI
-  (communicates via a JSON file) is directly reusable as the real-robot command source instead of parsing
-  the Unitree remote's joystick channels — it already produces exactly this 6-dim vector, and
-  `deploy/deploy_real.py` polls it the same way `scripts/rsl_rl/play.py` does (verbatim-ported poll loop).
+- **Command vector shape**: this repo's commands are 5-dim (lin_x, lin_y, ang_z, pitch, lean -- height was
+  removed, see the `base_pos_z` bullet above) vs. stock Go2's 3-dim joystick (lin_x, lin_y, yaw rate). The
+  existing `scripts/manual_command_slider.py` GUI (communicates via a JSON file) is directly reusable as the
+  real-robot command source instead of parsing the Unitree remote's joystick channels -- it already produces
+  exactly this 5-dim vector, and `deploy/deploy_real.py` polls it the same way `scripts/rsl_rl/play.py` does
+  (verbatim-ported poll loop).
 - **Control frequency mismatch (robot's native publish rate vs. the policy's trained rate)**: the policy
   must be stepped at exactly 50 Hz (`decimation=4` × `sim.dt=0.005` in
   `quadruped_go2_locomotion_env_cfg.py`), independent of whatever rate the robot's own `LowState` publishes
@@ -121,7 +128,8 @@ different port later, re-check with the same method rather than assuming `enp2s0
   entirely (see Stage 2.5); publishing is now two-rate, not one — a `RecurrentThread` at ~500 Hz
   (`publish_low_cmd`) continuously republishes whatever's in a shared `LowCmdTarget` buffer, decoupled from
   the 50 Hz policy-inference loop that only updates that buffer (matches the reference exactly). Height
-  tracking is a fixed constant for now (`DEFAULT_HEIGHT_M`), not a real estimate — see Stage 3.
+  tracking (`DEFAULT_HEIGHT_M`) and the `has_height_obs` branch have since been removed outright, not just
+  simplified -- see Stage 3.
 - `deploy/dump_joint_order.py` — prints Isaac Lab's real articulation joint order (needs the sim, no
   hardware) so `isaac_joint_order` in the config can be filled with ground truth instead of a guess.
 - Dependency: `unitree_sdk2py` — **now actually installed** in the running container and baked into
@@ -173,17 +181,20 @@ carries a direct warning: *"The GO2 in low-level mode can easily be damaged if u
 object construction and method calls are verified working (on loopback, no robot); whether it actually
 releases control on a real unit is not.
 
-### Stage 3 — Height-estimate wiring — **deferred to a fixed constant, not implemented for real**
-Height tracking isn't working yet, and rather than guess at a fix, `deploy_real.py` now always sends
-`DEFAULT_HEIGHT_M = 0.3` (the robot's nominal standing height) for this observation — no `SportModeState`
-subscription for height, no forward-kinematics stub pretending to be a real implementation. The open
-question this was blocked on remains open: `SportModeState`'s real-hardware availability *after*
-`ReleaseMode()` (Stage 2.5) is unconfirmed — web research suggests it may stop publishing once the onboard
-controller releases, which would make it useless for exactly the state the policy needs it in, but this
-hasn't been checked against Unitree's own docs or a real robot. `state.sportmode_velocity` (used for
-`base_lin_vel`) is left wired up to the same subscription despite this same open question — flagged in code
-comments, not silently trusted, but not simplified to a constant since there's no evidence yet it
-specifically fails. Revisit both once hardware is available to test directly.
+### Stage 3 -- Height-estimate wiring -- **RESOLVED BY REMOVAL, not implemented for real**
+Height tracking wasn't working (no reliable real-hardware source existed), and rather than keep guessing at
+a fix, `deploy_real.py` used to always send `DEFAULT_HEIGHT_M = 0.3` for this observation as a stopgap. That
+stopgap, the `base_height` observation it fed, and the `has_height_obs` field it depended on are now gone
+entirely -- height is not a command or an observation any more (see `mdp/commands.py`'s module docstring),
+so there was nothing left here to wire to `SportModeState` or forward kinematics, and no open question left
+to resolve for height specifically.
+
+The *separate* open question this section was originally blocked alongside -- `SportModeState`'s
+real-hardware availability *after* `ReleaseMode()` (Stage 2.5) -- is NOT resolved and still applies to
+`state.sportmode_velocity` (used for `base_lin_vel`, which is unrelated to height and still live-wired to
+that same subscription): web research suggests it may stop publishing once the onboard controller releases,
+but this hasn't been checked against Unitree's own docs or a real robot. Revisit once hardware is available
+to test directly.
 
 ### Stage 4 — Dry run (hoisted, zero command)
 `deploy_real.py --dry_run` already exists (Stage 1) and has been smoke-tested off-hardware. With the robot
@@ -216,19 +227,24 @@ Confirm it's there:
 
 ### 1. Pick which policy to run
 
-Both committed models work with this pipeline — pick based on what you're testing:
+**Both committed models below are now stale** -- they were trained against the old 23.5 Nm calf limit (the
+real calf has a 1.9169:1 knee reduction, 45.43 Nm), the old 6-dim/`base_height` observation, and the
+imu/radar phantom mass (+2.0 kg, 13% overweight). `unitree_go2witharm_cfg.py` no longer reproduces any of
+those three, so neither committed checkpoint matches the current training config; see
+`sim2sim/README.md` for the measurements, and retrain before using this pipeline for real.
 - **Vanilla**: `models/9_10_26_vanilla/exported/policy.pt` — simpler baseline, no pitch/lean/height weight
   bumps, no `base_height` observation (51-dim input).
 - **Experimental (Round 3)**: `models/9_13_26_pitch_lean_height_weights_experimental/exported/policy.pt` —
   the best-performing trained policy so far (52-dim input, includes `base_height`, but see the height-gap
   caveat below — it's fed a constant, not a real estimate, on hardware right now).
 
+Once retrained, the new policy will be 50-dim (5-dim command, no `base_height` observation at all -- see the
+`base_pos_z` bullet above) and `deploy_real.py`'s `DeployConfig` no longer has a `has_height_obs` field, so
+there is nothing left to infer from the filename any more.
+
 Set `policy_path` in `deploy/configs/go2_locomotion.yaml` to whichever `exported/policy.pt` you're using —
 **not** the raw `model_<N>.pt` checkpoint (that's the full RSL-RL training state, not a standalone inference
-module; see the config's own comment). If you switch policies later, remember `has_height_obs` is inferred
-from the path containing `"round3"` or `"experimental"` — don't rename the file to something that breaks
-that check, or the observation vector will be the wrong size and `torch.jit.load`'s forward pass will fail
-loudly (a real, if unlikely, footgun worth knowing about).
+module; see the config's own comment).
 
 ### 2. Get the joint order right (offline, no robot needed, do this once per asset)
 
@@ -293,10 +309,7 @@ at all), so it's incapable of moving the robot, not just configured not to.
    - **`projected_gravity`** — should read close to `(0, 0, -1)` with the robot standing level; a `WARN`
      here means the IMU quaternion convention assumption (`w,x,y,z`) may not match this firmware.
    - **Full observation vector** — sanity-check it holistically: velocities near zero, nothing wildly out of
-     range.
-   - It also reminds you to physically tape-measure the robot's standing height and compare against
-     `DEFAULT_HEIGHT_M=0.3` — not automated, no `SportModeState`-based estimate is attempted here (same open
-     question as Stage 3).
+     range. No height entry to check any more: see the `base_pos_z` bullet above.
 
    Tested against `deploy/fake_robot.py` this session (no rig needed for that dry-run-the-tool-itself
    check) — every check reports PASS against the synthetic robot's known-good data, confirming the script
@@ -314,8 +327,9 @@ at all), so it's incapable of moving the robot, not just configured not to.
   physically calf-like, deeply negative, not swapped into another joint's typical range) — **but this has
   not been independently confirmed**. The recommended next step, not yet done: physically move one joint by
   hand while `preflight_check.py --verbose` runs and confirm only that joint's reading changes.
-- **Height**: not yet reported back — still need a physical tape-measurement to compare against
-  `DEFAULT_HEIGHT_M=0.3`.
+- **Height**: not yet reported back at the time of this run, and now moot -- `DEFAULT_HEIGHT_M` and the
+  `base_height` observation it fed were removed outright afterward (see the `base_pos_z` bullet above), so
+  there is nothing left to compare a tape-measurement against.
 
 ### 5. Tier 2: release the robot's onboard control (small, controlled movement)
 
@@ -353,12 +367,12 @@ Only after a clean hoisted run: lower the robot per the standard Unitree procedu
 `Ctrl+C` the whole time. Start with small nonzero commands on the slider once grounded, not full-speed
 walking.
 
-### Known limitation to keep in mind throughout
+### Known limitation to keep in mind throughout (historical -- resolved by removal for any retrained policy)
 
-`base_height` (fed to the experimental policy only) is currently a **fixed 0.3m constant**, not a real
-measurement (see Stage 3) — the policy will behave as if the robot is always at exactly that height
-regardless of reality. This is a known, deliberate simplification, not a bug to chase if height-dependent
-behavior looks off during testing.
+For the two committed (pre-retrain) models only: `base_height` (fed to the experimental policy only) was a
+**fixed 0.3m constant**, not a real measurement -- the policy behaved as if the robot was always at exactly
+that height regardless of reality. A policy trained after the height removal has no `base_height`
+observation at all, so this limitation does not apply to it; see the `base_pos_z` bullet above.
 
 ## Verification
 
@@ -373,7 +387,7 @@ behavior looks off during testing.
   verification notes above for the full list of what was and wasn't checked.
 - What's left is inherently hardware-in-the-loop and not simulable: whether `release_motion_control`
   actually releases a real robot's onboard controller (Stage 2.5), whether `SportModeState` keeps publishing
-  afterward (Stage 3 — currently sidestepped via a fixed height constant, but `sportmode_velocity` still
+  afterward (height no longer depends on this at all, having been removed outright, but `sportmode_velocity` still
   depends on this), and `sdk_joint_order`/`isaac_joint_order` ground-truth confirmation (Stage 2). Proceed
   stage-by-stage, do not skip the hoisted dry-run (Stage 4).
 - Keep the robot hoisted for every test until Stage 5 explicitly says otherwise.

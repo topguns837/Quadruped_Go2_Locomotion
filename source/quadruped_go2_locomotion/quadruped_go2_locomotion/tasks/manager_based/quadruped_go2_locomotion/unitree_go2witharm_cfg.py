@@ -51,11 +51,39 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "base_legs": DCMotorCfg(
-            joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            effort_limit=23.5,
-            saturation_effort=23.5,
-            velocity_limit=30.0,
+        # Two groups, not one, because the Go2's calf is NOT the same motor as its hip and thigh: it sits
+        # behind a 1.9169:1 knee reduction. Unitree's own go2_description.urdf gives hip/thigh as
+        # effort=23.7 Nm velocity=30.1 rad/s and calf as effort=45.43 Nm velocity=15.70 rad/s, and this
+        # project's own USD carries the same numbers on its joint drives (calf
+        # drive:angular:physics:maxForce = 45.43, physxJoint:maxJointVelocity = 899.54 deg/s = 15.70 rad/s).
+        #
+        # Until now all 12 joints shared one DCMotorCfg at 23.5 Nm / 30.0 rad/s, which discarded those USD
+        # values and trained the calf at 0.52x its real torque with a torque-speed curve rolling off at 1.9x
+        # the real speed. Isaac Lab's own stock Go2 config had the identical bug; see isaac-sim/IsaacLab
+        # PR #7564 "Fix Unitree Go1 and Go2 calf actuator limits ignoring the knee reduction".
+        #
+        # The split is needed (rather than one group with per-joint dicts) because DCMotorCfg.saturation_effort
+        # is a scalar `float` in Isaac Lab v2.3.2 -- effort_limit/velocity_limit accept dicts, saturation_effort
+        # does not. PR #7564 added dict support upstream; on a newer Isaac Lab these two groups could be merged.
+        #
+        # Policies trained before this change (models/9_10_26_vanilla, models/9_13_26_*) depend on the old weak
+        # calf: they command calf targets far past the joint limit and rely on the 23.5 Nm clamp to turn that
+        # into a steady push. Give them the real torque and they destabilise, so they are NOT valid under this
+        # config and must be retrained, not resumed. See sim2sim/README.md for the measurements.
+        "hip_thigh": DCMotorCfg(
+            joint_names_expr=[".*_hip_joint", ".*_thigh_joint"],
+            effort_limit=23.7,
+            saturation_effort=23.7,
+            velocity_limit=30.1,
+            stiffness=25.0,
+            damping=0.5,
+            friction=0.0,
+        ),
+        "calves": DCMotorCfg(
+            joint_names_expr=[".*_calf_joint"],
+            effort_limit=45.43,
+            saturation_effort=45.43,
+            velocity_limit=15.70,
             stiffness=25.0,
             damping=0.5,
             friction=0.0,

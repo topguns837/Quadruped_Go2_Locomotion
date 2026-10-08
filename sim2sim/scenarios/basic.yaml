@@ -1,18 +1,20 @@
 # Basic sim2sim scenario: one behavior per segment, flat ground.
-# command = [lin_vel_x (m/s), lin_vel_y (m/s), ang_vel_z (rad/s), pitch (rad), lean (rad), height (m)]
-# Ranges seen in training: lin/ang +/-1.0, pitch +/-0.6, lean +/-0.3, height 0.2 to 0.4.
+# command = [lin_vel_x (m/s), lin_vel_y (m/s), ang_vel_z (rad/s), pitch (rad), lean (rad)]
+# Ranges seen in training: lin/ang +/-1.0, pitch +/-0.6, lean +/-0.3.
+# No height component: there is no height COMMAND any more (see mdp/commands.py's module docstring). Height
+# is tracked in the sim2sim summary as actual-vs-nominal instead -- see NOMINAL_HEIGHT_M in
+# sim2sim_mujoco.py -- so there used to be dedicated crouch/tall segments here (commanding 0.25/0.35 m) that
+# are no longer meaningful and have been removed.
 segments:
-  - {name: stand,          duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.0, 0.30]}
-  - {name: forward_slow,   duration: 5.0, command: [0.3, 0.0, 0.0, 0.0, 0.0, 0.30]}
-  - {name: forward_fast,   duration: 5.0, command: [0.8, 0.0, 0.0, 0.0, 0.0, 0.30]}
-  - {name: backward,       duration: 5.0, command: [-0.5, 0.0, 0.0, 0.0, 0.0, 0.30]}
-  - {name: lateral,        duration: 5.0, command: [0.0, 0.5, 0.0, 0.0, 0.0, 0.30]}
-  - {name: turn,           duration: 5.0, command: [0.0, 0.0, 0.8, 0.0, 0.0, 0.30]}
-  - {name: forward_turn,   duration: 5.0, command: [0.5, 0.0, 0.5, 0.0, 0.0, 0.30]}
-  - {name: pitch_up,       duration: 5.0, command: [0.0, 0.0, 0.0, -0.2, 0.0, 0.30]}
-  - {name: pitch_down,     duration: 5.0, command: [0.0, 0.0, 0.0, 0.2, 0.0, 0.30]}
-  - {name: lean_left,      duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, -0.2, 0.30]}
-  - {name: lean_right,     duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.2, 0.30]}
-  - {name: crouch,         duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.0, 0.25]}
-  - {name: tall,           duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.0, 0.35]}
-  - {name: stand_end,      duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.0, 0.30]}
+  - {name: stand,          duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.0]}
+  - {name: forward_slow,   duration: 5.0, command: [0.3, 0.0, 0.0, 0.0, 0.0]}
+  - {name: forward_fast,   duration: 5.0, command: [0.8, 0.0, 0.0, 0.0, 0.0]}
+  - {name: backward,       duration: 5.0, command: [-0.5, 0.0, 0.0, 0.0, 0.0]}
+  - {name: lateral,        duration: 5.0, command: [0.0, 0.5, 0.0, 0.0, 0.0]}
+  - {name: turn,           duration: 5.0, command: [0.0, 0.0, 0.8, 0.0, 0.0]}
+  - {name: forward_turn,   duration: 5.0, command: [0.5, 0.0, 0.5, 0.0, 0.0]}
+  - {name: pitch_up,       duration: 5.0, command: [0.0, 0.0, 0.0, -0.2, 0.0]}
+  - {name: pitch_down,     duration: 5.0, command: [0.0, 0.0, 0.0, 0.2, 0.0]}
+  - {name: lean_left,      duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, -0.2]}
+  - {name: lean_right,     duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.2]}
+  - {name: stand_end,      duration: 5.0, command: [0.0, 0.0, 0.0, 0.0, 0.0]}

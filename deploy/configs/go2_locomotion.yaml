@@ -10,6 +10,13 @@ policy_path: models/9_13_26_pitch_lean_height_weights_experimental/exported/poli
   # the raw observation vector and returns actions directly (obs normalization baked in). NOT model_17999.pt
   # (that's the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic
   # class to load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
+  #
+  # STALE as of the calf-actuator and height/mass fixes: this 52-dim policy was trained against the old
+  # 23.5 Nm calf limit, the old 6-wide/base_height observation, and the imu/radar phantom mass -- none of
+  # which the current training config reproduces any more. deploy_real.py's observation builder is now
+  # 50-dim-only on its real-hardware path (no base_height branch is exercised there), so pointing this at
+  # the file above will fail loudly with a matrix-shape error, not run with silently wrong behavior. Update
+  # this to the new policy's exported/policy.pt once retrained.
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
 network_interface: null  # REQUIRED before first run -- e.g. "enp3s0" (host NIC cabled to the robot). See
@@ -19,12 +26,18 @@ network_interface: null  # REQUIRED before first run -- e.g. "enp3s0" (host NIC 
 # --- action scale/offset (from ActionsCfg: mdp.JointPositionActionCfg(scale=0.25, use_default_offset=True)) ---
 action_scale: 0.25
 
-# --- per-joint PD gains and effort limit (from UNITREE_GO2WITHARM_CFG's "base_legs" DCMotorCfg) ---
-# Applied identically to all 12 leg joints -- the sim actuator config uses one shared DCMotorCfg for all of
-# them, so there's no per-joint variation to carry over.
+# --- per-joint PD gains (from UNITREE_GO2WITHARM_CFG's DCMotorCfg groups) ---
+# kp/kd really are identical across all 12 joints in sim, so there's no per-joint variation to carry over.
 kp: 25.0
 kd: 0.5
-effort_limit: 23.5  # saturation_effort in sim; also usable as a real-hardware torque safety clamp
+
+# effort_limit is NOT a copy of the sim actuator limit any more, and must not be "corrected" to match it.
+# UNITREE_GO2WITHARM_CFG now uses the real per-joint values (hip/thigh 23.7 Nm, calf 45.43 Nm -- the calf has a
+# 1.9169:1 knee reduction). This value is used on hardware only as a SAFETY threshold: deploy_real.py derives
+# its torque abort at 0.9 * effort_limit (~21 Nm, see the TorqueResponseWatchdog wiring and Checklist phase H),
+# and the Go2's own rated hip/thigh torque is 23.7 Nm. Raising it to 45.43 would weaken that abort by ~2x
+# across every joint, including the hip and thigh that cannot deliver it. Left deliberately at 23.5.
+effort_limit: 23.5
 
 # --- joint order, Isaac Lab side (the order this policy's action vector is in) ---
 # CONFIRMED ground truth via `deploy/dump_joint_order.py` (run this session against the real loaded asset,
@@ -83,7 +96,7 @@ sdk_joint_order:
   - RL_thigh_joint
   - RL_calf_joint
 
-# Height tracking is not working yet -- deploy_real.py uses a fixed DEFAULT_HEIGHT_M=0.3 constant instead
-# of a real estimate for now (see that file's module docstring). No height_source config choice here
-# anymore: nothing to configure until a real estimator (SportModeState post-release, or forward
-# kinematics) is implemented and verified against hardware -- see deploy.md Stage 3.
+# No height entry here, and nothing to configure for it: height is not a command or observation any more
+# (there is no reliable way to measure it on real hardware). The robot is only ever held near a fixed
+# default stance height by a training-side reward (RewardsCfg.height_penalty). See mdp/commands.py's
+# module docstring for the full rationale.

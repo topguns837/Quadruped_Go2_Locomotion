@@ -12,6 +12,12 @@ both the policy's transfer to a second physics engine and the hardware observati
 Actuation reproduces the training actuator (unitree_go2witharm_cfg.py, explicit DCMotorCfg): the policy runs at 50 Hz
 and the PD torque is recomputed every 0.005 s physics step (decimation 4), clipped by the DC motor torque-speed curve.
 
+Supports both the current 50-dim policies (5-wide command: lin_x, lin_y, ang_z, pitch, lean -- no height command
+or observation, see mdp/commands.py's module docstring for why) and the older committed 51/52-dim policies
+(6-wide command, 52-dim additionally observing base_height), via OBS_LAYOUT below. Height is never a command any
+more for either: it is tracked only as "actual height vs. a nominal target" in the summary table, matching how
+height_penalty regulates it during training.
+
 Interpreter: Isaac Sim's bundled Python (no Kit needed), or any Python with torch, mujoco, numpy, pyyaml:
     /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --manual_commands
     /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --headless \\
@@ -47,18 +53,18 @@ INIT_BASE_HEIGHT = 0.4  # UNITREE_GO2WITHARM_CFG.init_state.pos
 
 # Per-joint-type motor limits as (effort_limit, saturation_effort, velocity_limit).
 #
-# "training" is what the committed policies were actually trained against: unitree_go2witharm_cfg.py puts all 12
-# joints in ONE DCMotorCfg group with effort_limit=saturation_effort=23.5 Nm and velocity_limit=30.0 rad/s.
+# "hardware" is the real robot, from Unitree's own go2_description.urdf: hip/thigh are 23.7 Nm at 30.1 rad/s,
+# but the calf sits behind a 1.9169:1 knee reduction and is 45.43 Nm at 15.70 rad/s. The project USD carries
+# exactly these values on its joint drives too. `unitree_go2witharm_cfg.py` now configures these, so
+# "hardware" is also what anything trained from here on is trained against -- use it for new policies.
 #
-# "hardware" is the real robot, from Unitree's own go2_description.urdf (fetched and read): hip/thigh are
-# 23.7 Nm at 30.1 rad/s, but the calf sits behind a 1.9169:1 knee reduction and is 45.43 Nm at 15.70 rad/s. The
-# trained USD carries exactly these values too (calf drive maxForce 45.43, maxJointVelocity 899.54 deg/s =
-# 15.70 rad/s) -- the single-group DCMotorCfg override is what discards them. Isaac Lab's own stock Go2 config
-# had the same bug; see isaac-sim/IsaacLab PR #7564 "Fix Unitree Go1 and Go2 calf actuator limits ignoring the
-# knee reduction". So the calf trains at 0.52x the torque it has on hardware, and its torque-speed curve rolls
-# off at 1.9x the real speed.
+# "legacy" is the single 23.5 Nm / 30.0 rad/s DCMotorCfg group that applied to all 12 joints before that fix,
+# i.e. what the committed policies (models/9_10_26_vanilla, models/9_13_26_*) were actually trained against.
+# Isaac Lab's own stock Go2 config had the same bug; see isaac-sim/IsaacLab PR #7564. Those policies rely on
+# the weak calf saturating and destabilise without it (6 falls vs 0, see README), so run them under "legacy"
+# to reproduce their training conditions, and under "hardware" to see what they would do on the real robot.
 MOTOR_LIMITS = {
-    "training": {"hip": (23.5, 23.5, 30.0), "thigh": (23.5, 23.5, 30.0), "calf": (23.5, 23.5, 30.0)},
+    "legacy": {"hip": (23.5, 23.5, 30.0), "thigh": (23.5, 23.5, 30.0), "calf": (23.5, 23.5, 30.0)},
     "hardware": {"hip": (23.7, 23.7, 30.1), "thigh": (23.7, 23.7, 30.1), "calf": (45.43, 45.43, 15.70)},
 }
 
@@ -71,15 +77,40 @@ FALL_MIN_HEIGHT = 0.12
 SEGMENT_SETTLE_S = 1.0  # transient after each command change excluded from the tracking error
 METRIC_NAMES = ["lin_x", "lin_y", "ang_z", "pitch", "lean", "height"]
 
+# Per-policy observation layout, keyed by the exported policy's input dimension (read off its first Linear
+# layer in load_policy, never guessed from the file path). "cmd_width" is how many floats manual_cmd/
+# Segment.command must carry for THIS policy; "has_height_obs" is whether a base_height term is inserted
+# between projected_gravity and velocity_commands (see deploy_real.build_observation).
+#
+#   50: current policies -- 5-wide command, no height observation (see mdp/commands.py's module docstring).
+#   51: committed vanilla (models/9_10_26_vanilla) -- 6-wide command (height command, no height observation).
+#   52: committed Round 3 (models/9_13_26_*) -- 6-wide command AND a base_height observation.
+#
+# Sim2sim's own canonical command is always 5-wide (see Segment/load_scenario/--manual_commands below); for
+# a 51/52-dim policy the extra 6th ("height") slot is appended here from NOMINAL_HEIGHT_M["legacy"], never
+# asked of the user/scenario -- there is no height command any more, see the module docstring.
+OBS_LAYOUT = {
+    50: {"cmd_width": 5, "has_height_obs": False},
+    51: {"cmd_width": 6, "has_height_obs": False},
+    52: {"cmd_width": 6, "has_height_obs": True},
+}
+
+# Fixed height target used only for the summary table's "height" error column and (for has_height_obs
+# policies) the base_height observation itself -- NOT a command, see OBS_LAYOUT above.
+#   "new" mirrors RewardsCfg.height_penalty's target_height in quadruped_go2_locomotion_env_cfg.py (not
+#     imported from there: that file needs Isaac Lab's full env-cfg machinery, which this script deliberately
+#     avoids pulling in). Keep these in sync if either changes.
+#   "legacy" mirrors the old DEFAULT_HEIGHT_M / lin_pos_z range midpoint the committed policies trained with.
+NOMINAL_HEIGHT_M = {"new": 0.337, "legacy": 0.30}
+
 
 # ---------------------------------------------------------------------------------------------------------
 # Config / policy
 # ---------------------------------------------------------------------------------------------------------
 
 
-def load_sim_config(config_path: str, policy_path: str | None, obs_dim: int) -> deploy_real.DeployConfig:
-    """Same fields as deploy_real.load_config, minus the network interface. has_height_obs comes from the policy's
-    actual input size, not the path string, so any exported policy works without renaming."""
+def load_sim_config(config_path: str, policy_path: str | None) -> deploy_real.DeployConfig:
+    """Same fields as deploy_real.load_config, minus the network interface."""
     with open(config_path) as f:
         raw = yaml.safe_load(f)
     return deploy_real.DeployConfig(
@@ -93,7 +124,6 @@ def load_sim_config(config_path: str, policy_path: str | None, obs_dim: int) -> 
         isaac_joint_order=list(raw["isaac_joint_order"]),
         sdk_joint_order=list(raw["sdk_joint_order"]),
         default_joint_pos=dict(raw["default_joint_pos"]),
-        has_height_obs=obs_dim == 52,
     )
 
 
@@ -102,8 +132,8 @@ def load_policy(path: str) -> tuple[torch.jit.ScriptModule, int]:
     policy.eval()
     first_weight = next(p for name, p in policy.named_parameters() if p.dim() == 2)
     obs_dim = int(first_weight.shape[1])
-    if obs_dim not in (51, 52):
-        raise ValueError(f"{path} expects a {obs_dim}-dim observation; only 51 (vanilla) and 52 (Round 3) are known.")
+    if obs_dim not in OBS_LAYOUT:
+        raise ValueError(f"{path} expects a {obs_dim}-dim observation; known dims are {sorted(OBS_LAYOUT)}.")
     return policy, obs_dim
 
 
@@ -116,7 +146,7 @@ def load_policy(path: str) -> tuple[torch.jit.ScriptModule, int]:
 class Segment:
     name: str
     duration: float
-    command: list[float]  # lin_x, lin_y, ang_z, pitch, lean, height
+    command: list[float]  # lin_x, lin_y, ang_z, pitch, lean -- always 5-wide, see OBS_LAYOUT above
 
 
 def load_scenario(path: str) -> list[Segment]:
@@ -125,8 +155,8 @@ def load_scenario(path: str) -> list[Segment]:
     segments = []
     for entry in raw["segments"]:
         cmd = [float(v) for v in entry["command"]]
-        if len(cmd) != 6:
-            raise ValueError(f"Segment {entry['name']!r}: command must have 6 values, got {len(cmd)}")
+        if len(cmd) != 5:
+            raise ValueError(f"Segment {entry['name']!r}: command must have 5 values, got {len(cmd)}")
         segments.append(Segment(entry["name"], float(entry["duration"]), cmd))
     return segments
 
@@ -137,7 +167,7 @@ def load_scenario(path: str) -> list[Segment]:
 
 
 class MujocoGo2:
-    def __init__(self, model: mujoco.MjModel, cfg: deploy_real.DeployConfig, motor_limits: str = "training"):
+    def __init__(self, model: mujoco.MjModel, cfg: deploy_real.DeployConfig, motor_limits: str = "hardware"):
         self.model = model
         self.data = mujoco.MjData(model)
         self.cfg = cfg
@@ -285,10 +315,12 @@ class SegmentStats:
 
 
 def print_summary(
-    stats: list[SegmentStats], policy_path: str, height_source: str, default_isaac: np.ndarray, joint_names: list[str]
+    stats: list[SegmentStats], policy_path: str, nominal_height: float,
+    default_isaac: np.ndarray, joint_names: list[str],
 ) -> None:
-    print(f"\n[SUMMARY] policy={policy_path} height_source={height_source}")
+    print(f"\n[SUMMARY] policy={policy_path} nominal_height={nominal_height:.3f} m")
     print(f"  steady-state RMS error (first {SEGMENT_SETTLE_S:.1f} s of each segment excluded)")
+    print("  height error is actual vs. the fixed nominal_height above -- there is no height COMMAND any more")
     print("  max_dev = largest mean joint-target offset from default_joint_pos (deg), worst joint in brackets")
     header = f"  {'segment':<16}" + "".join(f"{n:>9}" for n in METRIC_NAMES) + f"{'falls':>7}{'peak_tau':>10}  max_dev"
     print(header)
@@ -329,7 +361,9 @@ def parse_args():
         "--height_source",
         choices=["true", "constant"],
         default="true",
-        help="Round 3 base_height obs: 'true' = simulated height, 'constant' = hardware stand-in DEFAULT_HEIGHT_M.",
+        help="Only affects a 52-dim (Round 3) policy's base_height OBSERVATION input: 'true' = simulated height, "
+        "'constant' = the legacy hardware stand-in NOMINAL_HEIGHT_M['legacy']. Ignored for every other policy "
+        "(50/51-dim), which have no height observation at all -- see OBS_LAYOUT.",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--scenario", default=None, help="YAML list of command segments (see sim2sim/scenarios/).")
@@ -342,9 +376,10 @@ def parse_args():
     parser.add_argument(
         "--motor_limits",
         choices=sorted(MOTOR_LIMITS),
-        default="training",
-        help="'training' = the single 23.5 Nm / 30 rad/s DCMotorCfg group the policies were trained with; "
-        "'hardware' = the real per-joint values from Unitree's URDF (calf 45.43 Nm / 15.70 rad/s). See MOTOR_LIMITS.",
+        default="hardware",
+        help="'hardware' (default) = the real robot's per-joint values, which unitree_go2witharm_cfg.py now also "
+        "trains against (calf 45.43 Nm / 15.70 rad/s); 'legacy' = the single 23.5 Nm / 30 rad/s group the "
+        "committed pre-fix policies were trained with. See MOTOR_LIMITS.",
     )
     parser.add_argument("--save_xml", default=None, help="Write the compiled MuJoCo model to this XML path and exit.")
     return parser.parse_args()
@@ -365,13 +400,17 @@ def main():
     if not os.path.isabs(policy_path):
         policy_path = os.path.join(_REPO_ROOT, policy_path)
     policy, obs_dim = load_policy(policy_path)
-    cfg = load_sim_config(args.config, policy_path, obs_dim)
+    layout = OBS_LAYOUT[obs_dim]
+    is_legacy = obs_dim != 50
+    nominal_height = NOMINAL_HEIGHT_M["legacy" if is_legacy else "new"]
+    cfg = load_sim_config(args.config, policy_path)
     sdk_to_isaac, _ = deploy_real.build_joint_index_maps(cfg)
     robot = MujocoGo2(model, cfg, motor_limits=args.motor_limits)
     default_isaac = robot.default_isaac.tolist()
+    height_source_note = f" (obs source: {args.height_source})" if layout["has_height_obs"] else ""
     print(
-        f"[INFO] policy={policy_path} obs_dim={obs_dim} height_obs={cfg.has_height_obs} "
-        f"(source: {args.height_source if cfg.has_height_obs else 'n/a'}) "
+        f"[INFO] policy={policy_path} obs_dim={obs_dim} cmd_width={layout['cmd_width']} "
+        f"has_height_obs={layout['has_height_obs']}{height_source_note} nominal_height={nominal_height:.3f} m "
         f"mass={float(np.sum(model.body_mass)):.2f} kg dt={model.opt.timestep} decimation={DECIMATION} "
         f"motor_limits={args.motor_limits} (calf {robot.effort_limit[-1]:.2f} Nm @ "
         f"{robot.velocity_limit[-1]:.2f} rad/s) armature={ARMATURE}"
@@ -380,7 +419,7 @@ def main():
     if args.scenario:
         segments = load_scenario(args.scenario)
     else:
-        segments = [Segment("manual" if args.manual_commands else "zero", args.duration, [0, 0, 0, 0, 0, 0.3])]
+        segments = [Segment("manual" if args.manual_commands else "zero", args.duration, [0, 0, 0, 0, 0])]
     manual_buf = None
     if args.manual_commands:
         manual_buf = deploy_real.ManualCommandBuffer()
@@ -423,9 +462,17 @@ def main():
             for k in range(round(seg.duration / dt)):
                 tick_start = time.monotonic()
                 cmd = manual_buf.get() if manual_buf else list(seg.command)
-                height = robot.base_height if args.height_source == "true" else deploy_real.DEFAULT_HEIGHT_M
+                # Pad to 6-wide with the legacy nominal height for an older (51/52-dim) policy: there is no
+                # height command any more (see OBS_LAYOUT/module docstring above), so this is never read from
+                # the slider or scenario, only appended here to match what those policies' velocity_commands
+                # observation term was trained to expect.
+                manual_cmd = cmd + [nominal_height] if layout["cmd_width"] == 6 else cmd
+                base_height_obs = None
+                if layout["has_height_obs"]:
+                    base_height_obs = robot.base_height if args.height_source == "true" else nominal_height
                 obs = deploy_real.build_observation(
-                    cfg, robot.to_robot_state(), sdk_to_isaac, default_isaac, cmd, last_action, base_height=height
+                    cfg, robot.to_robot_state(), sdk_to_isaac, default_isaac, manual_cmd, last_action,
+                    base_height=base_height_obs,
                 )
                 with torch.inference_mode():
                     action = policy(obs)[0].numpy()
@@ -444,12 +491,17 @@ def main():
                             "ang_z": ang_vel_z - cmd[2],
                             "pitch": pitch - cmd[3],
                             "lean": lean - cmd[4],
-                            "height": robot.base_height - cmd[5],
+                            "height": robot.base_height - nominal_height,
                         }
                     )
                     seg_stats.add_target(target)
                 if writer is not None:
-                    deploy_real.log_live_plot(writer, step, cmd, lin_vel, ang_vel_z, pitch, lean, robot.base_height)
+                    # deploy_real.log_live_plot covers the 5 velocity/pitch/lean tags; height is logged here
+                    # directly (deploy_real's version no longer carries height tags at all -- real hardware
+                    # has no height measurement to plot -- but sim2sim, unlike real hardware, CAN measure it).
+                    deploy_real.log_live_plot(writer, step, cmd, lin_vel, ang_vel_z, pitch, lean)
+                    writer.add_scalar("Metrics/base_velocity/cmd_height", nominal_height, step)
+                    writer.add_scalar("Metrics/base_velocity/actual_height", robot.base_height, step)
                 step += 1
 
                 reason = robot.fallen()
@@ -472,8 +524,7 @@ def main():
             if stop:
                 break
 
-        height_source = args.height_source if cfg.has_height_obs else "n/a"
-        print_summary(stats, policy_path, height_source, robot.default_isaac, cfg.isaac_joint_order)
+        print_summary(stats, policy_path, nominal_height, robot.default_isaac, cfg.isaac_joint_order)
     finally:
         if viewer is not None:
             close_viewer(viewer, viewer_threads)

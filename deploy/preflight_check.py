@@ -12,7 +12,7 @@ crouches the robot via its own StandDown()) or LowCmd publishing (see deploy.md'
 Reuses deploy_real.py's own helpers directly (config loading, joint-index mapping, state buffer, quaternion
 math, observation assembly) rather than reimplementing them -- see that file for what each does.
 
-Default output is a compact ~5-line status block per interval (connectivity / gravity / joints / height),
+Default output is a compact ~4-line status block per interval (connectivity / gravity / joints),
 not a raw data dump -- pass --verbose for the full per-joint and full-observation-vector breakdown. On exit
 (Ctrl+C, or --duration expiring) it prints a run-level SUMMARY with an explicit verdict: min/max ranges
 tracked across the whole run (not just the latest instant), so a joint reading that's consistently offset in
@@ -213,9 +213,6 @@ def print_summary(
             "noisy sensor -- investigate before proceeding."
         )
 
-    verdict.append(f"[TODO] Physically measure the robot's standing height and compare against "
-                    f"DEFAULT_HEIGHT_M={dr.DEFAULT_HEIGHT_M} -- not checked by this script.")
-
     print("\nVERDICT:")
     for line in verdict:
         print(f"  {line}")
@@ -400,7 +397,6 @@ def main():
                 print(f"  Gravity      : {'PASS' if err < GRAVITY_TOLERANCE else 'WARN'} "
                       f"(err={err:.3f}, tolerance={GRAVITY_TOLERANCE})")
                 print(f"  Joints       : {compact_joint_summary(deltas)}")
-                print(f"  Height       : not yet manually verified (DEFAULT_HEIGHT_M={dr.DEFAULT_HEIGHT_M})")
 
                 if args.verbose:
                     print("  --- verbose ---")
@@ -411,15 +407,13 @@ def main():
                         print(line)
                     obs = dr.build_observation(
                         cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order,
-                        manual_cmd=[0.0] * 6, last_action=[0.0] * 12,
+                        manual_cmd=[0.0] * 5, last_action=[0.0] * 12,
                     )
                     values = obs[0].tolist()
-                    labels = ["base_lin_vel"] * 3 + ["base_ang_vel"] * 3 + ["projected_gravity"] * 3
-                    if cfg.has_height_obs:
-                        labels += ["base_height"]
-                    labels += (["velocity_commands"] * 6 + ["joint_pos_rel"] * 12 + ["joint_vel"] * 12
-                               + ["last_action"] * 12)
-                    print(f"  observation vector ({len(values)}-dim, has_height_obs={cfg.has_height_obs}):")
+                    labels = (["base_lin_vel"] * 3 + ["base_ang_vel"] * 3 + ["projected_gravity"] * 3
+                              + ["velocity_commands"] * 5 + ["joint_pos_rel"] * 12 + ["joint_vel"] * 12
+                              + ["last_action"] * 12)
+                    print(f"  observation vector ({len(values)}-dim):")
                     for label, value in zip(labels, values):
                         print(f"    {label:18s} {value:+.4f}")
 

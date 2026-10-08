@@ -45,22 +45,42 @@ rebuild. Only restarting the container does.
 
 ### The go2withArm USD asset
 
-`source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXStatic.usda`
-is `.gitignore`d and is **not** in this repo (composed USD files like this are
-regenerated, not versioned). Generate it once per machine by running, inside
-the container:
-```bash
-isaaclab -p scripts/compose_go2_with_arm.py
-```
-This composes the standard Go2 (fetched from Nucleus) with the bundled
-OpenManipulator-X asset, mounted on top of the Go2's `base` body (a sibling
-in the USD hierarchy, not nested inside it — Isaac Lab's own contact-sensor
-activation never recurses past a rigid body, so nesting under the rigid
-`base` would make the arm's contact sensor unable to find any bodies) and
-rigidly attached via a fixed joint, with collision filtering between the arm
-and `base` to prevent self-collision at the mount point. It's picked up
-automatically by the bind mount once generated. If it's missing, the env
-will fail to spawn the robot.
+The robot asset is **committed** to this repo, at
+`source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd`
+(note the lowercase "s" and the `.usd` extension). Nothing needs generating:
+`.gitignore` carries a deliberate exception for it, and `unitree_go2witharm_cfg.py`
+loads it directly. Every policy in `models/` was trained on this exact file.
+
+This asset mounts the OpenManipulator-X on the Go2's **head**, at
+`(0.219, 0, 0.106)` m from the base origin. That matters: an earlier
+locally-generated asset mounted the arm flat on top of the torso at
+`(0, 0, 0.109)`, 21.9 cm further back, which shifts the centre of mass and
+invalidated the policies trained against it.
+
+Two files it depends on, both also committed:
+
+- `resources/openManipulator/open_manipulator_x_static.usd` -- the arm itself,
+  pulled in by a USD **payload**. Note the `.usd` extension: the payload names
+  `.usd`, so the `.usda` sibling alone is not enough. If this file is missing the
+  arm loads as an empty prim and env creation fails in the arm contact sensor with
+  *"could not find any bodies with contact reporter API"* -- which looks nothing
+  like a missing-asset error, so check this first if you see it.
+- A **remote sublayer** for the Go2 body meshes, fetched from Nucleus
+  (`omniverse-content-production.s3-us-west-2.amazonaws.com/.../Go2/go2/configuration.usd`).
+  First load therefore needs network access or a warm Isaac cache.
+
+`scripts/compose_go2_with_arm.py` is kept as a **reference only** and writes to
+`go2_with_arm_regenerated.usda`. It documents the composition steps and the PhysX
+constraints they work around (the arm must be a *sibling* of `base`, not nested
+inside it -- Isaac Lab's `activate_contact_sensors` never recurses past a rigid
+body, so a nested arm's contact sensor finds no bodies; plus collision filtering
+between the arm and `base` to stop a contact-generation blowup at the mount
+point). Do not point the config at its output.
+
+> **Note:** running that script, or anything else, inside the container creates
+> files owned by `root`, since the container runs as root against the bind mount.
+> That can leave directories under `resources/` unwritable from the host. Fix with
+> `sudo chown -R "$USER:$USER" source/`.
 
 ## 2. Build the image
 

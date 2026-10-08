@@ -41,14 +41,26 @@ Use the same Python environment used by Isaac Lab:
 python -m pip install -e source/quadruped_go2_locomotion
 ```
 
-# Modify robots\unitree.py in IsaacLab installation
+## Robot asset and configuration
 
+Nothing needs installing into your Isaac Lab checkout. The robot is defined locally by
+`source/quadruped_go2_locomotion/.../unitree_go2witharm_cfg.py`, which resolves the USD relative to itself,
+and the asset is **committed** to this repo at
+`source/quadruped_go2_locomotion/.../resources/go2withArm/go2withOpenXstatic.usd`.
 
-Add the following to the robots.unitree.py in IsaacLab Installation, alternately it can be defined locally, and pointing to any custom USD Model
+That asset mounts the OpenManipulator-X on the Go2's **head**, at `(0.219, 0, 0.106)` m from the base origin.
+`scripts/compose_go2_with_arm.py` is reference-only and writes elsewhere; do not point the config at it. See
+[docker/README.md](docker/README.md#the-go2witharm-usd-asset) for the asset's payload and remote-sublayer
+dependencies, and for the error you get when the arm payload is missing.
+
+The actuator configuration below is the part worth reading, because the calf is not the same motor as the hip
+and thigh (see the comment in the snippet):
+
 ```
 UNITREE_GO2WITHARM_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"file:///home/gavin/isaacSimData/go2withArm/go2withOpenXstatic.usd",
+        # Resolved relative to the config file; see unitree_go2witharm_cfg.py for the real expression.
+        usd_path=f"file://{_RESOURCES_DIR / 'go2withArm' / 'go2withOpenXstatic.usd'}",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
@@ -76,11 +88,25 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "base_legs": DCMotorCfg(
-            joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            effort_limit=23.5,
-            saturation_effort=23.5,
-            velocity_limit=30.0,
+        # Hip/thigh and calf are separate groups: the calf sits behind a 1.9169:1 knee reduction, so it is a
+        # 45.43 Nm / 15.70 rad/s joint while hip and thigh are 23.7 Nm / 30.1 rad/s (Unitree's
+        # go2_description.urdf, and this asset's own USD joint drives). Do not collapse these into one group
+        # at 23.5 Nm -- that trains the calf at about half its real torque. Two groups are required because
+        # DCMotorCfg.saturation_effort is a scalar in Isaac Lab v2.3.2.
+        "hip_thigh": DCMotorCfg(
+            joint_names_expr=[".*_hip_joint", ".*_thigh_joint"],
+            effort_limit=23.7,
+            saturation_effort=23.7,
+            velocity_limit=30.1,
+            stiffness=25.0,
+            damping=0.5,
+            friction=0.0,
+        ),
+        "calves": DCMotorCfg(
+            joint_names_expr=[".*_calf_joint"],
+            effort_limit=45.43,
+            saturation_effort=45.43,
+            velocity_limit=15.70,
             stiffness=25.0,
             damping=0.5,
             friction=0.0,

@@ -82,18 +82,23 @@ def track_lean_exp(
 def base_height_l2_pitch(
     env: ManagerBasedRLEnv,
     command_name: str,
+    target_height: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pitch_sensitivity: float = 0.25,
     lean_sensitivity: float = 0.08,
 ) -> torch.Tensor:
-    """Adaptive height penalty that uses the commanded lin_pos_z as the target height.
+    """Height penalty toward a fixed default stance height, with a small pitch/lean allowance.
 
-    The target height is read directly from the command buffer (component index 5).
-    An additional offset is applied based on commanded pitch and lean angles so that
-    the robot isn't penalized for naturally sitting lower during a lean.
+    There is no height COMMAND any more (see mdp.commands.UniformVelocityCommandWithPitch's docstring for
+    why: no reliable height measurement exists on real hardware). `target_height` is a fixed constant
+    instead of being read from the command buffer. The adaptive pitch/lean offset is kept: it still reads
+    the current commanded pitch/lean (components [3]/[4], unaffected by the height removal) so the robot
+    isn't penalized for naturally sitting slightly lower/higher while pitching or leaning.
 
     Args:
-        command_name: Name of the command to read the target height from.
+        command_name: Name of the command to read the current pitch/lean from.
+        target_height: Fixed default stance height (m) the robot is held near. Should match the default
+            joint pose's natural standing height so this reward doesn't fight joint_deviation_l1.
         pitch_sensitivity: How much target height increases per radian of commanded pitch.
             A value of 0.15 means ~15cm higher target per radian of pitch.
         lean_sensitivity: How much target height increases per radian of commanded lean.
@@ -102,14 +107,12 @@ def base_height_l2_pitch(
 
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    # Get commanded height from command buffer (component index 5)
-    cmd = env.command_manager.get_command(command_name)
-    cmd_height = cmd[:, 5]
     # Get commanded pitch and lean for adaptive offset
+    cmd = env.command_manager.get_command(command_name)
     cmd_pitch = cmd[:, 3]
     cmd_lean = cmd[:, 4]
-    # Compute adaptive target height: commanded height + offset from commanded angles
-    adaptive_target = cmd_height + pitch_sensitivity * torch.abs(cmd_pitch) + lean_sensitivity * torch.abs(cmd_lean)
+    # Compute adaptive target height: fixed target height + offset from commanded angles
+    adaptive_target = target_height + pitch_sensitivity * torch.abs(cmd_pitch) + lean_sensitivity * torch.abs(cmd_lean)
     # L2 penalty from adaptive target
     penalty = torch.square(asset.data.root_pos_w[:, 2] - adaptive_target)
     diagnostics.log_step(env, "reward.base_height_l2_pitch", penalty)

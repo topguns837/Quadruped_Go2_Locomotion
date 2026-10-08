@@ -15,7 +15,6 @@ from .commands import (
     UniformVelocityCommandWithPitch,
     get_pitch_command,
     get_lean_command,
-    get_lin_pos_z_command,
 )
 
 # Pitch tracking reward

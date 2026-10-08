@@ -39,7 +39,7 @@ parser.add_argument(
     action="store_true",
     default=False,
     help=(
-        "Set an exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command via a slider window "
+        "Set an exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean] command via a slider window "
         "(auto-launched) instead of the policy's usual random commands, without closing the Isaac Sim window."
     ),
 )
@@ -54,8 +54,9 @@ parser.add_argument(
     action="store_true",
     default=False,
     help=(
-        "Log per-step commanded-vs-actual velocity/pitch/lean/height to a TensorBoard file under "
-        "logs/play_dashboard/, viewable live with scripts/live_dashboard.py --logdir logs/play_dashboard."
+        "Log per-step commanded-vs-actual velocity/pitch/lean, plus actual-vs-default-stance height, to a "
+        "TensorBoard file under logs/play_dashboard/, viewable live with "
+        "scripts/live_dashboard.py --logdir logs/play_dashboard."
     ),
 )
 # append RSL-RL cli arguments
@@ -131,7 +132,6 @@ def _manual_command_file_poll_loop(cmd_term, path: str, poll_interval: float = 0
                     data["ang_vel_z"],
                     data["pitch"],
                     data["lean"],
-                    data["height"],
                 ]
                 cmd_term.set_manual_command(values)
                 last_mtime = mtime
@@ -140,10 +140,15 @@ def _manual_command_file_poll_loop(cmd_term, path: str, poll_interval: float = 0
         time.sleep(poll_interval)
 
 
-def _log_live_plot(writer, env):
-    """Logs one step's commanded vs. actual [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] for
-    env 0 to `writer`, using the exact tag names scripts/live_dashboard.py's PANELS already expects
+def _log_live_plot(writer, env, target_height: float):
+    """Logs one step's commanded vs. actual [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean] for env 0 to
+    `writer`, using the exact tag names scripts/live_dashboard.py's PANELS already expects
     (Metrics/base_velocity/{cmd,actual}_*) -- no dashboard changes needed to read this.
+
+    Height has no command component any more (see mdp/commands.py's module docstring): `target_height` is
+    the fixed value RewardsCfg.height_penalty holds the robot near (passed in by the caller, which reads it
+    from env_cfg, rather than hard-coding it here a second time), logged as `cmd_height` purely so the
+    existing "Height: commanded vs actual" dashboard panel stays meaningful.
 
     Unlike mdp/commands.py's training-time metrics, these are instantaneous per-step values, not
     accumulated over a resample cycle: play is "watch one robot," so there's no per-episode aggregation to
@@ -164,7 +169,7 @@ def _log_live_plot(writer, env):
     writer.add_scalar("Metrics/base_velocity/actual_pitch", pitch.item(), step)
     writer.add_scalar("Metrics/base_velocity/cmd_lean", cmd[4].item(), step)
     writer.add_scalar("Metrics/base_velocity/actual_lean", lean.item(), step)
-    writer.add_scalar("Metrics/base_velocity/cmd_height", cmd[5].item(), step)
+    writer.add_scalar("Metrics/base_velocity/cmd_height", target_height, step)
     writer.add_scalar("Metrics/base_velocity/actual_height", robot.data.root_pos_w[0, 2].item(), step)
     writer.flush()
 
@@ -297,6 +302,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         live_plot_dir = os.path.join("logs", "play_dashboard", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         live_plot_writer = SummaryWriter(log_dir=live_plot_dir)
         print(f"[INFO] Live plot logging to: {live_plot_dir}")
+        # Read once, not re-read every step: the fixed target height height_penalty holds the robot near
+        # (see RewardsCfg.height_penalty in quadruped_go2_locomotion_env_cfg.py).
+        live_plot_target_height = env_cfg.rewards.height_penalty.params["target_height"]
 
     dt = env.unwrapped.step_dt
 
@@ -315,7 +323,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if live_plot_writer is not None:
-            _log_live_plot(live_plot_writer, env)
+            _log_live_plot(live_plot_writer, env, live_plot_target_height)
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

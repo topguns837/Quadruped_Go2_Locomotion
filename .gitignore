@@ -20,6 +20,15 @@
 # Single-file exception, not a blanket unblock -- every other USD file in the repo stays ignored.
 !/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd
 
+# Second deliberate exception, for the same reason: go2withOpenXstatic.usd carries a PAYLOAD to
+# '../openManipulator/open_manipulator_x_static.usd' -- note the `.usd` extension. Only the `.usda` sibling was
+# ever committed (it predates the ignore rules above, which is why it is tracked at all), so on a fresh clone
+# that payload could not resolve, the arm loaded as an empty prim, and env creation died in the arm contact
+# sensor with "could not find any bodies with contact reporter API". The file below is ASCII-identical to
+# open_manipulator_x_static.usda; USD's `.usd` extension auto-detects ASCII vs crate, so one file satisfies the
+# payload. Keep the two in sync, or repoint the payload inside go2withOpenXstatic.usd at the `.usda` instead.
+!/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/openManipulator/open_manipulator_x_static.usd
+
 # Python
 .DS_Store
 **/*.egg-info/

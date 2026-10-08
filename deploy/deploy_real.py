@@ -34,9 +34,10 @@ Before any LowCmd is meaningful, the robot's onboard sport-mode controller must 
 MotionSwitcherClient, looping StandDown()+ReleaseMode() until CheckMode() reports no active mode) and
 independently corroborated by docs.quadruped.de's Go2 "Low-Level Control" page.
 
-Height tracking is NOT currently a real estimate -- see `DEFAULT_HEIGHT_M` below; deliberately simplified
-to a fixed constant since no reliable real-hardware source has been verified yet (SportModeState's
-availability once sport mode is released is unconfirmed).
+Height is not part of the command or observation at all any more: there is no reliable way to measure base
+height on real hardware (SportModeState's availability once sport mode is released was never confirmed),
+and the training-side fix is to hold the robot near a fixed default stance height purely via a reward
+(RewardsCfg.height_penalty), never to observe or command it. See mdp/commands.py's module docstring.
 """
 
 from __future__ import annotations
@@ -85,14 +86,6 @@ _LOWCMD_HEAD = (0xFE, 0xEF)
 _LOWLEVEL = 0xFF  # LowCmd.level_flag -- tells the robot to obey LowCmd instead of its onboard controller
 _MOTOR_MODE_PMSM = 0x01  # LowCmd.motor_cmd[i].mode -- required on every motor, set once at init
 
-# Height tracking isn't working yet (no reliable real-hardware source verified -- SportModeState's
-# real-hardware availability after ReleaseMode() is unconfirmed, see deploy.md Stage 3, and forward
-# kinematics isn't implemented). Deliberately simplified to a fixed constant for now rather than guessing:
-# the robot's nominal standing height, matching default_joint_pos's implied stance. Revisit once hardware
-# is available to test what's actually reliable.
-DEFAULT_HEIGHT_M = 0.3
-
-
 # ---------------------------------------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------------------------------------
@@ -110,7 +103,6 @@ class DeployConfig:
     isaac_joint_order: list[str]
     sdk_joint_order: list[str]
     default_joint_pos: dict[str, float]
-    has_height_obs: bool  # True for the experimental (Round 3) policy, False for vanilla -- see obs assembly.
 
 
 def load_config(path: str, cli_network_interface: str | None) -> DeployConfig:
@@ -133,7 +125,6 @@ def load_config(path: str, cli_network_interface: str | None) -> DeployConfig:
         isaac_joint_order=list(raw["isaac_joint_order"]),
         sdk_joint_order=list(raw["sdk_joint_order"]),
         default_joint_pos=dict(raw["default_joint_pos"]),
-        has_height_obs="round3" in raw["policy_path"] or "experimental" in raw["policy_path"],
     )
 
 
@@ -192,11 +183,13 @@ class LatestRobotState:
         self.wireless_remote = bytes(40)  # raw handheld-controller state carried in LowState (see decode_controller_buttons)
         self.quat_wxyz = (1.0, 0.0, 0.0, 0.0)  # IMU orientation, body-to-world
         self.gyro = (0.0, 0.0, 0.0)  # body-frame angular velocity, rad/s
-        # NOTE: same open question as DEFAULT_HEIGHT_M above -- SportModeState's real-hardware availability
-        # after ReleaseMode() is unconfirmed (see deploy.md Stage 3), so this may also go stale/frozen once
-        # the robot is actually in the state the policy needs it in. Left wired up (unlike height, which
-        # was simplified to a constant) since there's no evidence yet it specifically fails, but flagged
-        # here so it isn't silently trusted if it turns out not to work either.
+        # NOTE: SportModeState's real-hardware availability after ReleaseMode() is unconfirmed (see
+        # deploy.md Stage 3), so this may go stale/frozen once the robot is actually in the state the
+        # policy needs it in. Left wired up since there's no evidence yet it specifically fails, but
+        # flagged here so it isn't silently trusted if it turns out not to work either. (Height, the other
+        # quantity this same uncertainty applied to, is no longer tracked at all -- see mdp/commands.py's
+        # module docstring: there is no height command or observation any more, only a training-side
+        # reward toward a fixed default stance height, so there is nothing left to read here for it.)
         self.sportmode_velocity = (0.0, 0.0, 0.0)  # body-frame linear velocity estimate, m/s
         self.ready = False  # False until at least one LowState message has been received
         self.last_update = None  # time.monotonic() of the most recent LowState message
@@ -288,7 +281,7 @@ def quat_to_pitch_lean(quat_wxyz: tuple[float, float, float, float]) -> tuple[fl
 class ManualCommandBuffer:
     def __init__(self):
         self._lock = threading.Lock()
-        self._values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.3]  # lin_x, lin_y, ang_z, pitch, lean, height
+        self._values = [0.0, 0.0, 0.0, 0.0, 0.0]  # lin_x, lin_y, ang_z, pitch, lean
 
     def set(self, values: list[float]) -> None:
         with self._lock:
@@ -316,7 +309,6 @@ def _manual_command_file_poll_loop(buf: ManualCommandBuffer, path: str, poll_int
                         data["ang_vel_z"],
                         data["pitch"],
                         data["lean"],
-                        data["height"],
                     ]
                 )
                 last_mtime = mtime
@@ -897,7 +889,10 @@ def ramp_to_default_pose(
 
 
 def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, actual_ang_vel_z: float,
-                   actual_pitch: float, actual_lean: float, actual_height: float) -> None:
+                   actual_pitch: float, actual_lean: float) -> None:
+    """No height tags: real hardware has no height measurement to plot (see mdp/commands.py's module
+    docstring). sim2sim/sim2sim_mujoco.py, which CAN measure true height, logs its own cmd_height/
+    actual_height tags directly rather than through this function."""
     writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_x", cmd[0], step)
     writer.add_scalar("Metrics/base_velocity/actual_lin_vel_x", actual_lin_vel[0], step)
     writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_y", cmd[1], step)
@@ -908,17 +903,22 @@ def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, ac
     writer.add_scalar("Metrics/base_velocity/actual_pitch", actual_pitch, step)
     writer.add_scalar("Metrics/base_velocity/cmd_lean", cmd[4], step)
     writer.add_scalar("Metrics/base_velocity/actual_lean", actual_lean, step)
-    writer.add_scalar("Metrics/base_velocity/cmd_height", cmd[5], step)
-    writer.add_scalar("Metrics/base_velocity/actual_height", actual_height, step)
     writer.flush()
 
 
 # ---------------------------------------------------------------------------------------------------------
 # Observation assembly -- must exactly match ObservationsCfg.PolicyCfg's term order in
-# quadruped_go2_locomotion_env_cfg.py: base_lin_vel, base_ang_vel, projected_gravity, [base_height if
-# has_height_obs], velocity_commands, joint_pos (rel to default), joint_vel, last_action. No noise is added
-# (play mode already disables observation corruption -- QuadrupedLocomotionEnvCfg_PLAY sets
-# enable_corruption=False -- so hardware inference shouldn't add it either).
+# quadruped_go2_locomotion_env_cfg.py: base_lin_vel, base_ang_vel, projected_gravity, velocity_commands,
+# joint_pos (rel to default), joint_vel, last_action. No noise is added (play mode already disables
+# observation corruption -- QuadrupedLocomotionEnvCfg_PLAY sets enable_corruption=False -- so hardware
+# inference shouldn't add it either).
+#
+# `base_height` is NOT part of the current observation layout above (there is no reliable way to measure
+# base height on real hardware -- see mdp/commands.py's module docstring -- so newly trained policies never
+# have this term, and this function's own real-hardware call site never passes it). The parameter exists
+# only so sim2sim/sim2sim_mujoco.py can still run the OLDER committed policies (models/9_10_26_vanilla,
+# models/9_13_26_*), which DO have a base_height term between projected_gravity and velocity_commands --
+# sim2sim passes a real measured value for those; this is otherwise dead code on the real control loop.
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -929,10 +929,8 @@ def build_observation(
     default_joint_pos_isaac_order: list[float],
     manual_cmd: list[float],
     last_action: list[float],
-    base_height: float = DEFAULT_HEIGHT_M,
+    base_height: float | None = None,
 ) -> torch.Tensor:
-    """`base_height` defaults to the hardware stand-in constant; sim2sim/sim2sim_mujoco.py passes the true
-    simulated height instead."""
     gravity_b = quat_rotate_inverse_wxyz(state.quat_wxyz, (0.0, 0.0, -1.0))
 
     joint_pos_isaac = [state.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
@@ -943,9 +941,9 @@ def build_observation(
     parts += list(state.sportmode_velocity)  # base_lin_vel (body frame), 3
     parts += list(state.gyro)  # base_ang_vel (body frame), 3
     parts += list(gravity_b)  # projected_gravity, 3
-    if cfg.has_height_obs:
-        parts += [base_height]  # base_height, 1 -- DEFAULT_HEIGHT_M on hardware for now, see module docstring
-    parts += list(manual_cmd)  # velocity_commands, 6: [lin_x, lin_y, ang_z, pitch, lean, height]
+    if base_height is not None:
+        parts += [base_height]  # base_height, 1 -- only for older policies, see the note above
+    parts += list(manual_cmd)  # velocity_commands, 5: [lin_x, lin_y, ang_z, pitch, lean]
     parts += joint_pos_rel  # joint_pos, 12
     parts += joint_vel_isaac  # joint_vel, 12
     parts += list(last_action)  # actions (previous), 12
@@ -1330,7 +1328,6 @@ def main():
                         snap.gyro[2],
                         pitch,
                         lean,
-                        DEFAULT_HEIGHT_M,
                     )
 
                 step += 1

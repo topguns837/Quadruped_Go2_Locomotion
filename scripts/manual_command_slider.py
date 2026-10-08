@@ -23,20 +23,24 @@ import os
 import tkinter as tk
 
 # (label, key, min, max, initial, units) -- one slider per command component, in the exact order
-# play.py's poll loop expects: [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height]. Ranges match
+# play.py's poll loop expects: [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean]. Ranges match
 # CommandsCfg.ranges in quadruped_go2_locomotion_env_cfg.py (verified directly against that file, not
 # CLAUDE.md, whose pitch/lean ranges are swapped relative to the actual code).
+#
+# No height slider: height is not a command component any more. The robot is held near a fixed default
+# stance height by RewardsCfg.height_penalty (there's no reliable way to measure height on real hardware,
+# so it was never something an operator could usefully command either). See mdp/commands.py's module
+# docstring for the full rationale.
 SLIDERS = [
     ("lin_vel_x", "lin_vel_x (m/s)", -1.0, 1.0, 0.0),
     ("lin_vel_y", "lin_vel_y (m/s)", -1.0, 1.0, 0.0),
     ("ang_vel_z", "ang_vel_z (rad/s)", -1.0, 1.0, 0.0),
     ("pitch", "pitch (rad)", -0.6, 0.6, 0.0),
     ("lean", "lean (rad)", -0.3, 0.3, 0.0),
-    ("height", "height (m)", 0.2, 0.4, 0.3),
 ]
 
 
-def build_command_dict(lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height) -> dict:
+def build_command_dict(lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean) -> dict:
     """Pure function (no Tkinter/file I/O) so it's directly unit-testable."""
     return {
         "lin_vel_x": lin_vel_x,
@@ -44,7 +48,6 @@ def build_command_dict(lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height) -> 
         "ang_vel_z": ang_vel_z,
         "pitch": pitch,
         "lean": lean,
-        "height": height,
     }
 
 
