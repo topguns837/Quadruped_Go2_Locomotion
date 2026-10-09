@@ -463,6 +463,11 @@ class TerminationsCfg:
     # Safety net for non-finite (NaN/Inf) root/joint state from a rare physics-solver edge case,
     # independent of body_contact's base/head-only scope. See mdp/terminations.py.
     invalid_state = DoneTerm(func=mdp.invalid_state)
+    # Second half of the same safety net: invalid_state only catches NaN/Inf, not a contact-solver
+    # excursion that flings the root to an absurd but still-finite position (confirmed live: -2005 m in
+    # one env). Without this, that env would keep running the rest of its episode on nonsense state. See
+    # mdp.terminations.root_displacement_excessive and mdp.rewards.base_height_l2_pitch's docstring.
+    root_displacement = DoneTerm(func=mdp.root_displacement_excessive)
 
 
 @configclass

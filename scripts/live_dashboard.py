@@ -181,6 +181,16 @@ class LiveDashboard:
                     half_range = max((data_hi - data_lo) / 2, 1e-6) * self.y_range_multiplier
                     ax.set_ylim(center - half_range, center + half_range)
 
+        # __init__'s tight_layout() ran against empty axes (default 0..1 ticks, e.g. "0.0", "0.2") and is
+        # never enough once real data arrives: a reward panel spanning -4000..638, or any panel whose
+        # values reach into the millions (e.g. an unclamped reward outlier), produces tick labels several
+        # characters wider than what that one-time layout planned for. The plot area never shrinks to make
+        # room, so wide tick labels bleed past the subplot boundary into neighboring panels or off the
+        # figure edge -- "the graph overflows the image." Re-running this every frame keeps the margins
+        # sized to whatever the current tick labels actually need. Cheap enough at typical --interval
+        # (0.5-1s) for a 13-panel grid; skip it if dashboard redraws ever become visibly sluggish.
+        self.fig.tight_layout()
+
         return [line for panel in self.lines.values() for line in panel.values()]
 
     def run(self, interval_ms: int, output_path: str | None = None):

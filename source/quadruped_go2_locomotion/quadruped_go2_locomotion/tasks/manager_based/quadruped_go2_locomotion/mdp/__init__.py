@@ -28,7 +28,7 @@ from .rewards import (
 )
 
 # Safety-net termination for non-finite (NaN/Inf) simulation state
-from .terminations import invalid_state  # noqa: F401
+from .terminations import invalid_state, root_displacement_excessive  # noqa: F401
 
 # Per-step diagnostic file logging (see mdp/diagnostics.py)
 from .diagnostics import (

@@ -86,6 +86,7 @@ def base_height_l2_pitch(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pitch_sensitivity: float = 0.25,
     lean_sensitivity: float = 0.08,
+    max_penalty: float = 4.0,
 ) -> torch.Tensor:
     """Height penalty toward a fixed default stance height, with a small pitch/lean allowance.
 
@@ -95,6 +96,18 @@ def base_height_l2_pitch(
     the current commanded pitch/lean (components [3]/[4], unaffected by the height removal) so the robot
     isn't penalized for naturally sitting slightly lower/higher while pitching or leaning.
 
+    `max_penalty` exists because `root_pos_w[:, 2]` has no physical bound the way `joint_pos` does (unlike
+    e.g. hip_crossing_l2, whose input is clamped by the joint's own mechanical limits). A rare PhysX
+    contact-solver excursion can fling root_pos_w to an absurd-but-finite value (observed live: -2005 m in
+    one env), which `invalid_state`'s isfinite() check does not catch, and the resulting UNCLAMPED squared
+    error reached 4.02e6 in that run -- at weight -1.65, a single env's single step contributed about -6.6
+    million to that step's reward, dwarfing every other term by ~5 orders of magnitude and producing the
+    large recurring reward-curve dips this was diagnosed from. Clamp so one bad env can never do that:
+    max_penalty=4.0 means a 2m height error (already an absurd amount for normal operation) is where the
+    penalty saturates; see also mdp.terminations.root_displacement_excessive, which stops this at the
+    source by resetting an env before it keeps compounding this (now-bounded, but still wrong) penalty for
+    the rest of its episode.
+
     Args:
         command_name: Name of the command to read the current pitch/lean from.
         target_height: Fixed default stance height (m) the robot is held near. Should match the default
@@ -103,6 +116,7 @@ def base_height_l2_pitch(
             A value of 0.15 means ~15cm higher target per radian of pitch.
         lean_sensitivity: How much target height increases per radian of commanded lean.
             A value of 0.08 means ~8cm higher target per radian of lean.
+        max_penalty: Upper bound on the squared error (m^2), see above.
     """
 
     # extract the used quantities (to enable type-hinting)
@@ -113,8 +127,8 @@ def base_height_l2_pitch(
     cmd_lean = cmd[:, 4]
     # Compute adaptive target height: fixed target height + offset from commanded angles
     adaptive_target = target_height + pitch_sensitivity * torch.abs(cmd_pitch) + lean_sensitivity * torch.abs(cmd_lean)
-    # L2 penalty from adaptive target
-    penalty = torch.square(asset.data.root_pos_w[:, 2] - adaptive_target)
+    # L2 penalty from adaptive target, clamped -- see max_penalty above
+    penalty = torch.clamp(torch.square(asset.data.root_pos_w[:, 2] - adaptive_target), max=max_penalty)
     diagnostics.log_step(env, "reward.base_height_l2_pitch", penalty)
     return penalty
 
