@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.assets import Articulation
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import wrap_to_pi
 
 from . import diagnostics
@@ -96,17 +96,11 @@ def base_height_l2_pitch(
     the current commanded pitch/lean (components [3]/[4], unaffected by the height removal) so the robot
     isn't penalized for naturally sitting slightly lower/higher while pitching or leaning.
 
-    `max_penalty` exists because `root_pos_w[:, 2]` has no physical bound the way `joint_pos` does (unlike
-    e.g. hip_crossing_l2, whose input is clamped by the joint's own mechanical limits). A rare PhysX
-    contact-solver excursion can fling root_pos_w to an absurd-but-finite value (observed live: -2005 m in
-    one env), which `invalid_state`'s isfinite() check does not catch, and the resulting UNCLAMPED squared
-    error reached 4.02e6 in that run -- at weight -1.65, a single env's single step contributed about -6.6
-    million to that step's reward, dwarfing every other term by ~5 orders of magnitude and producing the
-    large recurring reward-curve dips this was diagnosed from. Clamp so one bad env can never do that:
-    max_penalty=4.0 means a 2m height error (already an absurd amount for normal operation) is where the
-    penalty saturates; see also mdp.terminations.root_displacement_excessive, which stops this at the
-    source by resetting an env before it keeps compounding this (now-bounded, but still wrong) penalty for
-    the rest of its episode.
+    `max_penalty` is defence in depth: `root_pos_w[:, 2]` has no physical bound (unlike `joint_pos`), so an
+    unclamped squared error can reach millions if a robot ever leaves the terrain and free-falls (observed:
+    the world edge is at +-148 m, robots walked off it, and one fall reached 4e6 here). The primary fix is a
+    wider terrain border plus the `terrain_out_of_bounds` termination; this clamp only bounds the damage.
+    max_penalty=4.0 saturates at a 2 m height error, far beyond any normal operation.
 
     Args:
         command_name: Name of the command to read the current pitch/lean from.
@@ -140,21 +134,14 @@ def foot_sliding_exp(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     feet_body_names: list[str] | None = None,
     contact_threshold: float = 0.5,
+    foot_radius: float = 0.022,
 ) -> torch.Tensor:
     """Penalize foot sliding using an exponential kernel.
 
     For each foot body in contact with the ground (contact force magnitude
-    exceeds ``contact_threshold``), computes the tangential foot velocity in the base
-    (robot root) frame. Returns a penalty value between 0 (no sliding) and ~1 (fast sliding).
+    exceeds ``contact_threshold``), computes the horizontal world-frame velocity of the
+    foot's contact point (sphere centre velocity corrected for rolling, radius ``foot_radius``). Returns a penalty value between 0 (no sliding) and ~1 (fast sliding).
     Non-contacted feet contribute 0 penalty (no penalty during the swing phase).
-
-    The velocity transformation uses :math:`v_{base} = R_{base}^{world\\, T} \\; v_{world}`,
-    i.e. :func:`~isaaclab.utils.math.quat_apply_inverse` with the base orientation
-    quaternion.
-
-    Tangential (sliding) component is extracted by removing the projection along the
-    projected gravity direction, so normal contact velocity (e.g. foot pressing into ground)
-    is not penalised.
 
     The returned value is a **penalty** (positive = bad). It is multiplied by ``weight < 0``
     in the reward config so the total contribution is negative when sliding.
@@ -173,6 +160,7 @@ def foot_sliding_exp(
             Typical Go2 values: ``["FL_foot", "FR_foot", "RL_foot", "RR_foot"]``.
         contact_threshold: Minimum contact force magnitude (N) for a body to be
             considered in contact with the ground.
+        foot_radius: Foot collision-sphere radius (m), 0.022 in Unitree's go2_description.
     """
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
@@ -211,31 +199,18 @@ def foot_sliding_exp(
     net_forces = contact_sensor.data.net_forces_w
     is_contact_all = torch.norm(net_forces, dim=-1) > contact_threshold  # (N, num_sensor_bodies)
 
-    # --- foot velocities in base frame ---
-    # Access body_com_vel_w to trigger timestamped buffer refresh
-    _ = asset.data.body_com_vel_w
-    foot_vel_w = asset.data.body_com_vel_w[:, feet_list, :]  # (N, n_feet, 6)
-
-    # Transform to base frame.
-    # quat_rotate_inverse is TorchScript-compiled: q=(N,4), v=(N,3).
-    # Broadcast root_quat_w to (N*n_feet, 4) to handle multiple feet.
-    import isaaclab.utils.math as math_utils
-
-    n_envs = foot_vel_w.size(0)
+    # --- contact-point velocity (world frame, horizontal) ---
+    # Sliding is the velocity of the point touching the ground, not of the foot sphere's centre: in normal
+    # stance the centre still moves at w x r as the leg rotates over a stationary foot. The contact point is
+    # r below the centre, so v_contact = v_com + w x (-r * z_hat) = v_com - r * (w_y, -w_x, 0).
+    _ = asset.data.body_com_vel_w  # trigger timestamped buffer refresh
+    foot_vel_w = asset.data.body_com_vel_w[:, feet_list, :]  # (N, n_feet, 6): linear, angular
+    lin_xy = foot_vel_w[:, :, 0:2]
+    ang = foot_vel_w[:, :, 3:6]
+    contact_vel_x = lin_xy[..., 0] - foot_radius * ang[..., 1]
+    contact_vel_y = lin_xy[..., 1] + foot_radius * ang[..., 0]
+    sliding_speed = torch.sqrt(contact_vel_x**2 + contact_vel_y**2)  # (N, n_feet)
     n_feet = foot_vel_w.size(1)
-    foot_vel_w_flat = foot_vel_w[:, :, :3].reshape(n_envs * n_feet, 3)  # (N*n_feet, 3)
-    root_quat_broadcast = asset.data.root_quat_w.repeat_interleave(n_feet, dim=0)  # (N*n_feet, 4)
-    foot_vel_base_flat = math_utils.quat_apply_inverse(root_quat_broadcast, foot_vel_w_flat)  # (N*n_feet, 3)
-    foot_vel_base = foot_vel_base_flat.reshape(n_envs, n_feet, 3)  # (N, n_feet, 3)
-
-    # --- tangential (sliding) component ---
-    # projected_gravity_b: (N, 3) in base frame — direction gravity appears to point
-    proj_grav = asset.data.projected_gravity_b  # (N, 3) in base frame
-    proj_grav = proj_grav / (torch.norm(proj_grav, dim=-1, keepdim=True) + 1e-8)
-    tangent_vel = foot_vel_base - proj_grav.unsqueeze(1) * torch.sum(
-        foot_vel_base * proj_grav.unsqueeze(1), dim=-1, keepdim=True
-    )
-    sliding_speed = torch.norm(tangent_vel, dim=-1)  # (N, n_feet)
 
     # --- penalty per foot ---
     # 1 - exp(-speed/std): 0 when speed=0, increases with speed (approaches 1.0 as speed → ∞).
@@ -275,9 +250,9 @@ def foot_lift_exp(
     height in the world frame. Returns a reward value between 0 (below threshold)
     and ~1 (well above threshold) using an exponential kernel.
 
-    This reward encourages the policy to lift its feet during the swing phase
-    rather than dragging them along the ground. It is neutral for contacted feet so
-    it does not conflict with the foot sliding penalty.
+    This only penalises low swing feet: contacting feet score the maximum (1.0), so it
+    cannot reward stepping by itself. See GaitDiagonalCoordination for the term that does.
+    It is neutral for contacted feet so it does not conflict with the foot sliding penalty.
 
     Args:
         std: Standard deviation for the exponential kernel. Controls how quickly the
@@ -390,3 +365,98 @@ def hip_crossing_l2(
     penalty = torch.sum(torch.square(penalty), dim=1)
     diagnostics.log_step(env, "reward.hip_crossing_l2", penalty)
     return penalty
+
+def _motion_blend(env: ManagerBasedRLEnv, command_name: str, cmd_scale: float) -> torch.Tensor:
+    """Smooth moving-vs-standing weight w in [0, 1], from the COMMAND only (never the robot's own motion).
+
+    w = clamp(max(|v_xy| / cmd_scale, |w_z| / cmd_scale), 0, 1): exactly 0 for a zero command, 1 once the
+    command reaches cmd_scale m/s (or rad/s). Gait terms are scaled by w and stand-still by 1 - w, so the
+    robot is never rewarded for trotting when told to stand, while tiny non-zero commands (continuous
+    sampling, heading-controller yaw) get a graded rather than all-or-nothing target.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    speed = torch.maximum(torch.norm(cmd[:, :2], dim=-1), torch.abs(cmd[:, 2]))
+    return torch.clamp(speed / cmd_scale, 0.0, 1.0)
+
+
+class GaitDiagonalCoordination(ManagerTermBase):
+    """Dense reward for a trot: weight alternating between the FL+RR and FR+RL diagonals.
+
+    With load share ``F_i / sum(F)`` per foot, ``s = share(FL+RR) - share(FR+RL)`` in [-1, 1]:
+    ``|s|`` is instant credit (0 standing on four feet, ~0.3 for a 30% weight shift onto a diagonal, 1 for a
+    pure trot stance), and ``1 - |EMA(s)|`` is an alternation factor (~1 when both diagonals take turns, ~0
+    when always on one). Pace, bound, airborne and standing all score ~0. Because partial weight shifts earn
+    partial credit, the policy can discover the gait incrementally. Scaled by the command blend weight
+    (see _motion_blend), so it is 0 at a zero command.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        pairs = cfg.params.get("diagonal_pairs", (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot")))
+        self._idx_a = sensor.find_bodies(list(pairs[0]))[0]
+        self._idx_b = sensor.find_bodies(list(pairs[1]))[0]
+        if len(self._idx_a) != 2 or len(self._idx_b) != 2:
+            raise ValueError(f"diagonal_pairs {pairs} did not resolve to 2 sensor bodies each")
+        self._ema = torch.zeros(env.num_envs, device=env.device)
+        self._alpha = env.step_dt / cfg.params.get("ema_time_constant", 0.5)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            self._ema.zero_()
+        else:
+            self._ema[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        sensor_cfg: SceneEntityCfg,
+        command_name: str = "base_velocity",
+        cmd_scale: float = 0.15,
+        min_total_force: float = 1.0,
+        diagonal_pairs=(("FL_foot", "RR_foot"), ("FR_foot", "RL_foot")),
+        ema_time_constant: float = 0.5,
+    ) -> torch.Tensor:
+        sensor = env.scene.sensors[sensor_cfg.name]
+        force = torch.norm(sensor.data.net_forces_w, dim=-1)  # (N, num_sensor_bodies)
+        fa = force[:, self._idx_a].sum(dim=1)
+        fb = force[:, self._idx_b].sum(dim=1)
+        total = fa + fb
+        airborne = total < min_total_force
+        s = torch.where(airborne, torch.zeros_like(total), (fa - fb) / total.clamp(min=min_total_force))
+        self._ema += self._alpha * (s - self._ema)
+        reward = torch.abs(s) * (1.0 - torch.abs(self._ema)) * _motion_blend(env, command_name, cmd_scale)
+        diagnostics.log_step(env, "reward.gait_coordination", reward)
+        return reward
+
+
+def stand_still_default_pose(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    feet_body_names: list[str],
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    cmd_scale: float = 0.15,
+    contact_threshold: float = 1.0,
+    pose_scale: float = 0.5,
+    posture_cmd_tol: float = 0.05,
+) -> torch.Tensor:
+    """Reward standing on all four feet in the default joint pose when the command says stand.
+
+    ``feet_planted * default_pose``: feet_planted is the fraction of feet with contact force above
+    ``contact_threshold`` (lifting any foot loses reward), default_pose is exp(-sum_j (q_j - q0_j)^2 /
+    pose_scale) over all joints. If a pitch or lean is commanded (> posture_cmd_tol rad) the pose factor is
+    1, leaving posture to track_pitch/lean so they never fight. Scaled by 1 - blend weight (see _motion_blend).
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_cfg.name]
+    feet_idx = sensor.find_bodies(feet_body_names)[0]
+    planted = (torch.norm(sensor.data.net_forces_w[:, feet_idx], dim=-1) > contact_threshold).float().mean(dim=1)
+    pose_err = torch.sum(torch.square(asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
+    default_pose = torch.exp(-pose_err / pose_scale)
+    cmd = env.command_manager.get_command(command_name)
+    posture_cmd = torch.maximum(torch.abs(cmd[:, 3]), torch.abs(cmd[:, 4])) > posture_cmd_tol
+    default_pose = torch.where(posture_cmd, torch.ones_like(default_pose), default_pose)
+    reward = planted * default_pose * (1.0 - _motion_blend(env, command_name, cmd_scale))
+    diagnostics.log_step(env, "reward.stand_still", reward)
+    return reward

@@ -78,7 +78,9 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
         terrain_type="generator",
         terrain_generator=TerrainGeneratorCfg(
             size=(8.0, 8.0),
-            border_width=20.0,
+            # 70 m: episode travel is bounded by sqrt(2) m/s * 40 s ~= 57 m, so even an edge tile's robot
+            # cannot reach the world edge. The border is four flat boxes, so width costs nothing.
+            border_width=70.0,
             num_rows=32,
             num_cols=32,
             horizontal_scale=0.1,
@@ -177,7 +179,7 @@ class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfgWithPitch(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.12,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
@@ -304,7 +306,7 @@ class EventCfg:
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.2, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (-0.5, 0.5),
                 "y": (-0.3, 0.3),
@@ -319,7 +321,7 @@ class EventCfg:
         func=mdp.reset_joints_by_scale,
         mode="reset",
         params={
-            "position_range": (0.5, 1.0),
+            "position_range": (0.5, 1.5),
             "velocity_range": (0.0, 0.0),
         },
     )
@@ -340,18 +342,22 @@ class RewardsCfg:
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp,
-        weight=0.5,
+        weight=2.0,  # was 0.5 (20:1 under lin_vel); Round 3 used 5.0, which cut lin_vel's tracking share to 48%
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
     track_pitch_exp = RewTerm(
         func=mdp.track_pitch_exp,
-        weight=0.5,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+        # Weight 3.0 (Round 3). std tightened sqrt(0.1) -> sqrt(0.04): at the old std a policy that ignores the
+        # +-0.6 rad pitch command still earned 46% of the reward; now 30%, so more of the weight is real gradient.
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.04)},
     )
     track_lean_exp = RewTerm(
         func=mdp.track_lean_exp,
-        weight=0.3,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+        # Weight 3.0 (Round 3). std tightened sqrt(0.1) -> sqrt(0.02): the old kernel was wider than the whole
+        # +-0.3 rad command range, so ignoring lean earned 77% of the reward; now 42%.
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.02)},
     )
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
@@ -416,6 +422,22 @@ class RewardsCfg:
             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
         },
     )
+    # Trot shaping (dense, partial credit for weight shifts between diagonals); 0 at a zero command.
+    gait_coordination = RewTerm(
+        func=mdp.GaitDiagonalCoordination,
+        weight=1.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"), "command_name": "base_velocity"},
+    )
+    # Stand on all four feet in the default pose when commanded to stand; 0 once a velocity is commanded.
+    stand_still = RewTerm(
+        func=mdp.stand_still_default_pose,
+        weight=1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
+            "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+            "command_name": "base_velocity",
+        },
+    )
     # foot lift reward -- reward feet above min_height when not in contact
     foot_lift = RewTerm(
         func=mdp.foot_lift_exp,
@@ -425,7 +447,7 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-            "min_height": 0.05,  # 5 cm
+            "min_height": 0.10,  # 10 cm (Round 3; was 5 cm)
         },
     )
     # -- optional penalties
@@ -463,11 +485,15 @@ class TerminationsCfg:
     # Safety net for non-finite (NaN/Inf) root/joint state from a rare physics-solver edge case,
     # independent of body_contact's base/head-only scope. See mdp/terminations.py.
     invalid_state = DoneTerm(func=mdp.invalid_state)
-    # Second half of the same safety net: invalid_state only catches NaN/Inf, not a contact-solver
-    # excursion that flings the root to an absurd but still-finite position (confirmed live: -2005 m in
-    # one env). Without this, that env would keep running the rest of its episode on nonsense state. See
-    # mdp.terminations.root_displacement_excessive and mdp.rewards.base_height_l2_pitch's docstring.
-    root_displacement = DoneTerm(func=mdp.root_displacement_excessive)
+    # Safety net that should never fire: the terrain border is wide enough that no episode can reach the
+    # edge (robots walking off it and free-falling caused the old -4k reward dips). time_out=True makes it a
+    # truncation, so the value function bootstraps instead of learning that walking far is dangerous.
+    # Any non-zero Episode_Termination/terrain_out_of_bounds therefore flags something unexpected.
+    terrain_out_of_bounds = DoneTerm(
+        func=mdp.terrain_out_of_bounds,
+        params={"asset_cfg": SceneEntityCfg("robot"), "distance_buffer": 3.0},
+        time_out=True,
+    )
 
 
 @configclass
