@@ -199,7 +199,11 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True)
+    # Same affine map as before (default + 0.25 * action, no clipping), but each applied target lags the policy output by
+    # 0-2 control steps (random per env per episode): the robot's command path is not instantaneous. See mdp/actions.py.
+    joint_pos = mdp.DelayedJointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True, max_delay_steps=2
+    )
 
 
 @configclass
@@ -260,11 +264,61 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.8, 0.8),
-            "dynamic_friction_range": (0.6, 0.6),
+            # Randomised per environment: real floors and foot rubber vary, and the old fixed 0.8/0.6 let the policy
+            # tune to one value. make_consistent keeps dynamic <= static.
+            "static_friction_range": (0.5, 1.2),
+            "dynamic_friction_range": (0.4, 1.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
+            "make_consistent": True,
         },
+    )
+
+    # Sim-to-real domain randomisation (startup = drawn once per environment). Ranges are assumptions to be revisited
+    # against measurements from the robot.
+    robot_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "mass_distribution_params": (-1.0, 2.0),  # kg added to the base (battery, payload, arm differences)
+            "operation": "add",
+            "recompute_inertia": True,
+        },
+    )
+    actuator_gains = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+        },
+    )
+    joint_armature = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "armature_distribution_params": (0.5, 2.0),  # x nominal JOINT_ARMATURE
+            "operation": "scale",
+        },
+    )
+    joint_friction = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "friction_distribution_params": (0.0, 0.1),  # Nm of joint friction (the robot has some; the sim had none)
+            "operation": "abs",
+        },
+    )
+    push_robot = EventTerm(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(8.0, 15.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
     )
 
     # Corrects 2.0 kg of phantom mass, 13% of the robot. `imu` and `radar` are massless sensor frames in
@@ -562,6 +616,16 @@ class QuadrupedLocomotionEnvCfg_PLAY(QuadrupedLocomotionEnvCfg):
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
+        # nominal physics for play and for sim2sim comparisons: no pushes, no action latency, no startup randomisation
+        # (armature stays at its nominal JOINT_ARMATURE); friction back to the single nominal 0.8 / 0.6 pair.
+        self.events.physics_material.params["static_friction_range"] = (0.8, 0.8)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.6, 0.6)
+        self.events.robot_mass = None
+        self.events.actuator_gains = None
+        self.events.joint_armature = None
+        self.events.joint_friction = None
+        self.events.push_robot = None
+        self.actions.joint_pos.max_delay_steps = 0
         
         # terrain curriculum
         self.curriculum.terrain_levels = None
