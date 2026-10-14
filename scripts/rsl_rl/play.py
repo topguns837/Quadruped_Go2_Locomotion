@@ -50,6 +50,26 @@ parser.add_argument(
     help="Path the manual-command slider window and this script agree on (see --manual_commands).",
 )
 parser.add_argument(
+    "--trace_out",
+    type=str,
+    default=None,
+    help=(
+        "Diagnostic: write a per-step .npz trace (policy obs, raw action, root/joint state, torque, foot "
+        "forces) of env 0 at a fixed ZERO command (no slider needed) and exit after --trace_steps steps. "
+        "Same fields as sim2sim_mujoco.py --trace_out; compare with sim2sim/compare_traces.py. Off by default."
+    ),
+)
+parser.add_argument("--trace_steps", type=int, default=1100, help="Control steps to record with --trace_out.")
+parser.add_argument(
+    "--trace_deterministic_reset",
+    action="store_true",
+    default=False,
+    help=(
+        "With --trace_out: start from the exact default pose with zero velocity (disables the reset-time "
+        "random base pose/velocity and x0.5-1.5 joint scaling), matching how sim2sim starts."
+    ),
+)
+parser.add_argument(
     "--live_plot",
     action="store_true",
     default=False,
@@ -206,6 +226,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     log_dir = os.path.dirname(resume_path)
 
+    if args_cli.trace_out and args_cli.trace_deterministic_reset:
+        env_cfg.events.reset_base.params["pose_range"] = {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)}
+        env_cfg.events.reset_base.params["velocity_range"] = {
+            k: (0.0, 0.0) for k in ("x", "y", "z", "roll", "pitch", "yaw")
+        }
+        env_cfg.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
+        print("[INFO] trace: deterministic reset (default pose, zero velocity).")
+
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
@@ -295,6 +323,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         atexit.register(slider_proc.terminate)
         print(f"[INFO] Manual command mode: slider window launched (writing to {args_cli.command_file}).")
 
+    trace = None
+    if args_cli.trace_out:
+        import numpy as np
+
+        if not args_cli.manual_commands:
+            cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+            cmd_term.enable_manual_override()
+            cmd_term.set_manual_command([0.0, 0.0, 0.0, 0.0, 0.0])
+        trace = {k: [] for k in ("obs", "action", "target", "joint_pos", "joint_vel", "torque", "root_pos",
+                                 "root_quat", "lin_vel_origin_b", "lin_vel_com_b", "ang_vel_b", "foot_force",
+                                 "command", "done")}
+        _robot = env.unwrapped.scene["robot"]
+        _sensor = env.unwrapped.scene["contact_forces"]
+        _foot_ids = [_sensor.body_names.index(n) for n in ("FL_foot", "FR_foot", "RL_foot", "RR_foot")]
+        _view = _robot.root_physx_view
+        _phys = {
+            "phys_dof_max_velocity": _view.get_dof_max_velocities()[0].cpu().numpy(),
+            "phys_dof_armature": _view.get_dof_armatures()[0].cpu().numpy(),
+            "phys_dof_friction": _view.get_dof_friction_coefficients()[0].cpu().numpy(),
+            "phys_dof_stiffness": _view.get_dof_stiffnesses()[0].cpu().numpy(),
+            "phys_dof_damping": _view.get_dof_dampings()[0].cpu().numpy(),
+            "phys_dof_max_force": _view.get_dof_max_forces()[0].cpu().numpy(),
+            "phys_dof_limits": _view.get_dof_limits()[0].cpu().numpy(),
+            "phys_body_masses": _view.get_masses()[0].cpu().numpy(),
+        }
+        print("[INFO] trace: PhysX dof max velocity (rad/s):", _phys["phys_dof_max_velocity"])
+        print("[INFO] trace: PhysX dof armature:", _phys["phys_dof_armature"])
+        print(f"[INFO] trace: recording {args_cli.trace_steps} steps at zero command to {args_cli.trace_out}")
+
     live_plot_writer = None
     if args_cli.live_plot:
         from torch.utils.tensorboard import SummaryWriter
@@ -318,8 +375,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             # agent stepping
             actions = policy(obs)
+            if trace is not None:
+                _obs_in = obs["policy"][0].detach().cpu().numpy().copy()
+                _act = actions[0].detach().cpu().numpy().copy()
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            if trace is not None:
+                _d = _robot.data
+                trace["obs"].append(_obs_in)
+                trace["action"].append(_act)
+                trace["target"].append(_d.joint_pos_target[0].cpu().numpy().copy())
+                trace["joint_pos"].append(_d.joint_pos[0].cpu().numpy().copy())
+                trace["joint_vel"].append(_d.joint_vel[0].cpu().numpy().copy())
+                trace["torque"].append(_d.applied_torque[0].cpu().numpy().copy())
+                trace["root_pos"].append(_d.root_pos_w[0].cpu().numpy().copy())
+                trace["root_quat"].append(_d.root_quat_w[0].cpu().numpy().copy())
+                trace["lin_vel_origin_b"].append(_d.root_link_lin_vel_b[0].cpu().numpy().copy())
+                trace["lin_vel_com_b"].append(_d.root_com_lin_vel_b[0].cpu().numpy().copy())
+                trace["ang_vel_b"].append(_d.root_ang_vel_b[0].cpu().numpy().copy())
+                _f = _sensor.data.net_forces_w[0, _foot_ids].norm(dim=-1)
+                trace["foot_force"].append(_f.cpu().numpy().copy())
+                trace["command"].append(
+                    env.unwrapped.command_manager.get_command("base_velocity")[0, :5].cpu().numpy().copy()
+                )
+                trace["done"].append(float(dones[0].item()))
+                if len(trace["obs"]) >= args_cli.trace_steps:
+                    break
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if live_plot_writer is not None:
@@ -334,6 +415,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    if trace is not None and trace["obs"]:
+        np.savez_compressed(
+            args_cli.trace_out,
+            dt=dt,
+            joint_names=np.array(list(env.unwrapped.scene["robot"].data.joint_names), dtype=str),
+            **_phys,
+            **{k: np.stack(v) for k, v in trace.items()},
+        )
+        print(f"[INFO] trace: wrote {len(trace['obs'])} steps to {args_cli.trace_out}")
 
     # close the simulator
     env.close()

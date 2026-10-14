@@ -117,6 +117,7 @@ class LiveDashboard:
         max_points: int = 100,
         exclude_panels: set[str] | None = None,
         y_range_multiplier: float = 1.0,
+        max_pixels: tuple[int, int] = (1850, 1000),
     ):
         self.logdir = logdir
         self.max_points = max_points
@@ -136,7 +137,12 @@ class LiveDashboard:
         n = len(self.panels)
         cols = math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
-        self.fig, axes = plt.subplots(rows, cols, figsize=(cols * 16 / 3, rows * 10 / 3))
+        fig_w, fig_h = cols * 16 / 3, rows * 10 / 3
+        # Saved PNG must fit on a 1920x1080 screen at 1:1: a 4x4 grid at matplotlib's default 100 dpi is
+        # 2133x1333 px, so an image viewer (feh) shows it larger than the screen and the legends/axes at the
+        # edges fall off. Lower the dpi just enough to fit (never raise it above 100).
+        dpi = min(100.0, max_pixels[0] / fig_w, max_pixels[1] / fig_h)
+        self.fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), dpi=dpi)
         self.fig.canvas.manager.set_window_title(f"Live training dashboard -- {logdir}")
         self.axes = [axes] if n == 1 else axes.flatten()
         self.lines: dict[str, dict[str, plt.Line2D]] = {}

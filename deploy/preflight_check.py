@@ -277,7 +277,7 @@ def launch_live_dashboard(logdir: str, interval: float, startup_timeout: float =
         time.sleep(poll_interval)
         waited += poll_interval
 
-    feh_proc = subprocess.Popen(["feh", "--reload", str(interval), output_png])
+    feh_proc = subprocess.Popen(["feh", "--scale-down", "--reload", str(interval), output_png])
     atexit.register(feh_proc.terminate)
 
     print(f"[INFO] Live dashboard launched: generating {output_png} every {interval}s, viewer window opened.")

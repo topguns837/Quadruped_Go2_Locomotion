@@ -30,7 +30,7 @@ if is_weak_gpu; then
     TRAIN_ARGS="--num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True"
     PLAY_ARGS="--num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True env.viewer.origin_type=env"
 else
-    TRAIN_ARGS=""
+    TRAIN_ARGS="--num_envs 2048 --max_iterations 10000"
     PLAY_ARGS=""
 fi
 
@@ -43,7 +43,7 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # same interval. --logdir points at the experiment root, not one specific run, so it always picks up
 # whichever run is most recently modified.
 DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_with_pitch_lean_and_height_control_ppo --output /tmp/dashboard.png"
-VIEW_CMD="feh --reload 0.5 /tmp/dashboard.png"
+VIEW_CMD="feh --scale-down --reload 0.5 /tmp/dashboard.png"
 
 # Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate
 # TensorBoard log under logs/play_dashboard/, written only when --live_plot is on -- see play.py). Same
@@ -60,7 +60,7 @@ VIEW_CMD="feh --reload 0.5 /tmp/dashboard.png"
 # pane and parsed by ITS shell -- single-quoting survives that whole chain without premature quote-closing,
 # where escaped double-quotes would have broken partway through (verified directly).
 PLAY_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/play_dashboard --output /tmp/play_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
-PLAY_VIEW_CMD="feh --reload 0.5 /tmp/play_dashboard.png"
+PLAY_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/play_dashboard.png"
 
 # Real-hardware deployment (see deploy.md, deploy/deploy_real.py). Unlike TRAIN_CMD/PLAY_CMD this does NOT
 # use the `isaaclab -p` wrapper -- deploy_real.py never touches pxr/Omniverse/SimulationApp, so launching
@@ -85,7 +85,7 @@ HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --n
 # same tag names as play.py's --live_plot -- see deploy_real.py's log_live_plot). Same --exclude-panels/
 # --y-range-multiplier reasoning as PLAY_DASHBOARD_CMD above; training's DASHBOARD_CMD is unaffected.
 HARDWARE_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/hardware_dashboard --output /tmp/hardware_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
-HARDWARE_VIEW_CMD="feh --reload 0.5 /tmp/hardware_dashboard.png"
+HARDWARE_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/hardware_dashboard.png"
 
 # Tier-1 read-only pre-flight check (deploy/preflight_check.py) -- structurally incapable of publishing
 # anything (no ChannelPublisher/LowCmd_ import in that file at all), so it's safe to run alongside
@@ -105,7 +105,7 @@ PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.p
 # The Menagerie Go2 model is fetched on first use (gitignored, not baked into the image).
 SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --manual_commands --live_plot"
 SIM2SIM_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/sim2sim_dashboard --output /tmp/sim2sim_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
-SIM2SIM_VIEW_CMD="feh --reload 0.5 /tmp/sim2sim_dashboard.png"
+SIM2SIM_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/sim2sim_dashboard.png"
 
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
