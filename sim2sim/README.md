@@ -197,3 +197,26 @@ in Isaac, and it is caused by the calf actuator limits above.
 5. Once retrained, re-run this scenario against the new 50-dim policy to replace the predates-the-fixes
    numbers above, and re-check whether vanilla's extra jerkiness under `--motor_limits hardware` (finding 1)
    persists now that the mass is also correct.
+
+
+## Joint speed cap and training parity (2026-10-13)
+
+Investigation of "stable in Isaac, jittery in MuJoCo and on the robot at zero command" found the cause: PhysX hard-clamps
+every joint's speed at `velocity_limit_sim`, which defaults to the USD value (measured: hip/thigh 30.1, calf 15.7 rad/s),
+on top of the DC-motor model. MuJoCo and the real robot have no such clamp. Policies trained with it learned bang-bang
+actions (raw up to +/-13) that the clamp tamed. Evidence (same policy, zero command, 20 s):
+
+| | Isaac (clamped) | MuJoCo (no cap) | MuJoCo (`--joint_speed_cap 30.1 30.1 15.7`) |
+|---|---|---|---|
+| joint speed RMS (rad/s) | 3.7 | 11.7 | 2.0 |
+| base speed RMS (m/s) | 0.063 | 0.232 | 0.048 |
+| body angular velocity RMS (rad/s) | 0.33 | 2.07 | 0.41 |
+
+Removing the clamp in Isaac (`PHYSX_JOINT_SPEED_LIMIT = 500`) makes Isaac behave like MuJoCo (joint speed RMS 14.4, angular
+velocity 3.07), and replaying Isaac's actions in uncapped MuJoCo matches it (15.7 / 3.6). Training now runs without the
+clamp (see CLAUDE.md "Real-hardware parity"); retrain, do not resume, any earlier policy.
+
+Tools: `play.py --trace_out` and `sim2sim_mujoco.py --trace_out` write per-step traces, `compare_traces.py` compares them,
+`replay_actions.py` replays recorded actions open loop (isolates physics from the policy). Runner options:
+`--joint_speed_cap HIP THIGH CALF` (emulates the PhysX clamp, off by default, only for old policies), `--armature`
+(default 0.01, matches training's nominal), `--action_delay N` (0-2 steps, like training).

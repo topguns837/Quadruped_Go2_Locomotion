@@ -68,10 +68,11 @@ MOTOR_LIMITS = {
     "hardware": {"hip": (23.7, 23.7, 30.1), "thigh": (23.7, 23.7, 30.1), "calf": (45.43, 45.43, 15.70)},
 }
 
-# Joint armature (rotor inertia). Isaac trained with 0: the DCMotorCfg leaves armature=None and the trained USD
-# authors no physxJoint:armature, so PhysX used 0. Menagerie's Go2 uses 0.01, and the real robot does have rotor
-# inertia (go2_description.urdf models 12 rotor links at 0.089 kg). 0.0 is the faithful-to-training default.
-ARMATURE = 0.0
+# Joint armature (rotor inertia, kg m^2). Matches `JOINT_ARMATURE` in unitree_go2witharm_cfg.py, the nominal value the
+# current training config applies (policies trained before 2026-10-13 used 0 and a PhysX speed clamp; see README).
+# The real robot has rotor inertia (go2_description.urdf models 12 rotor links); 0.01 is Menagerie's Go2 value and is
+# an assumption until measured. Override with --armature.
+ARMATURE = 0.01
 CONTACT_FORCE_THRESHOLD = 1.0  # N, body_contact / body_contact_arm terminations
 FALL_MIN_HEIGHT = 0.12
 SEGMENT_SETTLE_S = 1.0  # transient after each command change excluded from the tracking error
@@ -167,7 +168,10 @@ def load_scenario(path: str) -> list[Segment]:
 
 
 class MujocoGo2:
-    def __init__(self, model: mujoco.MjModel, cfg: deploy_real.DeployConfig, motor_limits: str = "hardware"):
+    def __init__(
+        self, model: mujoco.MjModel, cfg: deploy_real.DeployConfig, motor_limits: str = "hardware",
+        joint_speed_cap: tuple[float, float, float] | None = None,
+    ):
         self.model = model
         self.data = mujoco.MjData(model)
         self.cfg = cfg
@@ -198,6 +202,14 @@ class MujocoGo2:
         model.actuator_ctrlrange[self.act_idx_isaac, 1] = self.effort_limit
         model.dof_armature[self.dof_adr_isaac] = ARMATURE
 
+        # Optional hard joint-speed cap (rad/s per hip/thigh/calf), applied after every physics step. PhysX enforces a
+        # per-joint maxJointVelocity from the USD (calf 15.70 rad/s, measured: Isaac's calf speed never exceeds it);
+        # MuJoCo has no equivalent, so without this the same policy can spin joints to 60+ rad/s. None = off.
+        self.joint_speed_cap = None
+        if joint_speed_cap is not None:
+            per_type = dict(zip(("hip", "thigh", "calf"), joint_speed_cap))
+            self.joint_speed_cap = np.array([per_type[n.split("_")[1]] for n in cfg.isaac_joint_order])
+
         self.default_isaac = np.array([cfg.default_joint_pos[n] for n in cfg.isaac_joint_order])
         self.base_id = model.body("base").id
         self.floor_geom = model.geom("floor").id
@@ -205,6 +217,8 @@ class MujocoGo2:
         body_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) or "" for i in range(model.nbody)]
         self.fall_bodies = {self.base_id} | {i for i, name in enumerate(body_names) if name.startswith("arm_")}
         self.peak_torque = 0.0
+        self.last_tau = np.zeros(12)  # applied torque of the last physics sub-step, Isaac joint order
+        self.foot_geoms = [model.geom(n).id for n in ("FL", "FR", "RL", "RR")]  # Menagerie foot spheres
         self.reset()
 
     def reset(self) -> None:
@@ -230,6 +244,28 @@ class MujocoGo2:
 
     def ang_vel_b(self) -> tuple[float, float, float]:
         return tuple(float(v) for v in self.data.qvel[3:6])
+
+    def lin_vel_com_b(self) -> tuple[float, float, float]:
+        """Velocity of the base body's CENTER OF MASS in the base frame -- what Isaac Lab's `base_lin_vel`
+        observation is (`root_lin_vel_b` -> `root_com_lin_vel_b`). `lin_vel_b()` above is the body-frame ORIGIN
+        velocity (MuJoCo free-joint qvel); they differ by omega x r(origin->COM). Trace/diagnostic use only."""
+        qvel = self.data.qvel
+        r_world = self.data.xipos[self.base_id] - self.data.xpos[self.base_id]
+        omega_world = self.data.xmat[self.base_id].reshape(3, 3) @ qvel[3:6]
+        v_com_world = qvel[0:3] + np.cross(omega_world, r_world)
+        return deploy_real.quat_rotate_inverse_wxyz(self.quat_wxyz, tuple(float(v) for v in v_com_world))
+
+    def foot_normal_forces(self) -> np.ndarray:
+        """Normal contact force on each foot (FL, FR, RL, RR) against the floor, in N."""
+        forces = np.zeros(4)
+        force = np.zeros(6)
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            for k, g in enumerate(self.foot_geoms):
+                if g in (c.geom1, c.geom2) and self.floor_geom in (c.geom1, c.geom2):
+                    mujoco.mj_contactForce(self.model, self.data, i, force)
+                    forces[k] += abs(force[0])
+        return forces
 
     def to_robot_state(self) -> deploy_real.LatestRobotState:
         """MuJoCo state packed exactly like a LowState/SportModeState message would leave it (SDK motor order)."""
@@ -263,9 +299,13 @@ class MujocoGo2:
     def step(self, target_isaac: np.ndarray) -> None:
         for _ in range(DECIMATION):
             tau = self.dc_motor_torque(target_isaac)
+            self.last_tau = tau
             self.peak_torque = max(self.peak_torque, float(np.max(np.abs(tau))))
             self.data.ctrl[self.act_idx_isaac] = tau
             mujoco.mj_step(self.model, self.data)
+            if self.joint_speed_cap is not None:
+                qd = self.data.qvel[self.dof_adr_isaac]
+                self.data.qvel[self.dof_adr_isaac] = np.clip(qd, -self.joint_speed_cap, self.joint_speed_cap)
 
     # --- termination ---------------------------------------------------------------------------------------
 
@@ -381,6 +421,22 @@ def parse_args():
         "trains against (calf 45.43 Nm / 15.70 rad/s); 'legacy' = the single 23.5 Nm / 30 rad/s group the "
         "committed pre-fix policies were trained with. See MOTOR_LIMITS.",
     )
+    parser.add_argument("--armature", type=float, default=None, help=f"Joint armature kg m^2 (default {ARMATURE}).")
+    parser.add_argument(
+        "--action_delay", type=int, default=0,
+        help="Apply each policy target this many control steps (20 ms) late, like the training action latency "
+        "(0..2 in training). Default 0.",
+    )
+    parser.add_argument(
+        "--joint_speed_cap", type=float, nargs=3, default=None, metavar=("HIP", "THIGH", "CALF"),
+        help="Hard-clip joint speeds (rad/s) per joint type after every physics step, emulating PhysX's "
+        "maxJointVelocity, which Isaac enforces and MuJoCo lacks (see MujocoGo2). E.g. 30.1 30.1 15.7.",
+    )
+    parser.add_argument(
+        "--trace_out", default=None,
+        help="Write a per-control-step .npz trace (obs, action, joint/root state, torque, foot forces) for "
+        "comparing against an Isaac trace; see sim2sim/compare_traces.py. Off by default.",
+    )
     parser.add_argument("--save_xml", default=None, help="Write the compiled MuJoCo model to this XML path and exit.")
     return parser.parse_args()
 
@@ -388,6 +444,9 @@ def parse_args():
 def main():
     args = parse_args()
 
+    global ARMATURE
+    if args.armature is not None:
+        ARMATURE = args.armature
     model, spec = build_model()
     if args.save_xml:
         with open(args.save_xml, "w") as f:
@@ -405,7 +464,7 @@ def main():
     nominal_height = NOMINAL_HEIGHT_M["legacy" if is_legacy else "new"]
     cfg = load_sim_config(args.config, policy_path)
     sdk_to_isaac, _ = deploy_real.build_joint_index_maps(cfg)
-    robot = MujocoGo2(model, cfg, motor_limits=args.motor_limits)
+    robot = MujocoGo2(model, cfg, motor_limits=args.motor_limits, joint_speed_cap=args.joint_speed_cap)
     default_isaac = robot.default_isaac.tolist()
     height_source_note = f" (obs source: {args.height_source})" if layout["has_height_obs"] else ""
     print(
@@ -413,7 +472,8 @@ def main():
         f"has_height_obs={layout['has_height_obs']}{height_source_note} nominal_height={nominal_height:.3f} m "
         f"mass={float(np.sum(model.body_mass)):.2f} kg dt={model.opt.timestep} decimation={DECIMATION} "
         f"motor_limits={args.motor_limits} (calf {robot.effort_limit[-1]:.2f} Nm @ "
-        f"{robot.velocity_limit[-1]:.2f} rad/s) armature={ARMATURE}"
+        f"{robot.velocity_limit[-1]:.2f} rad/s) armature={ARMATURE} action_delay={args.action_delay} "
+        f"joint_speed_cap={args.joint_speed_cap if args.joint_speed_cap else 'off'}"
     )
 
     if args.scenario:
@@ -448,9 +508,14 @@ def main():
         viewer.cam.trackbodyid = robot.base_id
         viewer.cam.distance = 2.0
 
+    trace = None
+    if args.trace_out:
+        trace = {k: [] for k in ("obs", "action", "target", "joint_pos", "joint_vel", "torque", "root_pos", "root_quat",
+                                 "lin_vel_origin_b", "lin_vel_com_b", "ang_vel_b", "foot_force", "command")}
     try:
         dt = cfg.control_dt
         last_action = [0.0] * 12
+        target_history: list[np.ndarray] = [robot.default_isaac.copy()] * (args.action_delay + 1)
         stats: list[SegmentStats] = []
         step = 0
         stop = False
@@ -477,8 +542,26 @@ def main():
                 with torch.inference_mode():
                     action = policy(obs)[0].numpy()
                 target = robot.default_isaac + cfg.action_scale * action
-                robot.step(target)
+                target_history.append(target)
+                robot.step(target_history[max(0, len(target_history) - 1 - args.action_delay)])
+                if len(target_history) > args.action_delay + 1:
+                    target_history.pop(0)
                 last_action = action.tolist()
+                if trace is not None:
+                    q_isaac = robot.data.qpos[robot.qpos_adr_isaac]
+                    trace["obs"].append(obs[0].numpy().copy())
+                    trace["action"].append(action.copy())
+                    trace["target"].append(target.copy())
+                    trace["joint_pos"].append(q_isaac.copy())
+                    trace["joint_vel"].append(robot.data.qvel[robot.dof_adr_isaac].copy())
+                    trace["torque"].append(robot.last_tau.copy())
+                    trace["root_pos"].append(robot.data.qpos[0:3].copy())
+                    trace["root_quat"].append(robot.data.qpos[3:7].copy())
+                    trace["lin_vel_origin_b"].append(np.array(robot.lin_vel_b()))
+                    trace["lin_vel_com_b"].append(np.array(robot.lin_vel_com_b()))
+                    trace["ang_vel_b"].append(np.array(robot.ang_vel_b()))
+                    trace["foot_force"].append(robot.foot_normal_forces())
+                    trace["command"].append(np.array(cmd, dtype=float))
 
                 lin_vel = robot.lin_vel_b()
                 ang_vel_z = robot.ang_vel_b()[2]
@@ -526,6 +609,12 @@ def main():
 
         print_summary(stats, policy_path, nominal_height, robot.default_isaac, cfg.isaac_joint_order)
     finally:
+        if trace is not None and trace["obs"]:
+            np.savez_compressed(
+                args.trace_out, dt=cfg.control_dt, joint_names=np.array(cfg.isaac_joint_order),
+                **{k: np.stack(v) for k, v in trace.items()},
+            )
+            print(f"[INFO] Wrote trace ({len(trace['obs'])} steps) to {args.trace_out}")
         if viewer is not None:
             close_viewer(viewer, viewer_threads)
         if writer is not None:
