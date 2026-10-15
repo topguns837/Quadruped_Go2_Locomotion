@@ -62,6 +62,11 @@ def parse_args():
         help="After this many seconds, publish the handheld-controller bits for L2+B (the e-stop combo) in "
         "LowState.wireless_remote.",
     )
+    parser.add_argument(
+        "--fake_high_dq_after", type=float, default=None,
+        help="After this many seconds, report an artificially large dq (100 rad/s) on every joint in "
+        "LowState -- for testing deploy_real.py's JointSpeedWatchdog/JointSpeedFault without a real robot.",
+    )
     return parser.parse_args()
 
 
@@ -110,8 +115,12 @@ def main():
                 q_state[i] += 0.5 * err
             else:
                 tau_state[i] = 0.0
+            fake_dq = (
+                100.0 if args.fake_high_dq_after is not None and time.monotonic() - start_time >= args.fake_high_dq_after
+                else 0.0
+            )
             low_state.motor_state[i].q = q_state[i]
-            low_state.motor_state[i].dq = 0.0
+            low_state.motor_state[i].dq = fake_dq
             low_state.motor_state[i].tau_est = tau_state[i]
         if args.press_estop_after is not None and time.monotonic() - start_time >= args.press_estop_after:
             remote = [0] * 40

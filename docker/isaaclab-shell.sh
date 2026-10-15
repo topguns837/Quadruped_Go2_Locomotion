@@ -79,7 +79,7 @@ PLAY_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/play_dashboard.png"
 # and fails on a missing "FILL_IN_NIC" input file, instead of erroring obviously. A bare placeholder word
 # has no such failure mode. network_mode: host (docker-compose.yml) is what makes binding a specific host
 # NIC from inside this container possible at all.
-HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --dry_run"
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --max_target_dev_deg 25 --dry_run"
 
 # Same live-dashboard setup as play's, reading deploy_real.py's --live_plot output instead (logs/hardware_dashboard/,
 # same tag names as play.py's --live_plot -- see deploy_real.py's log_live_plot). Same --exclude-panels/
@@ -106,6 +106,12 @@ PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.p
 SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --manual_commands --live_plot"
 SIM2SIM_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/sim2sim_dashboard --output /tmp/sim2sim_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
 SIM2SIM_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/sim2sim_dashboard.png"
+
+# Isaac-vs-MuJoCo velocity-tracking comparison (scripts/rsl_rl/eval_velocity_tracking.py): needs the full Kit
+# runtime for the Isaac half, so `isaaclab -p`, unlike SIM2SIM_CMD above. With no --checkpoint it resolves the
+# latest run/checkpoint the same way `play.py --resume` does. Self-contained: no paired dashboard/viewer pane
+# needed (it prints one report and exits), same reasoning as PREFLIGHT_CMD.
+SIM2SIM_EVAL_CMD="isaaclab -p scripts/rsl_rl/eval_velocity_tracking.py --headless"
 
 docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-session -d -s isaaclab -n list-envs
@@ -137,7 +143,9 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux select-pane -t "$HW_CMD_PANE"
   tmux new-window -t isaaclab -n sim2sim
   tmux send-keys -t isaaclab:sim2sim "'"${SIM2SIM_CMD}"'"
-  S2S_DASH_PANE=$(tmux split-window -h -t isaaclab:sim2sim -P -F "#{pane_id}")
+  S2S_EVAL_PANE=$(tmux split-window -v -t isaaclab:sim2sim.0 -P -F "#{pane_id}")
+  tmux send-keys -t "$S2S_EVAL_PANE" "'"${SIM2SIM_EVAL_CMD}"'"
+  S2S_DASH_PANE=$(tmux split-window -h -t isaaclab:sim2sim.0 -P -F "#{pane_id}")
   tmux send-keys -t "$S2S_DASH_PANE" "'"${SIM2SIM_DASHBOARD_CMD}"'"
   S2S_VIEW_PANE=$(tmux split-window -v -t "$S2S_DASH_PANE" -P -F "#{pane_id}")
   tmux send-keys -t "$S2S_VIEW_PANE" "'"${SIM2SIM_VIEW_CMD}"'"

@@ -6,17 +6,16 @@
 # was calibrated against this exact stiffness/damping/scale combination; using different real-hardware PD
 # gains would silently change what each action value means to the robot.
 
-policy_path: models/9_13_26_pitch_lean_height_weights_experimental/exported/policy.pt  # JIT export -- takes
-  # the raw observation vector and returns actions directly (obs normalization baked in). NOT model_17999.pt
-  # (that's the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic
-  # class to load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
+policy_path: models/10_14_26_real_hardware_parity_tested/exported/policy.pt  # JIT export -- takes the raw
+  # observation vector and returns actions directly (obs normalization baked in). NOT model_9999.pt (that's
+  # the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic class to
+  # load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
   #
-  # STALE as of the calf-actuator and height/mass fixes: this 52-dim policy was trained against the old
-  # 23.5 Nm calf limit, the old 6-wide/base_height observation, and the imu/radar phantom mass -- none of
-  # which the current training config reproduces any more. deploy_real.py's observation builder is now
-  # 50-dim-only on its real-hardware path (no base_height branch is exercised there), so pointing this at
-  # the file above will fail loudly with a matrix-shape error, not run with silently wrong behavior. Update
-  # this to the new policy's exported/policy.pt once retrained.
+  # First checkpoint trained under the real-hardware-parity config (no PhysX joint-speed clamp, no action
+  # clipping, nominal armature + domain randomization -- see CLAUDE.md "Real-hardware parity (2026-10-13)").
+  # Operator-confirmed working on real hardware this session (hoisted + policy loop, see
+  # models/10_14_26_real_hardware_parity_tested/SUMMARY.md for the full report, including a known ~20-26 deg
+  # real-vs-simulated standing-pose gap on a few joints). Update this once a better checkpoint replaces it.
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
 network_interface: null  # REQUIRED before first run -- e.g. "enp3s0" (host NIC cabled to the robot). See

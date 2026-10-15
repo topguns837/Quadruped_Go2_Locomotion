@@ -409,7 +409,11 @@ def parse_args():
     source.add_argument("--scenario", default=None, help="YAML list of command segments (see sim2sim/scenarios/).")
     source.add_argument("--manual_commands", action="store_true", help="Drive commands from the slider GUI.")
     parser.add_argument("--command_file", default="/tmp/manual_command.json")
-    parser.add_argument("--duration", type=float, default=60.0, help="Run length without --scenario (s).")
+    parser.add_argument(
+        "--duration", type=float, default=None,
+        help="Run length in seconds without --scenario. Default: 60s for a zero-command run, or run "
+        "indefinitely (until the viewer window is closed / Ctrl+C) with --manual_commands.",
+    )
     parser.add_argument("--headless", action="store_true", help="No viewer; runs as fast as possible.")
     parser.add_argument("--live_plot", action="store_true", help="TensorBoard log to logs/sim2sim_dashboard/.")
     parser.add_argument("--no_reset", action="store_true", help="Stop at the first fall instead of resetting.")
@@ -479,7 +483,13 @@ def main():
     if args.scenario:
         segments = load_scenario(args.scenario)
     else:
-        segments = [Segment("manual" if args.manual_commands else "zero", args.duration, [0, 0, 0, 0, 0])]
+        if args.duration is not None:
+            duration = args.duration
+        elif args.manual_commands:
+            duration = 24 * 60 * 60  # effectively indefinite for an interactive session; Ctrl+C/close to stop
+        else:
+            duration = 60.0
+        segments = [Segment("manual" if args.manual_commands else "zero", duration, [0, 0, 0, 0, 0])]
     manual_buf = None
     if args.manual_commands:
         manual_buf = deploy_real.ManualCommandBuffer()

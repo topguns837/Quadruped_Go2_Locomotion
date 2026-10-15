@@ -69,6 +69,7 @@ def main():
     root.title("Manual command")
 
     values = {key: initial for key, _label, _lo, _hi, initial in SLIDERS}
+    scales: dict[str, tk.Scale] = {}
 
     def on_change(key, value):
         values[key] = float(value)
@@ -87,6 +88,20 @@ def main():
         )
         scale.set(initial)
         scale.pack(padx=8, pady=(0, 8))
+        scales[key] = scale
+
+    def zero_all():
+        """Snaps every slider back to 0 and writes the zeroed command immediately -- a single click to get
+        back to a standing-still command without having to drag each slider back by hand."""
+        for key in values:
+            values[key] = 0.0
+            scales[key].set(0.0)
+        write_command_file(args.command_file, build_command_dict(**values))
+
+    tk.Button(
+        root, text="ZERO ALL", command=zero_all, bg="red", fg="white",
+        activebackground="#aa0000", activeforeground="white", font=("TkDefaultFont", 10, "bold"),
+    ).pack(padx=8, pady=(4, 12), fill="x")
 
     # Write the initial (all-default) command immediately, so play.py's poller has a valid file to read
     # even before any slider is touched.
