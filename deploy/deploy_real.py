@@ -1362,12 +1362,21 @@ def main():
                 ]
 
                 if target_buf is not None:
+                    held_target = target_buf.get()
                     clamped_target, clipped_names = clamp_step(
-                        target_buf.get(), target_isaac_order, max_joint_step_rad, cfg.isaac_joint_order
+                        held_target, target_isaac_order, max_joint_step_rad, cfg.isaac_joint_order
                     )
                     if clipped_names:
+                        # Actual rate the policy's raw (unclamped) target implied this tick, rad/s -- vs.
+                        # args.max_joint_speed_rad_s, the cap that's about to be enforced below. Lets an
+                        # operator see HOW large the policy's ask was, not just that it was clipped.
+                        policy_rates = {
+                            name: (target_isaac_order[i] - held_target[i]) / control_dt
+                            for i, name in enumerate(cfg.isaac_joint_order)
+                        }
+                        rate_str = ", ".join(f"{name}={policy_rates[name]:+.2f}rad/s" for name in clipped_names)
                         print(f"[WARN] step {step}: slew-rate limit clipped {len(clipped_names)} joint(s) "
-                              f"to {args.max_joint_speed_rad_s:.3f} rad/s: {', '.join(clipped_names)}")
+                              f"to {args.max_joint_speed_rad_s:.3f} rad/s (policy wanted: {rate_str})")
                     max_err, max_tau = monitor.check(target_buf.get(), kp_fraction=1.0)
                     clamped_target, tethered = monitor.limit_target(clamped_target)
                     if tethered:
