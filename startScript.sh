@@ -13,7 +13,7 @@ DOCKER_DIR="${SCRIPT_DIR}/docker"
 while true; do
     echo ""
     echo "Start Menu"
-    echo "  1) Open Isaac Lab"
+    echo "  1) Open Stack"
     echo "  2) Build docker image"
     echo "  3) Open empty container"
     echo "  4) Exit"

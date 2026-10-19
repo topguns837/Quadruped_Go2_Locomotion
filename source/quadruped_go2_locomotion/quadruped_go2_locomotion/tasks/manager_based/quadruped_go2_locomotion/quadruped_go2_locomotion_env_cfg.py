@@ -78,7 +78,9 @@ class QuadrupedLocomotionSceneCfg(InteractiveSceneCfg):
         terrain_type="generator",
         terrain_generator=TerrainGeneratorCfg(
             size=(8.0, 8.0),
-            border_width=20.0,
+            # 70 m: episode travel is bounded by sqrt(2) m/s * 40 s ~= 57 m, so even an edge tile's robot
+            # cannot reach the world edge. The border is four flat boxes, so width costs nothing.
+            border_width=70.0,
             num_rows=32,
             num_cols=32,
             horizontal_scale=0.1,
@@ -177,7 +179,7 @@ class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfgWithPitch(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.12,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
@@ -189,7 +191,6 @@ class CommandsCfg:
             heading=(-math.pi, math.pi),
             ang_pos_x=(-0.3, 0.3),
             ang_pos_y=(-0.6, 0.6),
-            lin_pos_z=(0.2, 0.4),
         ),
     )
 
@@ -198,7 +199,11 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True)
+    # Same affine map as before (default + 0.25 * action, no clipping), but each applied target lags the policy output by
+    # 0-2 control steps (random per env per episode): the robot's command path is not instantaneous. See mdp/actions.py.
+    joint_pos = mdp.DelayedJointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True, max_delay_steps=2
+    )
 
 
 @configclass
@@ -259,19 +264,103 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.8, 0.8),
-            "dynamic_friction_range": (0.6, 0.6),
+            # Randomised per environment: real floors and foot rubber vary, and the old fixed 0.8/0.6 let the policy
+            # tune to one value. make_consistent keeps dynamic <= static.
+            "static_friction_range": (0.5, 1.2),
+            "dynamic_friction_range": (0.4, 1.0),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
+            "make_consistent": True,
         },
     )
 
-    # reset 
+    # Sim-to-real domain randomisation (startup = drawn once per environment). Ranges are assumptions to be revisited
+    # against measurements from the robot.
+    robot_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "mass_distribution_params": (-1.0, 2.0),  # kg added to the base (battery, payload, arm differences)
+            "operation": "add",
+            "recompute_inertia": True,
+        },
+    )
+    actuator_gains = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+        },
+    )
+    joint_armature = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "armature_distribution_params": (0.5, 2.0),  # x nominal JOINT_ARMATURE
+            "operation": "scale",
+        },
+    )
+    joint_friction = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "friction_distribution_params": (0.0, 0.1),  # Nm of joint friction (the robot has some; the sim had none)
+            "operation": "abs",
+        },
+    )
+    push_robot = EventTerm(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(8.0, 15.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+    )
+
+    # Corrects 2.0 kg of phantom mass, 13% of the robot. `imu` and `radar` are massless sensor frames in
+    # Unitree's URDF and are authored `physics:mass = 0.0` in our USD, but a rigid body cannot have zero mass
+    # in PhysX, so it silently substitutes its 1.0 kg default for EACH of them. Measured via
+    # root_physx_view.get_masses(): the robot loaded at 17.623 kg against a ~15.6 kg real weight, and because
+    # `radar` sits at (+0.289, 0, -0.047) that put 1 kg at the nose, 29 cm forward of the base origin, shifting
+    # the centre of mass ~1 cm forward and inflating pitch inertia. Our hardware has no radar fitted at all.
+    #
+    # Notes on the specific arguments:
+    #  - "abs" sets an absolute value and the degenerate (x, x) range makes this a deterministic setter, the
+    #    same trick physics_material above uses. 1 g rather than 0 because the term clamps at min_mass=1e-6.
+    #  - mode="startup" runs once after sim start, by which point the actuator's cached default_mass holds
+    #    PhysX's substituted 1.0 kg; "abs" then overwrites it. The term re-reads default_mass before applying,
+    #    so it is idempotent. "prestartup" would not work with replicate_physics=True.
+    #  - recompute_inertia=False because PhysX substituted only the MASS: the authored
+    #    physics:diagonalInertia = 1e-5 is non-zero and was kept. Rescaling it to 1e-8 buys nothing, and these
+    #    are not uniform-density solids. Either way both bodies are welded to `base` by fixed joints, so 2e-5
+    #    against the base's ~0.1 kg*m^2 is a 0.02% effect.
+    #  - body_names are literals matched with re.fullmatch, so they hit exactly these two bodies and raise at
+    #    startup if either name ever disappears, instead of silently doing nothing. Neither body has any child
+    #    prim, geometry or CollisionAPI, and neither appears in any reward/termination/contact body_names list,
+    #    so this change is confined to dynamics.
+    #  - UsdFileCfg.mass_props cannot do this: modify_mass_properties is @apply_nested and would overwrite all
+    #    47 rigid bodies' masses.
+    fix_massless_sensor_bodies = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["imu", "radar"]),
+            "mass_distribution_params": (0.001, 0.001),
+            "operation": "abs",
+            "recompute_inertia": False,
+        },
+    )
+
+    # reset
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (0.2, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (-0.5, 0.5),
                 "y": (-0.3, 0.3),
@@ -286,7 +375,7 @@ class EventCfg:
         func=mdp.reset_joints_by_scale,
         mode="reset",
         params={
-            "position_range": (0.5, 1.0),
+            "position_range": (0.5, 1.5),
             "velocity_range": (0.0, 0.0),
         },
     )
@@ -307,18 +396,22 @@ class RewardsCfg:
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp,
-        weight=0.5,
+        weight=2.0,  # was 0.5 (20:1 under lin_vel); Round 3 used 5.0, which cut lin_vel's tracking share to 48%
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
     track_pitch_exp = RewTerm(
         func=mdp.track_pitch_exp,
-        weight=0.5,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+        # Weight 3.0 (Round 3). std tightened sqrt(0.1) -> sqrt(0.04): at the old std a policy that ignores the
+        # +-0.6 rad pitch command still earned 46% of the reward; now 30%, so more of the weight is real gradient.
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.04)},
     )
     track_lean_exp = RewTerm(
         func=mdp.track_lean_exp,
-        weight=0.3,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.1)},
+        # Weight 3.0 (Round 3). std tightened sqrt(0.1) -> sqrt(0.02): the old kernel was wider than the whole
+        # +-0.3 rad command range, so ignoring lean earned 77% of the reward; now 42%.
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.02)},
     )
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
@@ -344,13 +437,22 @@ class RewardsCfg:
         },
     )
     # additional penalties to encourage more natural motions
+    #
+    # target_height=0.337 is the base height the default joint pose produces (thigh 0.8/1.0, calf -1.5, plus
+    # the foot collision radius) -- matches what joint_deviation_l1 already pulls toward, so the two rewards
+    # agree instead of fighting. pitch_sensitivity lowered from -0.5 (which drove the target to an
+    # unreachable 0.037m at the +-0.6 rad pitch limit) to -0.1, allowing ~6cm of crouch at full pitch instead
+    # of 30cm -- the base barely moves vertically under pitch anyway, since the hips are +-0.193m fore/aft of
+    # center. There is no height COMMAND any more (see mdp.commands' module docstring): no reliable height
+    # measurement exists on real hardware, so this fixed target is the only height regulation left.
     height_penalty = RewTerm(
         func=mdp.base_height_l2_pitch,
         weight=-1.65,
         params={
             "command_name": "base_velocity",
-            "pitch_sensitivity": -0.5,
-            "lean_sensitivity": 0.05,
+            "target_height": 0.337,
+            "pitch_sensitivity": -0.1,
+            "lean_sensitivity": 0.0,
         },
     )
 
@@ -374,6 +476,22 @@ class RewardsCfg:
             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
         },
     )
+    # Trot shaping (dense, partial credit for weight shifts between diagonals); 0 at a zero command.
+    gait_coordination = RewTerm(
+        func=mdp.GaitDiagonalCoordination,
+        weight=1.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"), "command_name": "base_velocity"},
+    )
+    # Stand on all four feet in the default pose when commanded to stand; 0 once a velocity is commanded.
+    stand_still = RewTerm(
+        func=mdp.stand_still_default_pose,
+        weight=1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
+            "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+            "command_name": "base_velocity",
+        },
+    )
     # foot lift reward -- reward feet above min_height when not in contact
     foot_lift = RewTerm(
         func=mdp.foot_lift_exp,
@@ -383,7 +501,7 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-            "min_height": 0.05,  # 5 cm
+            "min_height": 0.10,  # 10 cm (Round 3; was 5 cm)
         },
     )
     # -- optional penalties
@@ -421,6 +539,15 @@ class TerminationsCfg:
     # Safety net for non-finite (NaN/Inf) root/joint state from a rare physics-solver edge case,
     # independent of body_contact's base/head-only scope. See mdp/terminations.py.
     invalid_state = DoneTerm(func=mdp.invalid_state)
+    # Safety net that should never fire: the terrain border is wide enough that no episode can reach the
+    # edge (robots walking off it and free-falling caused the old -4k reward dips). time_out=True makes it a
+    # truncation, so the value function bootstraps instead of learning that walking far is dangerous.
+    # Any non-zero Episode_Termination/terrain_out_of_bounds therefore flags something unexpected.
+    terrain_out_of_bounds = DoneTerm(
+        func=mdp.terrain_out_of_bounds,
+        params={"asset_cfg": SceneEntityCfg("robot"), "distance_buffer": 3.0},
+        time_out=True,
+    )
 
 
 @configclass
@@ -489,6 +616,16 @@ class QuadrupedLocomotionEnvCfg_PLAY(QuadrupedLocomotionEnvCfg):
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
+        # nominal physics for play and for sim2sim comparisons: no pushes, no action latency, no startup randomisation
+        # (armature stays at its nominal JOINT_ARMATURE); friction back to the single nominal 0.8 / 0.6 pair.
+        self.events.physics_material.params["static_friction_range"] = (0.8, 0.8)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.6, 0.6)
+        self.events.robot_mass = None
+        self.events.actuator_gains = None
+        self.events.joint_armature = None
+        self.events.joint_friction = None
+        self.events.push_robot = None
+        self.actions.joint_pos.max_delay_steps = 0
         
         # terrain curriculum
         self.curriculum.terrain_levels = None

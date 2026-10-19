@@ -75,6 +75,14 @@ services:
       - /dev/dri:/dev/dri
     deploy:
       resources:
+        # Hard cap so a runaway process (e.g. Isaac Sim GUI training with too many envs, confirmed directly to use
+        # 100+ GB for 1024 envs) gets OOM-killed inside the container instead of taking down the whole host, which
+        # has happened more than once. Headless training measured at ~8 GB for 2048 envs; 48g leaves generous
+        # headroom (GUI/dashboard/slider running alongside, larger env counts) while stopping well short of the
+        # host's 125 GB. Raise if a legitimate run needs more; check `docker inspect
+        # quadruped_go2_locomotion --format '{{.State.OOMKilled}}'` if the container dies unexpectedly.
+        limits:
+          memory: 48g
         reservations:
           devices:
             - driver: nvidia

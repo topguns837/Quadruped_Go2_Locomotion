@@ -64,6 +64,31 @@ PANELS = [
         ("Metrics/base_velocity/error_vel_xy", "error_vel_xy"),
         ("Metrics/base_velocity/error_vel_yaw", "error_vel_yaw"),
     ]),
+    # Written by deploy/preflight_check.py --live_plot (Joints/<joint_name> tags, one per leg joint) --
+    # grouped by leg rather than by joint type so "wiggle one leg, watch one panel" reads naturally. These
+    # tags never appear in training/play/hardware logdirs, so --exclude-panels is what keeps them out of
+    # those dashboards (see docker/isaaclab-shell.sh) -- no auto-detection here, to avoid a startup race
+    # where a panel's tags don't exist yet on the very first reload and silently never reappear.
+    ("FL leg joint angles", [
+        ("Joints/FL_hip_joint", "hip"),
+        ("Joints/FL_thigh_joint", "thigh"),
+        ("Joints/FL_calf_joint", "calf"),
+    ]),
+    ("FR leg joint angles", [
+        ("Joints/FR_hip_joint", "hip"),
+        ("Joints/FR_thigh_joint", "thigh"),
+        ("Joints/FR_calf_joint", "calf"),
+    ]),
+    ("RL leg joint angles", [
+        ("Joints/RL_hip_joint", "hip"),
+        ("Joints/RL_thigh_joint", "thigh"),
+        ("Joints/RL_calf_joint", "calf"),
+    ]),
+    ("RR leg joint angles", [
+        ("Joints/RR_hip_joint", "hip"),
+        ("Joints/RR_thigh_joint", "thigh"),
+        ("Joints/RR_calf_joint", "calf"),
+    ]),
 ]
 
 
@@ -92,6 +117,7 @@ class LiveDashboard:
         max_points: int = 100,
         exclude_panels: set[str] | None = None,
         y_range_multiplier: float = 1.0,
+        max_pixels: tuple[int, int] = (1850, 1000),
     ):
         self.logdir = logdir
         self.max_points = max_points
@@ -111,7 +137,12 @@ class LiveDashboard:
         n = len(self.panels)
         cols = math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
-        self.fig, axes = plt.subplots(rows, cols, figsize=(cols * 16 / 3, rows * 10 / 3))
+        fig_w, fig_h = cols * 16 / 3, rows * 10 / 3
+        # Saved PNG must fit on a 1920x1080 screen at 1:1: a 4x4 grid at matplotlib's default 100 dpi is
+        # 2133x1333 px, so an image viewer (feh) shows it larger than the screen and the legends/axes at the
+        # edges fall off. Lower the dpi just enough to fit (never raise it above 100).
+        dpi = min(100.0, max_pixels[0] / fig_w, max_pixels[1] / fig_h)
+        self.fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), dpi=dpi)
         self.fig.canvas.manager.set_window_title(f"Live training dashboard -- {logdir}")
         self.axes = [axes] if n == 1 else axes.flatten()
         self.lines: dict[str, dict[str, plt.Line2D]] = {}
@@ -156,6 +187,16 @@ class LiveDashboard:
                     half_range = max((data_hi - data_lo) / 2, 1e-6) * self.y_range_multiplier
                     ax.set_ylim(center - half_range, center + half_range)
 
+        # __init__'s tight_layout() ran against empty axes (default 0..1 ticks, e.g. "0.0", "0.2") and is
+        # never enough once real data arrives: a reward panel spanning -4000..638, or any panel whose
+        # values reach into the millions (e.g. an unclamped reward outlier), produces tick labels several
+        # characters wider than what that one-time layout planned for. The plot area never shrinks to make
+        # room, so wide tick labels bleed past the subplot boundary into neighboring panels or off the
+        # figure edge -- "the graph overflows the image." Re-running this every frame keeps the margins
+        # sized to whatever the current tick labels actually need. Cheap enough at typical --interval
+        # (0.5-1s) for a 13-panel grid; skip it if dashboard redraws ever become visibly sluggish.
+        self.fig.tight_layout()
+
         return [line for panel in self.lines.values() for line in panel.values()]
 
     def run(self, interval_ms: int, output_path: str | None = None):
@@ -194,7 +235,7 @@ def main():
             "(e.g. logs/rsl_rl/<experiment_name>) -- in which case the most recently modified run is used."
         ),
     )
-    parser.add_argument("--interval", type=float, default=3.0, help="Refresh interval in seconds.")
+    parser.add_argument("--interval", type=float, default=0.5, help="Refresh interval in seconds.")
     parser.add_argument(
         "--max-points",
         type=int,

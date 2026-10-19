@@ -52,3 +52,13 @@ git apply -R patches/round3_weights_and_height.patch   # restore the vanilla-pla
 ```
 
 Playing `models/9_10_26_vanilla/model_9999.pt` needs no patch — it matches the default committed state.
+
+**Update, post-retrain-prep fixes:** `patches/round3_weights_and_height.patch` no longer applies cleanly --
+its height-command/`base_height`-observation hunks conflict with the current `mdp/commands.py` and
+`quadruped_go2_locomotion_env_cfg.py`, which have since dropped the height command and observation entirely
+(no reliable way to measure height on real hardware; height is now training-reward-only, see
+`mdp/commands.py`'s module docstring). Both this checkpoint and `models/9_10_26_vanilla` are also stale for
+an unrelated reason: they were trained against a 23.5 Nm calf limit the real Go2 does not have (its calf has
+a 1.9169:1 knee reduction, 45.43 Nm) and a 2.0 kg imu/radar phantom mass that has since been fixed -- see
+`sim2sim/README.md` for the measurements. The patch, and this run, are kept only as a historical record of
+the Round 3 reward-weight experiment; do not apply the patch or resume from this checkpoint.

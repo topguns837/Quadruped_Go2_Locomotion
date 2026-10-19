@@ -41,3 +41,4 @@ def invalid_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
         diagnostics.log_step(env, name, value)
         done |= ~torch.isfinite(value).reshape(value.shape[0], -1).all(dim=1)
     return done
+
