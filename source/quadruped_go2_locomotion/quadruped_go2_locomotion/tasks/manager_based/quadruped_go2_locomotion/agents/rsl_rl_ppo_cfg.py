@@ -12,7 +12,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 10000
-    save_interval = 500
+    save_interval = 100
     experiment_name = "go2_with_pitch_lean_and_height_control_ppo"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(

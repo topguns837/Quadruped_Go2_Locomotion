@@ -115,7 +115,7 @@ Only after Phase 5 passed and the LED is steady green.
 - [ ] Watch for `[WARN] tether limited ...` lines. Occasional ones are fine. **Many joints limited every step = the targets are running away: stop.**
 - [ ] `[STEP n]` targets stay near default (hips about +/-6, thighs about 46-57, calves about -86 deg), not drifting. If a joint drifts steadily, stop.
 - [ ] Sliders at zero. Stable stand, no twitching, LED green.
-- [ ] Measure standing height with a tape: `______ m` (policy assumes 0.30 m; height and base velocity inputs are still stand-ins, so the first ground run may be imperfect).
+- [ ] Base velocity input is still a stand-in (`sportmode_velocity`, see deploy.md), so the first ground run may be imperfect. (Height is no longer an input at all -- removed, not a stand-in -- so there is nothing to tape-measure here any more.)
 - [ ] Only then: small slider commands (e.g. 0.1 m/s), increasing gradually.
 - **Go / No-Go:** [ ] stable stand for 1+ minute at zero command  [ ] no tether spam  [ ] LED green
 

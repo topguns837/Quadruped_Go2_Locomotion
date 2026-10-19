@@ -12,7 +12,9 @@ re-running training to reproduce it. No-ops (and never raises) when log_dir isn'
 
 from __future__ import annotations
 
+import logging
 import os
+from logging.handlers import RotatingFileHandler
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,6 +25,15 @@ from isaaclab.managers import SceneEntityCfg
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+# Bounds step_diagnostics.log's total size per run -- it used to grow unboundedly (measured up to 1.1 GB on a
+# long run) since it appended one line per logged term per step forever. ~7 logged terms x ~70 bytes/line/step
+# means 20 MB is ~40000 steps of trailing history -- far more than needed to see the lead-up to a crash -- and
+# x 3 backups caps the worst case at 80 MB per run instead of unbounded growth. Oldest rotated file is
+# step_diagnostics.log.3; RotatingFileHandler deletes it once a 4th rotation would be needed, so the total is a
+# hard cap, not just a rename.
+STEP_DIAGNOSTICS_MAX_BYTES = 20 * 1024 * 1024
+STEP_DIAGNOSTICS_BACKUP_COUNT = 3
+
 # One open file handle per log_dir, reused across calls/terms instead of reopening every line.
 _LOG_FILES: dict[str, "_StepLogger"] = {}
 
@@ -30,10 +41,24 @@ _LOG_FILES: dict[str, "_StepLogger"] = {}
 class _StepLogger:
     def __init__(self, log_dir: str):
         os.makedirs(log_dir, exist_ok=True)
-        self._file = open(os.path.join(log_dir, "step_diagnostics.log"), "a", buffering=1)
+        # logging.getLogger's name registry is itself keyed by log_dir, so a second _StepLogger built for the
+        # same log_dir (shouldn't happen given the _LOG_FILES cache above, but kept defensive) reuses the same
+        # handler instead of attaching a duplicate one.
+        logger = logging.getLogger(f"step_diagnostics.{log_dir}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not logger.handlers:
+            handler = RotatingFileHandler(
+                os.path.join(log_dir, "step_diagnostics.log"),
+                maxBytes=STEP_DIAGNOSTICS_MAX_BYTES,
+                backupCount=STEP_DIAGNOSTICS_BACKUP_COUNT,
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+        self._logger = logger
 
     def write(self, line: str) -> None:
-        self._file.write(line + "\n")
+        self._logger.info(line)
 
 
 def log_step(env: ManagerBasedRLEnv, source: str, value: torch.Tensor) -> None:

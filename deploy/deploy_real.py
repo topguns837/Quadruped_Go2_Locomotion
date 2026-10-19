@@ -34,9 +34,10 @@ Before any LowCmd is meaningful, the robot's onboard sport-mode controller must 
 MotionSwitcherClient, looping StandDown()+ReleaseMode() until CheckMode() reports no active mode) and
 independently corroborated by docs.quadruped.de's Go2 "Low-Level Control" page.
 
-Height tracking is NOT currently a real estimate -- see `DEFAULT_HEIGHT_M` below; deliberately simplified
-to a fixed constant since no reliable real-hardware source has been verified yet (SportModeState's
-availability once sport mode is released is unconfirmed).
+Height is not part of the command or observation at all any more: there is no reliable way to measure base
+height on real hardware (SportModeState's availability once sport mode is released was never confirmed),
+and the training-side fix is to hold the robot near a fixed default stance height purely via a reward
+(RewardsCfg.height_penalty), never to observe or command it. See mdp/commands.py's module docstring.
 """
 
 from __future__ import annotations
@@ -85,14 +86,6 @@ _LOWCMD_HEAD = (0xFE, 0xEF)
 _LOWLEVEL = 0xFF  # LowCmd.level_flag -- tells the robot to obey LowCmd instead of its onboard controller
 _MOTOR_MODE_PMSM = 0x01  # LowCmd.motor_cmd[i].mode -- required on every motor, set once at init
 
-# Height tracking isn't working yet (no reliable real-hardware source verified -- SportModeState's
-# real-hardware availability after ReleaseMode() is unconfirmed, see deploy.md Stage 3, and forward
-# kinematics isn't implemented). Deliberately simplified to a fixed constant for now rather than guessing:
-# the robot's nominal standing height, matching default_joint_pos's implied stance. Revisit once hardware
-# is available to test what's actually reliable.
-DEFAULT_HEIGHT_M = 0.3
-
-
 # ---------------------------------------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------------------------------------
@@ -110,7 +103,6 @@ class DeployConfig:
     isaac_joint_order: list[str]
     sdk_joint_order: list[str]
     default_joint_pos: dict[str, float]
-    has_height_obs: bool  # True for the experimental (Round 3) policy, False for vanilla -- see obs assembly.
 
 
 def load_config(path: str, cli_network_interface: str | None) -> DeployConfig:
@@ -133,7 +125,6 @@ def load_config(path: str, cli_network_interface: str | None) -> DeployConfig:
         isaac_joint_order=list(raw["isaac_joint_order"]),
         sdk_joint_order=list(raw["sdk_joint_order"]),
         default_joint_pos=dict(raw["default_joint_pos"]),
-        has_height_obs="round3" in raw["policy_path"] or "experimental" in raw["policy_path"],
     )
 
 
@@ -192,11 +183,13 @@ class LatestRobotState:
         self.wireless_remote = bytes(40)  # raw handheld-controller state carried in LowState (see decode_controller_buttons)
         self.quat_wxyz = (1.0, 0.0, 0.0, 0.0)  # IMU orientation, body-to-world
         self.gyro = (0.0, 0.0, 0.0)  # body-frame angular velocity, rad/s
-        # NOTE: same open question as DEFAULT_HEIGHT_M above -- SportModeState's real-hardware availability
-        # after ReleaseMode() is unconfirmed (see deploy.md Stage 3), so this may also go stale/frozen once
-        # the robot is actually in the state the policy needs it in. Left wired up (unlike height, which
-        # was simplified to a constant) since there's no evidence yet it specifically fails, but flagged
-        # here so it isn't silently trusted if it turns out not to work either.
+        # NOTE: SportModeState's real-hardware availability after ReleaseMode() is unconfirmed (see
+        # deploy.md Stage 3), so this may go stale/frozen once the robot is actually in the state the
+        # policy needs it in. Left wired up since there's no evidence yet it specifically fails, but
+        # flagged here so it isn't silently trusted if it turns out not to work either. (Height, the other
+        # quantity this same uncertainty applied to, is no longer tracked at all -- see mdp/commands.py's
+        # module docstring: there is no height command or observation any more, only a training-side
+        # reward toward a fixed default stance height, so there is nothing left to read here for it.)
         self.sportmode_velocity = (0.0, 0.0, 0.0)  # body-frame linear velocity estimate, m/s
         self.ready = False  # False until at least one LowState message has been received
         self.last_update = None  # time.monotonic() of the most recent LowState message
@@ -288,7 +281,7 @@ def quat_to_pitch_lean(quat_wxyz: tuple[float, float, float, float]) -> tuple[fl
 class ManualCommandBuffer:
     def __init__(self):
         self._lock = threading.Lock()
-        self._values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.3]  # lin_x, lin_y, ang_z, pitch, lean, height
+        self._values = [0.0, 0.0, 0.0, 0.0, 0.0]  # lin_x, lin_y, ang_z, pitch, lean
 
     def set(self, values: list[float]) -> None:
         with self._lock:
@@ -316,7 +309,6 @@ def _manual_command_file_poll_loop(buf: ManualCommandBuffer, path: str, poll_int
                         data["ang_vel_z"],
                         data["pitch"],
                         data["lean"],
-                        data["height"],
                     ]
                 )
                 last_mtime = mtime
@@ -611,6 +603,17 @@ class TrackingFault(RuntimeError):
     near the motors' limit, or a ramp that could not reach its target within the tether."""
 
 
+class JointSpeedFault(TrackingFault):
+    """Raised when the robot's actual measured joint velocity (LowState's dq, not the commanded target)
+    stays above its per-joint-type cap for too long -- the real-hardware analog of Isaac/PhysX's hard
+    `velocity_limit_sim` clamp, which overwrites the simulated joint's physical velocity state directly.
+    Real hardware has no equivalent lever (we can't overwrite physical velocity, only the position target
+    we command), so this reacts to the robot's actual speed instead: a joint moving this fast for several
+    consecutive ticks means something is off (free-swinging, a drop, a runaway command) regardless of
+    whether clamp_step/tether_limit/the torque watchdog have also caught it. Subclasses TrackingFault so
+    it's handled by the same except clause as every other "stop now" condition."""
+
+
 def tether_limit(
     target_isaac_order: list[float], actual_isaac_order: list[float], max_dev_rad: float, joint_names: list[str]
 ) -> tuple[list[float], list[str]]:
@@ -700,6 +703,38 @@ class TorqueResponseWatchdog:
             self._count = 0
 
 
+class JointSpeedWatchdog:
+    """Raises JointSpeedFault after `consecutive_steps` consecutive updates where any joint's actual
+    measured |velocity| exceeds its per-joint-type cap (hip/thigh/calf, same three-value convention as
+    sim2sim's --joint_speed_cap). Default caps (30.1, 30.1, 15.7 rad/s) are this robot's own
+    DCMotorCfg.velocity_limit values (unitree_go2witharm_cfg.py) -- the real motors' rated speed, not an
+    arbitrary number -- so tripping this means the joint is moving faster than its own rated speed, not
+    just "fast for this gait." Any update under every joint's cap resets the count."""
+
+    def __init__(self, consecutive_steps: int, caps_by_type: dict[str, float], joint_names: list[str]):
+        self.consecutive_steps = consecutive_steps
+        self.caps_rad_s = [caps_by_type[name.split("_")[1]] for name in joint_names]
+        self.joint_names = joint_names
+        self._count = 0
+
+    def update(self, actual_vel_isaac_order: list[float]) -> None:
+        over = [
+            (name, v, cap)
+            for name, v, cap in zip(self.joint_names, actual_vel_isaac_order, self.caps_rad_s)
+            if abs(v) > cap
+        ]
+        if over:
+            self._count += 1
+            if self._count >= self.consecutive_steps:
+                worst_name, worst_v, worst_cap = max(over, key=lambda t: abs(t[1]) - t[2])
+                raise JointSpeedFault(
+                    f"Joint {worst_name} measured speed {worst_v:.1f} rad/s stayed above its "
+                    f"{worst_cap:.1f} rad/s cap for {self._count} consecutive steps."
+                )
+        else:
+            self._count = 0
+
+
 class SafetyMonitor:
     """Per-tick safety checks bundled for ramp_to_default_pose() and the main loop: controller e-stop,
     tracking telemetry (max position error / max |tau_est|), the torque-response watchdog, and optional
@@ -707,10 +742,11 @@ class SafetyMonitor:
 
     def __init__(self, state: "LatestRobotState", sdk_to_isaac: list[int], watchdog: TorqueResponseWatchdog,
                  joint_names: list[str], max_dev_rad: float, abort_err_rad: float, abort_steps: int,
-                 tau_abort_nm: float, writer=None):
+                 tau_abort_nm: float, speed_watchdog: "JointSpeedWatchdog | None" = None, writer=None):
         self.state = state
         self.sdk_to_isaac = sdk_to_isaac
         self.watchdog = watchdog
+        self.speed_watchdog = speed_watchdog
         self.joint_names = joint_names
         self.max_dev_rad = max_dev_rad
         self.abort_err_rad = abort_err_rad
@@ -723,6 +759,10 @@ class SafetyMonitor:
     def actual_isaac_order(self) -> list[float]:
         snap = self.state.snapshot()
         return [snap.joint_pos[sdk_i] for sdk_i in self.sdk_to_isaac]
+
+    def actual_vel_isaac_order(self) -> list[float]:
+        snap = self.state.snapshot()
+        return [snap.joint_vel[sdk_i] for sdk_i in self.sdk_to_isaac]
 
     def limit_target(self, target_isaac_order: list[float]) -> tuple[list[float], list[str]]:
         """Tether: see tether_limit. Applied to every target before it reaches the publish buffer."""
@@ -769,6 +809,8 @@ class SafetyMonitor:
         else:
             self._big_err_count = 0
         self.watchdog.update(kp_fraction, max_err, max_tau)
+        if self.speed_watchdog is not None:
+            self.speed_watchdog.update(self.actual_vel_isaac_order())
         return max_err, max_tau
 
 
@@ -897,7 +939,10 @@ def ramp_to_default_pose(
 
 
 def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, actual_ang_vel_z: float,
-                   actual_pitch: float, actual_lean: float, actual_height: float) -> None:
+                   actual_pitch: float, actual_lean: float) -> None:
+    """No height tags: real hardware has no height measurement to plot (see mdp/commands.py's module
+    docstring). sim2sim/sim2sim_mujoco.py, which CAN measure true height, logs its own cmd_height/
+    actual_height tags directly rather than through this function."""
     writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_x", cmd[0], step)
     writer.add_scalar("Metrics/base_velocity/actual_lin_vel_x", actual_lin_vel[0], step)
     writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_y", cmd[1], step)
@@ -908,17 +953,22 @@ def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, ac
     writer.add_scalar("Metrics/base_velocity/actual_pitch", actual_pitch, step)
     writer.add_scalar("Metrics/base_velocity/cmd_lean", cmd[4], step)
     writer.add_scalar("Metrics/base_velocity/actual_lean", actual_lean, step)
-    writer.add_scalar("Metrics/base_velocity/cmd_height", cmd[5], step)
-    writer.add_scalar("Metrics/base_velocity/actual_height", actual_height, step)
     writer.flush()
 
 
 # ---------------------------------------------------------------------------------------------------------
 # Observation assembly -- must exactly match ObservationsCfg.PolicyCfg's term order in
-# quadruped_go2_locomotion_env_cfg.py: base_lin_vel, base_ang_vel, projected_gravity, [base_height if
-# has_height_obs], velocity_commands, joint_pos (rel to default), joint_vel, last_action. No noise is added
-# (play mode already disables observation corruption -- QuadrupedLocomotionEnvCfg_PLAY sets
-# enable_corruption=False -- so hardware inference shouldn't add it either).
+# quadruped_go2_locomotion_env_cfg.py: base_lin_vel, base_ang_vel, projected_gravity, velocity_commands,
+# joint_pos (rel to default), joint_vel, last_action. No noise is added (play mode already disables
+# observation corruption -- QuadrupedLocomotionEnvCfg_PLAY sets enable_corruption=False -- so hardware
+# inference shouldn't add it either).
+#
+# `base_height` is NOT part of the current observation layout above (there is no reliable way to measure
+# base height on real hardware -- see mdp/commands.py's module docstring -- so newly trained policies never
+# have this term, and this function's own real-hardware call site never passes it). The parameter exists
+# only so sim2sim/sim2sim_mujoco.py can still run the OLDER committed policies (models/9_10_26_vanilla,
+# models/9_13_26_*), which DO have a base_height term between projected_gravity and velocity_commands --
+# sim2sim passes a real measured value for those; this is otherwise dead code on the real control loop.
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -929,8 +979,8 @@ def build_observation(
     default_joint_pos_isaac_order: list[float],
     manual_cmd: list[float],
     last_action: list[float],
+    base_height: float | None = None,
 ) -> torch.Tensor:
-    lean, pitch = quat_to_pitch_lean(state.quat_wxyz)
     gravity_b = quat_rotate_inverse_wxyz(state.quat_wxyz, (0.0, 0.0, -1.0))
 
     joint_pos_isaac = [state.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
@@ -941,9 +991,9 @@ def build_observation(
     parts += list(state.sportmode_velocity)  # base_lin_vel (body frame), 3
     parts += list(state.gyro)  # base_ang_vel (body frame), 3
     parts += list(gravity_b)  # projected_gravity, 3
-    if cfg.has_height_obs:
-        parts += [DEFAULT_HEIGHT_M]  # base_height, 1 -- fixed constant for now, see module docstring
-    parts += list(manual_cmd)  # velocity_commands, 6: [lin_x, lin_y, ang_z, pitch, lean, height]
+    if base_height is not None:
+        parts += [base_height]  # base_height, 1 -- only for older policies, see the note above
+    parts += list(manual_cmd)  # velocity_commands, 5: [lin_x, lin_y, ang_z, pitch, lean]
     parts += joint_pos_rel  # joint_pos, 12
     parts += joint_vel_isaac  # joint_vel, 12
     parts += list(last_action)  # actions (previous), 12
@@ -1024,15 +1074,31 @@ def parse_args():
         "caution, must be > 0 (some holding stiffness from the very first publish is still needed).",
     )
     parser.add_argument(
-        "--max_joint_step_deg", type=float, default=3.0,
-        help="Per-tick slew-rate limit: no joint's commanded target may move more than this many degrees "
-        "from whatever target_buf currently holds, in either direction, applied every control tick (not "
-        "just at startup). Added after a real-hardware incident where the ramp-to-default-pose handoff into "
-        "the policy loop sent an unsmoothed multi-degree jump in one tick (the ramp only smooths the "
-        "transition INTO default_joint_pos; the first policy action afterward, and any later anomalous "
-        "action, was previously written straight through with no limit). 3.0 is conservative for this "
-        "testing phase -- raise it once continuous full-speed gait is validated and this is confirmed to "
-        "bind during normal walking, not just anomalies.",
+        "--max_joint_speed_rad_s", type=float, default=2.618,
+        help="Per-tick slew-rate limit on the COMMANDED target, expressed as an equivalent joint speed "
+        "(rad/s), same units as Isaac/sim2sim's velocity_limit/--joint_speed_cap for this robot: no "
+        "joint's commanded target may change faster than this, applied every control tick (not just at "
+        "startup; max_delta_rad = this * control_dt). Added after a real-hardware incident where the "
+        "ramp-to-default-pose handoff into the policy loop sent an unsmoothed multi-degree jump in one "
+        "tick (the ramp only smooths the transition INTO default_joint_pos; the first policy action "
+        "afterward, and any later anomalous action, was previously written straight through with no "
+        "limit). Default 2.618 rad/s (= 3 deg/tick at 50 Hz) is conservative for this testing phase -- "
+        "raise it once continuous full-speed gait is validated and this is confirmed to bind during "
+        "normal walking, not just anomalies. This limits the TARGET's rate of change, not the robot's "
+        "actual physical speed -- see --speed_fault_cap_rad_s for a check on the latter.",
+    )
+    parser.add_argument(
+        "--speed_fault_cap_rad_s", type=float, nargs=3, default=[30.1, 30.1, 15.7], metavar=("HIP", "THIGH", "CALF"),
+        help="Abort if the robot's ACTUAL measured joint velocity (LowState's dq, not the commanded "
+        "target) stays above these per-joint-type caps for --speed_fault_steps consecutive ticks -- the "
+        "real-hardware analog of Isaac/PhysX's hard velocity_limit_sim clamp, which overwrites simulated "
+        "joint velocity directly (a lever real hardware doesn't have). Defaults are this robot's own "
+        "DCMotorCfg.velocity_limit values (unitree_go2witharm_cfg.py) -- its rated speed, not an "
+        "arbitrary number.",
+    )
+    parser.add_argument(
+        "--speed_fault_steps", type=int, default=5,
+        help="Consecutive over-cap ticks (see --speed_fault_cap_rad_s) before aborting.",
     )
     parser.add_argument(
         "--steps_per_confirm", type=int, nargs="?", const=1, default=None,
@@ -1197,14 +1263,20 @@ def main():
         print(f"[INFO] Manual step-confirm mode: every target printed in degrees, {gate.steps_per_confirm} "
               f"command(s) sent per SPACE press. Not real-time while this is on.")
 
-    max_joint_step_rad = math.radians(args.max_joint_step_deg)
-    print(f"[INFO] Per-tick slew-rate limit: max {args.max_joint_step_deg:.1f} deg/joint/tick.")
+    max_joint_step_rad = args.max_joint_speed_rad_s * control_dt
+    print(f"[INFO] Per-tick slew-rate limit: max {args.max_joint_speed_rad_s:.3f} rad/s "
+          f"({math.degrees(max_joint_step_rad):.1f} deg/joint/tick).")
 
     # Gated runs count steps per keypress (each one a deliberate human action), free-running ones count
     # control ticks, so the same "no torque response" evidence needs far fewer gated steps (5) than ticks (25
     # = 0.5 s at 50 Hz).
     monitor = None
     if target_buf is not None:
+        speed_watchdog = JointSpeedWatchdog(
+            consecutive_steps=args.speed_fault_steps,
+            caps_by_type=dict(zip(("hip", "thigh", "calf"), args.speed_fault_cap_rad_s)),
+            joint_names=cfg.isaac_joint_order,
+        )
         monitor = SafetyMonitor(
             state, sdk_to_isaac, TorqueResponseWatchdog(consecutive_steps=5 if gate is not None else 25),
             joint_names=cfg.isaac_joint_order,
@@ -1212,11 +1284,15 @@ def main():
             abort_err_rad=math.radians(args.abort_err_deg),
             abort_steps=3,
             tau_abort_nm=0.9 * cfg.effort_limit,
+            speed_watchdog=speed_watchdog,
             writer=live_plot_writer,
         )
         print(f"[INFO] Tether: targets limited to {args.max_target_dev_deg:.0f} deg of actual "
               f"(max PD torque ~ kp*dev = {cfg.kp * math.radians(args.max_target_dev_deg):.1f} Nm); abort if error "
               f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm.")
+        print(f"[INFO] Joint-speed fault: abort if actual |velocity| exceeds "
+              f"{args.speed_fault_cap_rad_s[0]:.1f}/{args.speed_fault_cap_rad_s[1]:.1f}/{args.speed_fault_cap_rad_s[2]:.1f} "
+              f"rad/s (hip/thigh/calf) for {args.speed_fault_steps} consecutive steps.")
 
     print(f"[INFO] Entering control loop at {1.0 / control_dt:.0f} Hz (dry_run={args.dry_run}). Ctrl+C to stop.")
     with cbreak_terminal() if gate is not None else contextlib.nullcontext():
@@ -1291,7 +1367,7 @@ def main():
                     )
                     if clipped_names:
                         print(f"[WARN] step {step}: slew-rate limit clipped {len(clipped_names)} joint(s) "
-                              f"to {args.max_joint_step_deg:.1f} deg/tick: {', '.join(clipped_names)}")
+                              f"to {args.max_joint_speed_rad_s:.3f} rad/s: {', '.join(clipped_names)}")
                     max_err, max_tau = monitor.check(target_buf.get(), kp_fraction=1.0)
                     clamped_target, tethered = monitor.limit_target(clamped_target)
                     if tethered:
@@ -1328,7 +1404,6 @@ def main():
                         snap.gyro[2],
                         pitch,
                         lean,
-                        DEFAULT_HEIGHT_M,
                     )
 
                 step += 1

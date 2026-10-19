@@ -3,13 +3,32 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# One-off script: composes the standard Unitree Go2 USD (fetched from Nucleus)
-# with the bundled OpenManipulator-X static asset, mounted on top of the Go2's
-# main body ("base"), and saves the result to
-# resources/go2withArm/go2withOpenXStatic.usda.
+# Reference/regeneration script: composes the standard Unitree Go2 USD (fetched
+# from Nucleus) with the bundled OpenManipulator-X static asset, mounting the arm
+# on the Go2's head.
 #
-# Run once via: isaaclab -p scripts/compose_go2_with_arm.py
-"""Compose the Go2 + OpenManipulator-X USD asset."""
+# ---------------------------------------------------------------------------
+# THIS SCRIPT DOES NOT PRODUCE THE ASSET THE PROJECT USES.
+#
+# The authoritative asset is the committed
+#   resources/go2withArm/go2withOpenXstatic.usd      (note: lowercase "s", .usd)
+# which is what unitree_go2witharm_cfg.py loads and what every committed policy
+# in models/ was trained on. Do not point the config at this script's output and
+# do not delete the committed asset; it has no other distribution mechanism.
+#
+# An earlier version of this script mounted the arm at (0, 0, 0.109) -- flat on
+# top of the torso -- which is NOT where the committed asset puts it, and policies
+# trained against that mounting were discarded. ARM_MOUNT_POS below is now read
+# off the committed asset so a regenerated stage has the same arm geometry, but
+# the two stages still differ in structure (payload vs reference, prim and joint
+# names), so they are not interchangeable.
+#
+# Kept only so the composition steps and the PhysX constraints they work around
+# stay documented and reproducible.
+# ---------------------------------------------------------------------------
+#
+# Run via: isaaclab -p scripts/compose_go2_with_arm.py
+"""Compose a Go2 + OpenManipulator-X USD asset (reference only, see the note above)."""
 
 import argparse
 
@@ -32,21 +51,27 @@ _RESOURCES_DIR = (
     f"{os.path.dirname(os.path.abspath(__file__))}/../source/quadruped_go2_locomotion/"
     "quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources"
 )
-OUTPUT_PATH = f"{_RESOURCES_DIR}/go2withArm/go2withOpenXStatic.usda"
+# Deliberately NOT "go2withOpenXstatic.usd(a)": that name differs from the committed asset's only by one
+# letter's case, and a stale file with that near-identical name sat next to the real one and caused confusion.
+# This output name is unmistakable and nothing in the project loads it.
+OUTPUT_PATH = f"{_RESOURCES_DIR}/go2withArm/go2_with_arm_regenerated.usda"
 # Reference the manipulator asset relative to the output file's own directory
 # (both live under resources/), not by its absolute container mount path, so
 # the composed asset stays valid if the repo is mounted somewhere else.
 MANIPULATOR_USDA_RELATIVE = "../openManipulator/open_manipulator_x_static.usda"
 
-# Go2's main body ("base") sits at identity relative to go2_description
-# (queried directly from go2.usd: xformOp:translate on /go2_description/base
-# is (0, 0, 0)), and its bounding box top surface is at roughly z=0.089
-# (also queried directly: ComputeWorldBound on /go2_description/base). The
-# arm is placed as a sibling of base (see the placement note below for why),
-# so its own translate is given in that same go2_description-local frame:
-# centered over the body, just above that top surface.
-BASE_TRANSLATE = Gf.Vec3d(0.0, 0.0, 0.089)
-MOUNT_TRANSLATE = BASE_TRANSLATE + Gf.Vec3d(0.0, 0.0, 0.02)
+# Arm mount, in the go2_description-local frame. Go2's main body ("base") sits at identity in that frame
+# (xformOp:translate on /go2_description/base is (0, 0, 0), queried directly), so this is also the offset
+# from base.
+#
+# These numbers are READ OFF THE COMMITTED ASSET, not derived: they are the xformOp:translate on
+# /go2_description/open_manipulator_x_static in resources/go2withArm/go2withOpenXstatic.usd (and its mount
+# joint's localPos0 is exactly the negation). The arm sits on the HEAD, forward of and above the base origin.
+#
+# The previous value here was (0, 0, 0.089 + 0.02) = flat on top of the torso, derived from the base's
+# bounding-box top surface. That is 21.9 cm behind the real mounting point, which changes the robot's centre
+# of mass, so it is wrong -- do not "simplify" back to a bounding-box calculation.
+ARM_MOUNT_POS = Gf.Vec3d(0.2191266564592013, 0.0, 0.10596202282924586)
 MOUNT_ORIENT = Gf.Quatd(1.0, Gf.Vec3d(0.0, 0.0, 0.0))  # identity
 
 
@@ -79,7 +104,7 @@ def main():
     #      would still find zero bodies.
     # go2_description itself (unlike base) carries no RigidBodyAPI, so a
     # sibling placement avoids both problems at once, and needs no xform
-    # stack reset: MOUNT_TRANSLATE above is just this asset's ordinary local
+    # stack reset: ARM_MOUNT_POS above is just this asset's ordinary local
     # transform under go2_description, same as base's own.
     arm_path = "/go2_description/OpenManipulatorX"
     arm_prim = stage.DefinePrim(arm_path, "Xform")
@@ -87,7 +112,7 @@ def main():
 
     xformable = UsdGeom.Xformable(arm_prim)
     xformable.ClearXformOpOrder()
-    xformable.AddTranslateOp().Set(MOUNT_TRANSLATE)
+    xformable.AddTranslateOp().Set(ARM_MOUNT_POS)
     # The manipulator asset's own composed xform ops already declare
     # xformOp:orient as quatd (double precision); AddOrientOp()'s default
     # (float) collides with that existing typeName, so match it explicitly.
@@ -106,7 +131,11 @@ def main():
     mount_joint = UsdPhysics.FixedJoint.Define(stage, "/go2_description/ArmMountJoint")
     mount_joint.CreateBody0Rel().SetTargets([Sdf.Path("/go2_description/base")])
     mount_joint.CreateBody1Rel().SetTargets([Sdf.Path(f"{arm_path}/world")])
-    mount_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.02))
+    # localPos0 is on base (body0) and MUST equal the arm's xform translate above, because base sits at
+    # identity in this frame -- otherwise the Xform places the arm in one spot and the joint constrains it to
+    # another, and the joint wins at simulation time. The old code set the xform to z=0.109 but the joint to
+    # z=0.02, so the arm silently snapped 8.9 cm down on the first physics step.
+    mount_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(ARM_MOUNT_POS))
     mount_joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
 
     # Exclude collision between the arm and base. A FixedJoint (unlike an

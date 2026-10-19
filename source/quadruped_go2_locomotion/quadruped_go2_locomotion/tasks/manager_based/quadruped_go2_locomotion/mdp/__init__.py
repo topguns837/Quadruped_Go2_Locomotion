@@ -9,13 +9,15 @@ from isaaclab.envs.mdp import *  # noqa: F401, F403
 
 from .curriculums import *  # noqa: F401, F403
 
+# Joint position action with random control latency (see mdp/actions.py)
+from .actions import DelayedJointPositionActionCfg  # noqa: F401
+
 # Extended command terms with pitch (lean) support
 from .commands import (
     UniformVelocityCommandCfgWithPitch,
     UniformVelocityCommandWithPitch,
     get_pitch_command,
     get_lean_command,
-    get_lin_pos_z_command,
 )
 
 # Pitch tracking reward
@@ -25,11 +27,16 @@ from .rewards import (
     base_height_l2_pitch,
     hip_crossing_l2,
     foot_sliding_exp,
-    foot_lift_exp,  # noqa: F401
+    foot_lift_exp,
+    GaitDiagonalCoordination,
+    stand_still_default_pose,  # noqa: F401
 )
 
 # Safety-net termination for non-finite (NaN/Inf) simulation state
 from .terminations import invalid_state  # noqa: F401
+
+# Stock Isaac Lab locomotion termination: ends (as a truncation) an env whose robot nears the terrain edge
+from isaaclab_tasks.manager_based.locomotion.velocity.mdp import terrain_out_of_bounds  # noqa: F401
 
 # Per-step diagnostic file logging (see mdp/diagnostics.py)
 from .diagnostics import (

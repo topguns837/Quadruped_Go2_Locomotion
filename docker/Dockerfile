@@ -306,6 +306,12 @@ RUN git clone --depth 1 https://github.com/unitreerobotics/unitree_sdk2_python.g
 # ---------------------------------------------------------------------------
 FROM base AS app
 
+# MuJoCo for sim2sim (sim2sim/sim2sim_mujoco.py, see sim2sim/README.md). Kept in this cheap stage so adding it
+# doesn't rebuild base. numpy<2 is named in the same install so pip can't upgrade numpy past what
+# isaaclab/isaaclab-rl/isaaclab-tasks pin (same failure mode as the unitree_sdk2py install above).
+# mujoco 3.15.0 is the version sim2sim was verified with (against numpy 1.26).
+RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install "mujoco==3.15.0" "numpy<2"
+
 RUN echo "export ISAACLAB_PATH=${ISAACLAB_PATH}" >> /root/.bashrc && \
     echo "alias isaaclab=${ISAACLAB_PATH}/isaaclab.sh" >> /root/.bashrc && \
     echo "alias python=${ISAACLAB_PATH}/_isaac_sim/python.sh" >> /root/.bashrc && \
