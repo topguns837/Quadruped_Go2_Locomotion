@@ -90,11 +90,9 @@ METRIC_NAMES = ["lin_x", "lin_y", "ang_z", "pitch", "lean", "height"]
 # Sim2sim's own canonical command is always 5-wide (see Segment/load_scenario/--manual_commands below); for
 # a 51/52-dim policy the extra 6th ("height") slot is appended here from NOMINAL_HEIGHT_M["legacy"], never
 # asked of the user/scenario -- there is no height command any more, see the module docstring.
-OBS_LAYOUT = {
-    50: {"cmd_width": 5, "has_height_obs": False},
-    51: {"cmd_width": 6, "has_height_obs": False},
-    52: {"cmd_width": 6, "has_height_obs": True},
-}
+# Single source of truth lives in deploy_real.py (deploy and sim2sim must agree); includes the current 47-dim
+# layout (no base_lin_vel) plus the older 50/51/52 ones. See deploy_real.OBS_LAYOUT / policy_obs_layout.
+OBS_LAYOUT = deploy_real.OBS_LAYOUT
 
 # Fixed height target used only for the summary table's "height" error column and (for has_height_obs
 # policies) the base_height observation itself -- NOT a command, see OBS_LAYOUT above.
@@ -464,7 +462,9 @@ def main():
         policy_path = os.path.join(_REPO_ROOT, policy_path)
     policy, obs_dim = load_policy(policy_path)
     layout = OBS_LAYOUT[obs_dim]
-    is_legacy = obs_dim != 50
+    # "legacy" = the old 6-wide-command policies (51/52); the current 5-wide ones (47 without base_lin_vel,
+    # 50 with it) use the new nominal height. Keyed on cmd_width, not obs_dim, so 47 is not misclassified.
+    is_legacy = layout["cmd_width"] == 6
     nominal_height = NOMINAL_HEIGHT_M["legacy" if is_legacy else "new"]
     cfg = load_sim_config(args.config, policy_path)
     sdk_to_isaac, _ = deploy_real.build_joint_index_maps(cfg)
@@ -547,7 +547,7 @@ def main():
                     base_height_obs = robot.base_height if args.height_source == "true" else nominal_height
                 obs = deploy_real.build_observation(
                     cfg, robot.to_robot_state(), sdk_to_isaac, default_isaac, manual_cmd, last_action,
-                    base_height=base_height_obs,
+                    base_height=base_height_obs, include_base_lin_vel=layout["has_lin_vel"],
                 )
                 with torch.inference_mode():
                     action = policy(obs)[0].numpy()

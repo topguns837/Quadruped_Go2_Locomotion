@@ -179,7 +179,11 @@ class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfgWithPitch(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.12,
+        rel_standing_envs=0.2,  # was 0.12; more pure-standing practice (robot fell at/near zero command)
+        # Oversample the low-speed regime: ~35% of the non-standing envs get |lin_vel| <= 0.3 m/s so slow
+        # walking is dense, not the sparse tail of the uniform (-1,1) range. See mdp/commands.py.
+        rel_low_speed_envs=0.35,
+        low_speed_max=0.3,
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
@@ -220,11 +224,12 @@ class ObservationsCfg:
         # mdp/diagnostics.py), without changing the term's value. clip on the velocity terms bounds a
         # runaway inf/huge-finite physics-solver spike (doesn't catch true NaN, see diagnostics.py's
         # finite-check for that).
-        base_lin_vel = ObsTerm(
-            func=mdp.logged_base_lin_vel,
-            noise=Unoise(n_min=-0.1, n_max=0.1),
-            clip=(-50.0, 50.0),
-        )
+        # base_lin_vel is deliberately NOT an actor observation: on real hardware it is only available from
+        # SportModeState, which STOPS publishing once release_motion_control() runs (required to send LowCmd),
+        # so it was dead-zero on every deploy tick -- a heavily-weighted input the policy could never see,
+        # which is why the robot drifted and tipped. Training the actor without it makes the sim and hardware
+        # observations identical. The critic keeps it as a privileged input (CriticCfg below); the critic is
+        # discarded at deploy, so this is free. Actor obs: 50 -> 47 dims.
         base_ang_vel = ObsTerm(
             func=mdp.logged_base_ang_vel,
             noise=Unoise(n_min=-0.2, n_max=0.2),
@@ -250,8 +255,28 @@ class ObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Privileged critic observations (never deployed): clean proprio (no sensor noise) in the SAME order
+        as the policy group, PLUS base_lin_vel which the actor cannot observe on hardware. Asymmetric
+        actor-critic -- the value function learns with the true body velocity while the actor stays
+        hardware-realistic. Mirrors the stairs env's CriticCfg."""
+
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, clip=(-50.0, 50.0))
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, clip=(-50.0, 50.0))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, clip=(-50.0, 50.0))
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.concatenate_terms = True
+            self.enable_corruption = False
+
     # observation groups
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 @configclass
@@ -274,16 +299,35 @@ class EventCfg:
         },
     )
 
-    # Sim-to-real domain randomisation (startup = drawn once per environment). Ranges are assumptions to be revisited
-    # against measurements from the robot.
+    # Curriculum-scaled randomisation of the trunk mass, its centre of mass and the push forces (robot_mass, robot_com,
+    # push_robot_force below). Each range is multiplied by env.difficulty_scale (0 -> 1, see CurriculumCfg.difficulty
+    # and mdp/curriculums.py:difficulty_scale), so training starts with none of it and gets harder only as the policy
+    # keeps the robot up. The ranges here are the FULL strength, reached at difficulty 1. Full strength applied from
+    # iteration 0 stalled the previous run (52% falls vs 4% without it). They are reset events (redrawn each episode)
+    # because a startup event is drawn once and cannot follow a curriculum.
+    #
+    # Everything else in this class (friction, PD gains, armature, joint friction, the velocity push) stays on at
+    # full strength from the start: they are the hardware-parity randomisations the previous good policy trained with.
     robot_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="startup",
+        func=mdp.randomize_base_mass_curriculum,
+        mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "mass_distribution_params": (-1.0, 2.0),  # kg added to the base (battery, payload, arm differences)
-            "operation": "add",
-            "recompute_inertia": True,
+            # kg added to the base (battery, payload, arm differences) at full difficulty. +-5 kg is ~+-32% of the
+            # ~15.6 kg robot. The base body is ~6.9 kg, so -5 kg lands ~1.9 kg. The inertia is scaled with the mass.
+            "max_abs_kg": 5.0,
+        },
+    )
+    # Centre-of-mass offset on the base at full difficulty: a payload/battery is rarely bolted exactly at the
+    # geometric centre. It moves the balance point (fore/aft shift fights the pitch command, lateral shift fights
+    # lean/roll). Kept inside the support polygon so every draw stays balanceable: the Go2 foot stance spans
+    # ~+-0.19 m fore/aft and ~+-0.12 m lateral, x/y are held to ~55% and ~65% of that. z is vertical, so it can be wider.
+    robot_com = EventTerm(
+        func=mdp.randomize_base_com_curriculum,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "max_xyz": (0.10, 0.08, 0.15),  # meters
         },
     )
     actuator_gains = EventTerm(
@@ -319,6 +363,21 @@ class EventCfg:
         mode="interval",
         interval_range_s=(8.0, 15.0),
         params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+    )
+    # External force/torque shoves on the trunk, in ADDITION to the velocity kick above: a real push is a
+    # force the policy must actively resist, not an instantaneous velocity reset. Applied to the base body and
+    # re-sampled every interval (persisting between), so it is a shifting disturbance field. Curriculum-scaled: at full
+    # difficulty +-40 N on each axis (robot ~15.6 kg, weight ~153 N) and +-5 Nm torque.
+    # Disabled in the PLAY cfg (nominal physics for sim2sim parity), like push_robot.
+    push_robot_force = EventTerm(
+        func=mdp.push_force_curriculum,
+        mode="interval",
+        interval_range_s=(5.0, 12.0),
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "max_force": 40.0,
+            "max_torque": 5.0,
+        },
     )
 
     # Corrects 2.0 kg of phantom mass, 13% of the robot. `imu` and `radar` are massless sensor frames in
@@ -416,9 +475,13 @@ class RewardsCfg:
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    # Smoothness / effort penalties, strengthened 2026-10-30 so a smooth, low-torque gait is LEARNED rather
+    # than only clipped at deploy (the real robot showed high torque and jerky corrections). These trade off
+    # against command tracking -- retune if tracking suffers; watch peak_tau in the sim2sim summary.
+    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-3.0e-5)  # was -1.0e-5
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-5.0e-7)  # was -2.5e-7
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.03)  # was -0.01 (jerk between policy outputs)
+    dof_vel_l2 = RewTerm(func=mdp.joint_vel_l2, weight=-1.0e-4)  # new: penalize fast joint motion directly
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -555,6 +618,19 @@ class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    # Strength of the mass / centre-of-mass / push-force randomisation in EventCfg, 0 -> 1. Rises while the policy
+    # survives (>= 80% of ended episodes are time-outs, not falls), falls back if it does not (<= 40%).
+    difficulty = CurrTerm(
+        func=mdp.difficulty_scale,
+        params={
+            "up_thresh": 0.8,
+            "down_thresh": 0.4,
+            "step": 0.05,
+            "dwell_steps": 6000,  # env steps per window, 24 per PPO iteration -> 250 iterations
+            "settle_steps": 2000,  # one full episode: don't count episodes that began at the old difficulty
+            "min_episodes": 500,
+        },
+    )
 
 
 ##
@@ -621,14 +697,18 @@ class QuadrupedLocomotionEnvCfg_PLAY(QuadrupedLocomotionEnvCfg):
         self.events.physics_material.params["static_friction_range"] = (0.8, 0.8)
         self.events.physics_material.params["dynamic_friction_range"] = (0.6, 0.6)
         self.events.robot_mass = None
+        self.events.robot_com = None
         self.events.actuator_gains = None
         self.events.joint_armature = None
         self.events.joint_friction = None
         self.events.push_robot = None
+        self.events.push_robot_force = None
         self.actions.joint_pos.max_delay_steps = 0
         
         # terrain curriculum
         self.curriculum.terrain_levels = None
+        # no difficulty scale in play: the mass / COM / push events are disabled above, so there is nothing to ramp
+        self.curriculum.difficulty = None
 
         # NOTE: origin_type="asset_root" subscribes to a per-frame render
         # callback that continuously re-reads the robot's live pose

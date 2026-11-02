@@ -30,7 +30,7 @@ if is_weak_gpu; then
     TRAIN_ARGS="--num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True"
     PLAY_ARGS="--num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True env.viewer.origin_type=env"
 else
-    TRAIN_ARGS="--num_envs 2048 --max_iterations 10000"
+    TRAIN_ARGS="--num_envs 2048 --max_iterations 18000 --headless"
     PLAY_ARGS=""
 fi
 
@@ -42,7 +42,7 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # saves a PNG instead of opening a window, and feh --reload displays that PNG, auto-refreshing on the
 # same interval. --logdir points at the experiment root, not one specific run, so it always picks up
 # whichever run is most recently modified.
-DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_with_pitch_lean_and_height_control_ppo --output /tmp/dashboard.png"
+DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_kp40_curriculum_ppo --output /tmp/dashboard.png"
 VIEW_CMD="feh --scale-down --reload 0.5 /tmp/dashboard.png"
 
 # Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate

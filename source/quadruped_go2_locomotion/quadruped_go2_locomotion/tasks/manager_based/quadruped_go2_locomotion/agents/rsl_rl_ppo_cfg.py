@@ -13,8 +13,15 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 10000
     save_interval = 100
-    experiment_name = "go2_with_pitch_lean_and_height_control_ppo"
+    # New experiment dir: this policy drops base_lin_vel from the actor (47-dim), trains at kp 40 and ramps the mass /
+    # COM / push randomisation with a curriculum (CurriculumCfg.difficulty), so it is not resume-compatible with the
+    # old 50-dim / kp-25 checkpoints or with go2_kp40_no_lin_vel_ppo (full randomisation from iteration 0).
+    experiment_name = "go2_kp40_curriculum_ppo"
     empirical_normalization = True
+    # Asymmetric actor-critic: the actor sees only the hardware-available `policy` group (no base_lin_vel);
+    # the critic sees the privileged `critic` group (includes base_lin_vel). The critic is discarded at
+    # deploy. See ObservationsCfg.PolicyCfg / CriticCfg in quadruped_go2_locomotion_env_cfg.py.
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         noise_std_type="log",

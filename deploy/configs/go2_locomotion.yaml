@@ -18,17 +18,39 @@ policy_path: models/10_14_26_real_hardware_parity_tested/exported/policy.pt  # J
   # real-vs-simulated standing-pose gap on a few joints). Update this once a better checkpoint replaces it.
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
-network_interface: null  # REQUIRED before first run -- e.g. "enp3s0" (host NIC cabled to the robot). See
-                          # deploy.md Stage 0 ("ifconfig" after connecting). Left null so a real run refuses
-                          # to start unset (fails loud, not with a silent wrong-interface bind).
+network_interface: null  # REQUIRED before first run -- the HOST NIC on the robot's 192.168.123.0/24 network.
+                          # Wired: the cabled NIC, e.g. "enp3s0" (deploy.md Stage 0). Wireless: the desktop
+                          # WiFi interface, e.g. "wlan0"/"wlxXXXX", once it has associated with the robot's
+                          # bridged AP and taken a static 192.168.123.x address (deploy.md Stage 0b;
+                          # deploy/wireless/). The container is network_mode: host, so use the HOST interface
+                          # name. Left null so a real run refuses to start unset (fails loud, not with a
+                          # silent wrong-interface bind).
+
+link_lost_after: 0.5  # Seconds of LowState silence before the run stops as link-lost (and damps, never
+                      # resumes). 0.5 s suits the wired link's ~500 Hz stream; for a jittery WiFi link, check
+                      # the end-of-run "[LINK] LowState gaps" summary (max/p95) and raise cautiously if real
+                      # gaps approach it. Overridable per-run with --link_lost_after.
 
 # --- action scale/offset (from ActionsCfg: mdp.JointPositionActionCfg(scale=0.25, use_default_offset=True)) ---
 action_scale: 0.25
 
 # --- per-joint PD gains (from UNITREE_GO2WITHARM_CFG's DCMotorCfg groups) ---
 # kp/kd really are identical across all 12 joints in sim, so there's no per-joint variation to carry over.
-kp: 25.0
-kd: 0.5
+kp: 40.0  # MUST equal the training actuator stiffness (unitree_go2witharm_cfg.py DCMotorCfg.stiffness). Raised
+          # 25 -> 40 (2026-10-30): kp=25 could not hold the stance on hardware (legs sagged at handover). The
+          # policy's action->torque mapping is learned at this gain, so deploy and training must match.
+kd: 0.8   # = training damping (unitree_go2witharm_cfg.py DCMotorCfg.damping), raised 0.5 -> 0.8 with kp.
+
+# hold_kp -- stiffness used ONLY for the startup ramp that raises the robot to the default stance, BEFORE the
+# policy loop takes over. The policy loop itself always runs at `kp` above (its trained gain). kp=25 is the
+# training gain and is held in the loop by the policy actively commanding an offset every tick -- it is NOT
+# stiff enough to passively raise/hold the robot's full weight on the ground during the cold start, so the
+# legs sag (rear knees first) and the ramp never reaches the stance. A stiffer hold_kp lets the robot actually
+# stand up to default; deploy_real.py then drops kp to `kp` in the same tick the first policy action is applied,
+# so the policy's active hold takes over before the robot can sag. Set to kp to restore the old behaviour.
+hold_kp: 40.0  # = kp now that the policy trains at kp 40 (holds the stance without a stiffer hold). The ramp
+               # still ramps kp 0 -> hold_kp gently; with hold_kp == kp the handover kp-fade is effectively a
+               # no-op. Raise above kp only if a retrained policy still sags during the startup lift.
 
 # effort_limit is NOT a copy of the sim actuator limit any more, and must not be "corrected" to match it.
 # UNITREE_GO2WITHARM_CFG now uses the real per-joint values (hip/thigh 23.7 Nm, calf 45.43 Nm -- the calf has a

@@ -102,3 +102,6 @@ tests/
 
 # sim2sim: Menagerie Go2 model, fetched by sim2sim/fetch_go2_model.sh
 sim2sim/mujoco/menagerie/
+
+# Wireless relay shared secret (never commit)
+deploy/relay.key

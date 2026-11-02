@@ -114,6 +114,71 @@ Unitree's documented default subnet for a direct wired connection). Found via `/
 real by Stage 1's first `preflight_check.py` run below actually receiving data on it. If you reconnect on a
 different port later, re-check with the same method rather than assuming `enp2s0` still applies.
 
+### Stage 0b — Wireless: run the policy on the desktop, relay actions through the Jetson — optional
+The Ethernet cable stays the default and the only link for `deploy_real.py`. For an untethered run use the
+sibling script **`deploy/deploy_real_wireless.py`**: the policy, observation building, slew limit, tether, ramp and
+watchdogs are `deploy_real.py`'s own code (imported, unchanged), but robot I/O goes through a small **relay on the
+Jetson** (`deploy/relay_jetson.py`). The Jetson is on the robot's `192.168.123.0/24` network through its
+untouched `eth0` and speaks DDS to the robot; it speaks authenticated UDP/TCP to the desktop over the lab WiFi.
+
+Why a relay and not WiFi DDS: DDS needs same-subnet multicast and the robot's `123.x` network is wired-only, and
+`unitree_sdk2py` hard-codes its CycloneDDS config (`CYCLONEDDS_URI` is ignored), so a desktop on WiFi cannot join.
+The retired alternative (a hostapd access point bridged onto `eth0` on the Jetson) is documented in
+`deploy/wireless/README.md`; it must not be used -- it rewires `eth0` and the USB WiFi dongle wedged the Jetson.
+
+**Safety lives on the robot side.** The Jetson owns the 500 Hz `LowCmd` heartbeat and damps (kp=0, kd=3), then goes
+quiet, on its own if: no valid command arrives for `--silence_damp_s` (default 150 ms), the control connection drops,
+the robot's `LowState` stops, the desktop asks, or an authenticated command is invalid (kp/kd out of range, NaN).
+Every target is limited to `--max_target_dev_deg` (default 30) of the actual joint angle whatever arrives.
+Damping is latched for the session: there is no resume. Every packet is signed (shared key, per-session id) and the
+control connection does a mutual challenge-response, so nothing else on the lab network can command the robot or
+feed the desktop fake state.
+
+**Known limitation:** state reaches the policy delayed by the WiFi latency. Training included 0-2 steps of ACTION
+delay but not stale OBSERVATIONS. The exit summary prints the command->state round trip and the state-gap
+percentiles; judge the link from those (and the hoisted checklist) before any ground run.
+
+One-time setup on the Jetson (private venv, nothing global; do NOT source the ROS setup in that shell):
+`python3 -m venv ~/relay_env`, build `cyclonedds==0.10.2` against `~/cyclonedds_ws/install/cyclonedds`, install the
+pinned `unitree_sdk2py` commit from `docker/Dockerfile` (plus its `utils/lib/*.so` copy step). Copy `deploy/` to
+the Jetson. Create the key once: `python deploy/relay_jetson.py --init_key ~/.go2_relay_key`, then copy that same
+file to the desktop as `deploy/relay.key` (git-ignored, mode 600).
+
+Test ladder (stop at the first failure; real motors only at the last rung):
+1. **Loopback, no robot or WiFi:** `bash deploy/tests/run_t2_loopback.sh` inside the project container
+   (`docker run --rm --network none ...`, see the script header). Covers the happy path, a frozen sender, a killed
+   client, a dead robot stream, the controller e-stop, a wrong key, forged packets and an invalid command.
+2. **Jetson sees the robot's DDS (read-only):** `python deploy/lowstate_probe.py --network_interface eth0` on the
+   Jetson; expect ~500 Hz and plausible joint values.
+3. **WiFi soak:** `deploy/wireless/link_check.sh <desktop lab NIC> 600 <jetson lab IP>` plus a 100 Hz relay run (next rung);
+   loss must be 0% with no multi-second silences.
+4. **Over real WiFi, no robot:** on the Jetson run `fake_robot.py` and `relay_jetson.py` **both on `--network_interface
+   lo`** (loopback DDS, never touching `eth0` or the robot), and on the desktop `deploy_real_wireless.py --relay_host
+   <jetson> --skip_release`. Watch the round-trip and gap summary.
+5. **Real robot, hoisted, `deploy/Checklist.md`:** first stop the ROS node that can send sport commands
+   (`go2_highroscontrol`, a plain `kill`; a reboot restores it), then run the relay on `eth0` and the desktop script
+   without `--skip_release`. The cable stays plugged in as the emergency path.
+
+#### Instrumented 15-minute WiFi soak (fake robot, loopback on the Jetson, no motor can move)
+
+Measures the real WiFi link with every packet logged, while the app injects loss, delay, reordering and stalls on a
+schedule (`deploy/impair.py`, refused unless the relay is on `lo`). Three terminals:
+
+```bash
+# Jetson (re-copy deploy/ first so both machines run identical files; meta.json records the SHA-256s)
+bash ~/deploy/tests/run_soak_jetson.sh <RUN>          # prints READY
+# Desktop host (independent ICMP log of the real link)
+mkdir -p logs/relay_runs/<RUN> && ping -D -i 0.2 -w 930 -I enp1s0f0 192.168.152.215 > logs/relay_runs/<RUN>/icmp_ping.log
+# Desktop container
+bash deploy/tests/run_soak_desktop.sh <RUN>
+# After both finish
+scp -r unitree@192.168.152.215:relay_logs/<RUN> logs/relay_runs/<RUN>/jetson
+python deploy/tools/analyze_soak.py logs/relay_runs/<RUN>      # report.md, report.json, plots/
+```
+
+`deploy/tests/run_soak_local.sh <RUN> 0.1` runs the same stack on one machine's loopback in about 95 s, to check the
+tooling. Pass rules are at the top of `deploy/tools/analyze_soak.py`.
+
 ### Stage 1 — `deploy/` directory — **done, and now checked against the real SDK, not just documentation**
 - `deploy/configs/go2_locomotion.yaml` — joint order/index mapping (both `isaac_joint_order` and
   `sdk_joint_order`, remapped via `build_joint_index_maps`), PD gains (`kp=25.0`, `kd=0.5`, copied from

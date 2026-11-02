@@ -89,8 +89,20 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         return self.vel_command_b
 
     def _resample_command(self, env_ids):
-        # Sample base velocities via parent
+        # Sample base velocities via parent (this also re-rolls is_standing_env and zeroes standing envs)
         super()._resample_command(env_ids)
+        # Low-speed oversampling: resample a random fraction of the NON-standing envs' lin_vel_x/y into a
+        # small band so the near-zero regime is dense, not the sparse tail of the uniform range. Standing
+        # envs are left at the zero the parent set.
+        rel_low = getattr(self.cfg, "rel_low_speed_envs", 0.0)
+        if rel_low > 0.0:
+            band = getattr(self.cfg, "low_speed_max", 0.3)
+            non_standing = env_ids[~self.is_standing_env[env_ids]]
+            if len(non_standing) > 0:
+                low_ids = non_standing[torch.rand(len(non_standing), device=self.device) < rel_low]
+                if len(low_ids) > 0:
+                    self.vel_command_b[low_ids, 0] = torch.empty(len(low_ids), device=self.device).uniform_(-band, band)
+                    self.vel_command_b[low_ids, 1] = torch.empty(len(low_ids), device=self.device).uniform_(-band, band)
         # Sample pitch target
         r = torch.empty(len(env_ids), device=self.device)
         if self.cfg.ranges.ang_pos_y is not None:
@@ -273,6 +285,16 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
     """
 
     class_type: ClassVar = UniformVelocityCommandWithPitch
+
+    rel_low_speed_envs: float = 0.0
+    """Fraction of the NON-standing envs whose lin_vel_x/lin_vel_y are resampled into a small low-speed band
+    on each resample. The uniform (-1,1) range makes near-zero speeds a thin tail, yet standing and slow
+    walking are distinct skills (the robot fell at low commanded speeds), so this practices them densely.
+    0 disables it (plain uniform). Independent of rel_standing_envs, which zeroes the command entirely."""
+
+    low_speed_max: float = 0.3
+    """Half-width (m/s) of the low-speed band when rel_low_speed_envs > 0: lin_vel_x and lin_vel_y are each
+    resampled ~ U(-low_speed_max, low_speed_max) for the selected envs."""
 
     nominal_height: float = 0.337
     """Display-only height reference for the cmd_height metric (Metrics/base_velocity/cmd_height). Not a

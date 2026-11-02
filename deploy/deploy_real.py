@@ -103,9 +103,16 @@ class DeployConfig:
     isaac_joint_order: list[str]
     sdk_joint_order: list[str]
     default_joint_pos: dict[str, float]
+    link_lost_after_s: float = 0.5  # LINK_LOST_AFTER_S; defaulted so direct constructors (sim2sim) keep working
+    hold_kp: float | None = None  # startup-ramp stiffness; None = same as kp (old single-stiffness behaviour)
+
+    def __post_init__(self) -> None:
+        if self.hold_kp is None:
+            self.hold_kp = self.kp
 
 
-def load_config(path: str, cli_network_interface: str | None) -> DeployConfig:
+def load_config(path: str, cli_network_interface: str | None, cli_link_lost_after: float | None = None,
+                cli_hold_kp: float | None = None) -> DeployConfig:
     with open(path) as f:
         raw = yaml.safe_load(f)
     network_interface = cli_network_interface or raw["network_interface"]
@@ -114,13 +121,29 @@ def load_config(path: str, cli_network_interface: str | None) -> DeployConfig:
             "network_interface is not set -- pass --network_interface or set it in the config file. "
             "Refusing to guess a NIC for DDS traffic to the robot."
         )
+    # Link-loss threshold: CLI > config `link_lost_after` > the module default (0.5 s). Exposed because a
+    # wireless link's jitter may need a different margin than the wired default was chosen for.
+    if cli_link_lost_after is not None:
+        link_lost_after_s = cli_link_lost_after
+    else:
+        link_lost_after_s = float(raw.get("link_lost_after", LINK_LOST_AFTER_S))
+    kp = float(raw["kp"])
+    # hold_kp: stiffness for the startup ramp only (the policy loop runs at kp). CLI > config > kp (old
+    # behaviour). See the config comment and ramp_to_default_pose() -- kp is too soft to raise the robot's
+    # weight off the ground before the policy is live.
+    if cli_hold_kp is not None:
+        hold_kp = cli_hold_kp
+    else:
+        hold_kp = float(raw.get("hold_kp", kp))
     return DeployConfig(
         policy_path=raw["policy_path"],
         control_dt=float(raw["control_dt"]),
         network_interface=network_interface,
+        link_lost_after_s=link_lost_after_s,
         action_scale=float(raw["action_scale"]),
-        kp=float(raw["kp"]),
+        kp=kp,
         kd=float(raw["kd"]),
+        hold_kp=hold_kp,
         effort_limit=float(raw["effort_limit"]),
         isaac_joint_order=list(raw["isaac_joint_order"]),
         sdk_joint_order=list(raw["sdk_joint_order"]),
@@ -193,6 +216,15 @@ class LatestRobotState:
         self.sportmode_velocity = (0.0, 0.0, 0.0)  # body-frame linear velocity estimate, m/s
         self.ready = False  # False until at least one LowState message has been received
         self.last_update = None  # time.monotonic() of the most recent LowState message
+        # LowState inter-arrival jitter tracking. On a wired link gaps are ~2 ms (500 Hz); over WiFi they
+        # can spike, and a spike past the link-loss threshold safely stops the run -- so these stats let the
+        # operator see how close WiFi jitter is getting to that threshold. _gaps_s is capped to bound memory
+        # on long runs (500k samples ~= 1000 s at 500 Hz); past that only max/last keep updating.
+        self.foot_force = [0, 0, 0, 0]  # Go2 foot contact sensors (raw units), in SDK foot order FR, FL, RR, RL
+        self.last_gap_s = 0.0
+        self.max_gap_s = 0.0
+        self._gaps_s: list[float] = []
+        self._gaps_capped = False
 
     def age_s(self) -> float:
         """Seconds since the last LowState message (inf if none yet). Used by the link-loss guard."""
@@ -200,15 +232,42 @@ class LatestRobotState:
             return float("inf")
         return time.monotonic() - self.last_update
 
+    def gap_stats(self) -> dict:
+        """Summary of LowState inter-arrival gaps seen so far (seconds): sample count, max, and 95th
+        percentile, plus whether the sample buffer was capped. For judging WiFi link health against the
+        link-loss threshold."""
+        with self._lock:
+            gaps = sorted(self._gaps_s)
+            capped = self._gaps_capped
+            max_s = self.max_gap_s
+        if not gaps:
+            return {"count": 0, "max_s": max_s, "p95_s": 0.0, "capped": capped}
+        p95 = gaps[min(len(gaps) - 1, int(0.95 * len(gaps)))]
+        return {"count": len(gaps), "max_s": max_s, "p95_s": p95, "capped": capped}
+
     def update_from_low_state(self, msg) -> None:
         with self._lock:
-            self.last_update = time.monotonic()
+            now = time.monotonic()
+            if self.last_update is not None:
+                gap = now - self.last_update
+                self.last_gap_s = gap
+                if gap > self.max_gap_s:
+                    self.max_gap_s = gap
+                if len(self._gaps_s) < 500_000:
+                    self._gaps_s.append(gap)
+                else:
+                    self._gaps_capped = True
+            self.last_update = now
             self.joint_pos = [ms.q for ms in msg.motor_state[: len(self.joint_pos)]]
             self.joint_vel = [ms.dq for ms in msg.motor_state[: len(self.joint_vel)]]
             self.tau_est = [ms.tau_est for ms in msg.motor_state[: len(self.tau_est)]]
             self.wireless_remote = bytes(msg.wireless_remote)
             self.quat_wxyz = tuple(msg.imu_state.quaternion)
             self.gyro = tuple(msg.imu_state.gyroscope)
+            try:
+                self.foot_force = [int(v) for v in msg.foot_force]
+            except (AttributeError, TypeError):
+                pass
             self.ready = True
 
     def update_from_sportmode_state(self, msg) -> None:
@@ -225,6 +284,7 @@ class LatestRobotState:
             snap.wireless_remote = self.wireless_remote
             snap.quat_wxyz = self.quat_wxyz
             snap.gyro = self.gyro
+            snap.foot_force = list(self.foot_force)
             snap.sportmode_velocity = self.sportmode_velocity
             snap.ready = self.ready
             snap.last_update = self.last_update
@@ -615,7 +675,8 @@ class JointSpeedFault(TrackingFault):
 
 
 def tether_limit(
-    target_isaac_order: list[float], actual_isaac_order: list[float], max_dev_rad: float, joint_names: list[str]
+    target_isaac_order: list[float], actual_isaac_order: list[float], max_dev_rad: "float | list[float]",
+    joint_names: list[str]
 ) -> tuple[list[float], list[str]]:
     """Limits every commanded joint target to within `max_dev_rad` of that joint's ACTUAL position, returning
     the limited target and the names of joints that were limited.
@@ -627,13 +688,16 @@ def tether_limit(
     far from reality. This bounds the PD torque at kp * max_dev (e.g. 25 * 15 deg = 6.5 Nm) no matter what the
     policy or ramp asks for -- the software effort limit the unused `effort_limit` config value was meant to be."""
     limited, limited_names = [], []
-    for name, tgt, act in zip(joint_names, target_isaac_order, actual_isaac_order):
+    # max_dev_rad may be a scalar or a per-joint list (the calves get a wider leash while lifting, see
+    # SafetyMonitor.set_lift_mode).
+    devs = max_dev_rad if isinstance(max_dev_rad, (list, tuple)) else [max_dev_rad] * len(joint_names)
+    for name, tgt, act, dev in zip(joint_names, target_isaac_order, actual_isaac_order, devs):
         delta = tgt - act
-        if delta > max_dev_rad:
-            limited.append(act + max_dev_rad)
+        if delta > dev:
+            limited.append(act + dev)
             limited_names.append(name)
-        elif delta < -max_dev_rad:
-            limited.append(act - max_dev_rad)
+        elif delta < -dev:
+            limited.append(act - dev)
             limited_names.append(name)
         else:
             limited.append(tgt)
@@ -648,6 +712,17 @@ class LinkLost(Exception):
     fought it -- violent ~45 Hz chatter. On link loss the script must STOP publishing and exit, never wait
     for the link to come back."""
 
+
+def handover_kp(tick: int, n_ticks: int, hold_kp: float, kp: float) -> float:
+    """kp for policy tick `tick` (0-based) while fading from the stiff ramp hold to the policy's gain over
+    `n_ticks` ticks. Real run: dropping 60 -> 25 on one tick let the robot sag ~40 deg in 0.5 s before the
+    policy could take the load; a short fade gives it ticks to catch up. n_ticks <= 0 means an immediate drop."""
+    if n_ticks <= 0 or tick >= n_ticks - 1:
+        return kp
+    return hold_kp + (kp - hold_kp) * (tick + 1) / n_ticks
+
+
+CALF_RATED_NM = 45.43  # Go2 calf peak torque (hip/thigh 23.7); see unitree_go2witharm_cfg.py and the config comment
 
 LINK_LOST_AFTER_S = 0.5  # LowState normally arrives at ~500 Hz; half a second of silence is a dead link
 
@@ -742,7 +817,8 @@ class SafetyMonitor:
 
     def __init__(self, state: "LatestRobotState", sdk_to_isaac: list[int], watchdog: TorqueResponseWatchdog,
                  joint_names: list[str], max_dev_rad: float, abort_err_rad: float, abort_steps: int,
-                 tau_abort_nm: float, speed_watchdog: "JointSpeedWatchdog | None" = None, writer=None):
+                 tau_abort_nm: float, speed_watchdog: "JointSpeedWatchdog | None" = None, writer=None,
+                 link_lost_after_s: float = LINK_LOST_AFTER_S):
         self.state = state
         self.sdk_to_isaac = sdk_to_isaac
         self.watchdog = watchdog
@@ -753,8 +829,30 @@ class SafetyMonitor:
         self.abort_steps = abort_steps
         self.tau_abort_nm = tau_abort_nm
         self.writer = writer
+        self.link_lost_after_s = link_lost_after_s
         self._tick = 0
         self._big_err_count = 0
+        self._lift_dev_rad: float | None = None  # calf-only wider tether while lifting off the ground, else None
+        self._lift_calf_tau_abort_nm: float | None = None
+
+    def set_lift_mode(self, calf_dev_rad: float, calf_tau_abort_nm: float) -> None:
+        """Startup lift only: a robot rising from prone needs more rear-calf torque than the 15 deg tether's
+        kp*dev ceiling allows (real run: max |tau| flat at 16.5 Nm = the cap, calves stuck 45 deg short). Widens
+        ONLY the calves' tether and torque abort (calves are rated 45.4 Nm; hip/thigh 23.7 Nm keep the normal
+        leash and the normal abort). end_lift_mode() restores everything before the policy starts."""
+        self._lift_dev_rad = calf_dev_rad
+        self._lift_calf_tau_abort_nm = calf_tau_abort_nm
+
+    def end_lift_mode(self) -> None:
+        self._lift_dev_rad = None
+        self._lift_calf_tau_abort_nm = None
+
+    def _is_calf(self, i: int) -> bool:
+        return self.joint_names[i].endswith("_calf_joint")
+
+    def actual_tau_isaac_order(self) -> list[float]:
+        snap = self.state.snapshot()
+        return [snap.tau_est[sdk_i] for sdk_i in self.sdk_to_isaac]
 
     def actual_isaac_order(self) -> list[float]:
         snap = self.state.snapshot()
@@ -766,14 +864,18 @@ class SafetyMonitor:
 
     def limit_target(self, target_isaac_order: list[float]) -> tuple[list[float], list[str]]:
         """Tether: see tether_limit. Applied to every target before it reaches the publish buffer."""
-        return tether_limit(target_isaac_order, self.actual_isaac_order(), self.max_dev_rad, self.joint_names)
+        dev = self.max_dev_rad
+        if self._lift_dev_rad is not None:
+            dev = [self._lift_dev_rad if self._is_calf(i) else self.max_dev_rad for i in range(len(self.joint_names))]
+        return tether_limit(target_isaac_order, self.actual_isaac_order(), dev, self.joint_names)
 
     def _raise_if_unsafe(self, snap: "LatestRobotState") -> None:
         age = snap.age_s()
-        if age > LINK_LOST_AFTER_S:
+        if age > self.link_lost_after_s:
             raise LinkLost(
-                f"No LowState for {age:.1f} s (cable pulled, or robot rebooting / powered off). Stopping and "
-                "NOT resuming: a resumed command stream could fight a robot that came back in sport mode."
+                f"No LowState for {age:.1f} s > {self.link_lost_after_s:.2f} s link-loss threshold (cable/WiFi "
+                "dropped, or robot rebooting / powered off). Stopping and NOT resuming: a resumed command "
+                "stream could fight a robot that came back in sport mode."
             )
         if estop_pressed(snap.wireless_remote):
             raise EmergencyStop("Controller e-stop (L2+B) pressed.")
@@ -793,12 +895,21 @@ class SafetyMonitor:
         if self.writer is not None:
             self.writer.add_scalar("Debug/max_pos_error_deg", math.degrees(max_err), self._tick)
             self.writer.add_scalar("Debug/max_abs_tau_est_nm", max_tau, self._tick)
-        if max_tau >= self.tau_abort_nm:
-            raise TrackingFault(
-                f"Joint torque {max_tau:.1f} Nm is at/over {self.tau_abort_nm:.1f} Nm (90% of effort_limit). "
-                "Stopping before the robot's own protection trips."
-            )
-        if max_err > self.abort_err_rad:
+            self.writer.add_scalar("Debug/lowstate_gap_ms", self.state.last_gap_s * 1000.0, self._tick)
+        tau_isaac = [snap.tau_est[sdk_i] for sdk_i in self.sdk_to_isaac]
+        for i, t in enumerate(tau_isaac):
+            limit = self.tau_abort_nm
+            if self._lift_calf_tau_abort_nm is not None and self._is_calf(i):
+                limit = self._lift_calf_tau_abort_nm
+            if abs(t) >= limit:
+                raise TrackingFault(
+                    f"Joint {self.joint_names[i]} torque {abs(t):.1f} Nm is at/over {limit:.1f} Nm. "
+                    "Stopping before the robot's own protection trips."
+                )
+        abort_err = self.abort_err_rad
+        if self._lift_dev_rad is not None:
+            abort_err = max(abort_err, self._lift_dev_rad + math.radians(10.0))  # tracking error rides the leash
+        if max_err > abort_err:
             self._big_err_count += 1
             if self._big_err_count >= self.abort_steps:
                 raise TrackingFault(
@@ -858,6 +969,8 @@ def ramp_to_default_pose(
     full_kp: float,
     gate: StepConfirmGate | None = None,
     monitor: SafetyMonitor | None = None,
+    settle_s: float = 0.0,
+    settle_tol_rad: float = math.radians(6.0),
 ) -> None:
     """Required safety step, previously MISSING entirely: linearly interpolates the published target from
     the robot's actual current joint positions to `default_isaac_order` over `duration_s`, instead of
@@ -919,12 +1032,48 @@ def ramp_to_default_pose(
             time.sleep(sleep_time)
     target_buf.set_kp(full_kp)
     final_target = list(default_isaac_order)  # exact, not just alpha=1.0's floating-point approximation
+    # Settle: the ramp's duration is fixed, but a robot lifting itself from the ground is not -- kp climbs over
+    # the ramp, so the legs only start to rise in its last seconds and are still moving when it ends (real run,
+    # prone start: 10 of 12 joints arrived, the rear calves were still rising). Keep holding the default at full
+    # kp, still tethered (torque <= kp * tether), until every joint is within settle_tol_rad of default or the
+    # timeout passes. On timeout the tether guard below is still the backstop, so nothing is loosened.
+    if monitor is not None and settle_s > 0.0 and gate is None:
+        settle_end = time.monotonic() + settle_s
+        last_report = 0.0
+        while True:
+            tick_start = time.perf_counter()
+            monitor.check(target_buf.get(), kp_fraction=1.0)  # e-stop, link, torque, tracking faults still live
+            actual = monitor.actual_isaac_order()
+            resid = [abs(d - a) for d, a in zip(default_isaac_order, actual)]
+            if max(resid) <= settle_tol_rad:
+                print(f"[INFO] Settled: every joint within {math.degrees(settle_tol_rad):.1f} deg of default.")
+                break
+            if time.monotonic() >= settle_end:
+                print(f"[WARN] Settle timeout ({settle_s:.0f}s): worst joint still {math.degrees(max(resid)):.1f} "
+                      f"deg from default; falling through to the tether guard.")
+                break
+            if time.monotonic() - last_report >= 1.0:
+                worst = max(range(len(resid)), key=resid.__getitem__)
+                tau = monitor.actual_tau_isaac_order()[worst]
+                print(f"[SETTLE] worst: {isaac_joint_order[worst]} {math.degrees(resid[worst]):.1f} deg from default, "
+                      f"tau_est {tau:+.1f} Nm")
+                last_report = time.monotonic()
+            tethered, _ = monitor.limit_target(list(default_isaac_order))
+            target_buf.set(tethered)
+            sleep_time = control_dt - (time.perf_counter() - tick_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
     if monitor is not None:
         final_target, limited = monitor.limit_target(final_target)
         if limited:
+            actual = monitor.actual_isaac_order()
+            detail = ", ".join(
+                f"{n} {math.degrees(abs(default_isaac_order[isaac_joint_order.index(n)] - actual[isaac_joint_order.index(n)])):.0f} deg"
+                for n in limited
+            )
             raise TrackingFault(
                 f"Ramp finished but {len(limited)} joint(s) are still more than the tether "
-                f"({math.degrees(monitor.max_dev_rad):.0f} deg) from default: {', '.join(limited)}. The robot did "
+                f"({math.degrees(monitor.max_dev_rad):.0f} deg) from default: {detail}. The robot did "
                 "not follow the ramp (contact, winch, or fault) -- refusing to hand off to the policy."
             )
     target_buf.set(final_target)
@@ -939,10 +1088,16 @@ def ramp_to_default_pose(
 
 
 def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, actual_ang_vel_z: float,
-                   actual_pitch: float, actual_lean: float) -> None:
+                   actual_pitch: float, actual_lean: float,
+                   commanded_isaac: list[float] | None = None, actual_isaac: list[float] | None = None,
+                   joint_names: list[str] | None = None) -> None:
     """No height tags: real hardware has no height measurement to plot (see mdp/commands.py's module
     docstring). sim2sim/sim2sim_mujoco.py, which CAN measure true height, logs its own cmd_height/
-    actual_height tags directly rather than through this function."""
+    actual_height tags directly rather than through this function.
+
+    If `commanded_isaac`/`actual_isaac`/`joint_names` are given, logs per-joint commanded vs actual position
+    (degrees) under JointPos/<name>/{cmd,actual} -- the signal that distinguishes "the policy is crouching"
+    from "a joint cannot follow the command" (e.g. the cold-start sag that lands the rear knees on the ground)."""
     writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_x", cmd[0], step)
     writer.add_scalar("Metrics/base_velocity/actual_lin_vel_x", actual_lin_vel[0], step)
     writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_y", cmd[1], step)
@@ -953,6 +1108,10 @@ def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, ac
     writer.add_scalar("Metrics/base_velocity/actual_pitch", actual_pitch, step)
     writer.add_scalar("Metrics/base_velocity/cmd_lean", cmd[4], step)
     writer.add_scalar("Metrics/base_velocity/actual_lean", actual_lean, step)
+    if commanded_isaac is not None and actual_isaac is not None and joint_names is not None:
+        for name, c, a in zip(joint_names, commanded_isaac, actual_isaac):
+            writer.add_scalar(f"JointPos/{name}/cmd", math.degrees(c), step)
+            writer.add_scalar(f"JointPos/{name}/actual", math.degrees(a), step)
     writer.flush()
 
 
@@ -969,6 +1128,28 @@ def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, ac
 # only so sim2sim/sim2sim_mujoco.py can still run the OLDER committed policies (models/9_10_26_vanilla,
 # models/9_13_26_*), which DO have a base_height term between projected_gravity and velocity_commands --
 # sim2sim passes a real measured value for those; this is otherwise dead code on the real control loop.
+#
+# Per-policy observation layout, keyed by the exported policy's input dim (read off its first Linear layer by
+# `policy_obs_layout`, never guessed from the file path). `cmd_width` is how many command floats to feed;
+# `has_height_obs` inserts a base_height term; `has_lin_vel` prepends base_lin_vel. sim2sim imports this.
+#   47: current policies -- NO base_lin_vel (dropped: dead on hardware after ReleaseMode), 5-wide command.
+#   50: older 5-wide-command policies WITH base_lin_vel, no height obs.
+#   51/52: legacy 6-wide-command policies (51: height command only; 52: + base_height observation).
+OBS_LAYOUT = {
+    47: {"cmd_width": 5, "has_height_obs": False, "has_lin_vel": False},
+    50: {"cmd_width": 5, "has_height_obs": False, "has_lin_vel": True},
+    51: {"cmd_width": 6, "has_height_obs": False, "has_lin_vel": True},
+    52: {"cmd_width": 6, "has_height_obs": True, "has_lin_vel": True},
+}
+
+
+def policy_obs_layout(policy) -> tuple[int, dict]:
+    """(obs_dim, layout) read off the policy's first Linear layer; raises if the dim is unknown."""
+    first_weight = next(p for p in policy.parameters() if p.dim() == 2)
+    obs_dim = int(first_weight.shape[1])
+    if obs_dim not in OBS_LAYOUT:
+        raise ValueError(f"policy expects a {obs_dim}-dim observation; known dims are {sorted(OBS_LAYOUT)}.")
+    return obs_dim, OBS_LAYOUT[obs_dim]
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -980,6 +1161,7 @@ def build_observation(
     manual_cmd: list[float],
     last_action: list[float],
     base_height: float | None = None,
+    include_base_lin_vel: bool = True,
 ) -> torch.Tensor:
     gravity_b = quat_rotate_inverse_wxyz(state.quat_wxyz, (0.0, 0.0, -1.0))
 
@@ -988,7 +1170,10 @@ def build_observation(
     joint_pos_rel = [q - q0 for q, q0 in zip(joint_pos_isaac, default_joint_pos_isaac_order)]
 
     parts: list[float] = []
-    parts += list(state.sportmode_velocity)  # base_lin_vel (body frame), 3
+    if include_base_lin_vel:
+        # base_lin_vel (body frame), 3. Only for policies trained WITH it; dead on hardware after ReleaseMode
+        # (SportModeState stops publishing), which is why current policies drop it -- see OBS_LAYOUT.
+        parts += list(state.sportmode_velocity)
     parts += list(state.gyro)  # base_ang_vel (body frame), 3
     parts += list(gravity_b)  # projected_gravity, 3
     if base_height is not None:
@@ -1034,6 +1219,14 @@ def parse_args():
     )
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument(
+        "--link_lost_after",
+        type=float,
+        default=None,
+        help="Seconds of LowState silence before the run stops as link-lost (overrides config's "
+        "'link_lost_after', default 0.5). Raise cautiously for a jittery WiFi link; a LowState gap this "
+        "long always stops and damps.",
+    )
+    parser.add_argument(
         "--manual_commands",
         action="store_true",
         default=False,
@@ -1072,6 +1265,41 @@ def parse_args():
         "interpolation had even sent its first step -- the remaining suspect was kp snapping to full "
         "stiffness on a possibly not-yet-settled joint. 0.1 = 10%% of full kp to start; raise for more "
         "caution, must be > 0 (some holding stiffness from the very first publish is still needed).",
+    )
+    parser.add_argument(
+        "--hold_kp", type=float, default=None,
+        help="Stiffness for the startup ramp ONLY (overrides config's 'hold_kp'); the policy loop always runs "
+        "at the config 'kp'. The training gain kp=25 cannot raise/hold the robot's weight off the ground "
+        "during the cold start, so the legs sag and the ramp never reaches the stance. A stiffer hold_kp "
+        "(~60) lets the robot stand to default; kp is then dropped to the policy's value in the same tick the "
+        "first policy action is applied. Set equal to kp to restore the old single-stiffness behaviour.",
+    )
+    parser.add_argument(
+        "--settle_s", type=float, default=8.0,
+        help="After the startup ramp, keep holding the default pose at hold_kp (still tethered) for up to this "
+        "many seconds until every joint is within --settle_tol_deg of default. A robot lifting itself off the "
+        "ground is still rising when the fixed-length ramp ends; 0 restores the old immediate hand-off check.",
+    )
+    parser.add_argument(
+        "--handover_slew_rad_s", type=float, default=2.618,
+        help="Per-tick slew cap used ONLY while kp is fading from hold_kp to kp at policy handover (see "
+        "--kp_handover_s). Kept conservative (default 2.618 = 3 deg/tick) because a fast target step at the "
+        "still-stiff fade kp makes a large torque spike (the handover jerk / torque-abort seen when "
+        "--max_joint_speed_rad_s was raised globally). Clamped to at most --max_joint_speed_rad_s.",
+    )
+    parser.add_argument(
+        "--kp_handover_s", type=float, default=0.5,
+        help="Fade kp from hold_kp to the policy's kp over this many seconds after the policy starts (0 = drop "
+        "instantly). An instant 60 -> 25 drop let the real robot sag ~40 deg before the policy took the load.",
+    )
+    parser.add_argument("--settle_tol_deg", type=float, default=6.0, help="Settle target, see --settle_s.")
+    parser.add_argument(
+        "--lift_calf_tether_deg", type=float, default=None,
+        help="Startup lift only (ramp + settle; off by default): widen the CALF tether to this many degrees and "
+        "raise the calf torque abort to 0.9 x its 45.4 Nm rating. A robot rising from prone needs more rear-calf "
+        "torque than the 15 deg tether's kp*dev cap (60 * 15 deg = 15.7 Nm) -- real run: torque flat at that "
+        "cap, rear calves stuck 40-45 deg short. Max calf torque ~ hold_kp * this (60 * 25 deg = 26 Nm). Hips "
+        "and thighs keep the normal leash and abort, and everything is restored before the policy starts.",
     )
     parser.add_argument(
         "--max_joint_speed_rad_s", type=float, default=2.618,
@@ -1141,7 +1369,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    cfg = load_config(args.config, args.network_interface)
+    cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp)
 
     if args.skip_release and cfg.network_interface != "lo":
         raise ValueError(
@@ -1164,6 +1392,10 @@ def main():
     print(f"[INFO] Loading policy from: {cfg.policy_path}")
     policy = torch.jit.load(cfg.policy_path)
     policy.eval()
+    obs_dim, obs_layout = policy_obs_layout(policy)
+    include_base_lin_vel = obs_layout["has_lin_vel"]
+    print(f"[INFO] Policy observation dim {obs_dim}: base_lin_vel {'INCLUDED' if include_base_lin_vel else 'OMITTED'} "
+          f"(SportModeState {'needed' if include_base_lin_vel else 'not needed -- it stops after ReleaseMode anyway'}).")
 
     state = LatestRobotState(num_joints=12)
 
@@ -1176,11 +1408,24 @@ def main():
         print(f"[INFO] Manual command mode: slider window launched (writing to {args.command_file}).")
 
     live_plot_writer = None
+    live_plot_dir = None
     if args.live_plot:
         from torch.utils.tensorboard import SummaryWriter
 
         live_plot_dir = os.path.join("logs", "hardware_dashboard", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         live_plot_writer = SummaryWriter(log_dir=live_plot_dir)
+        # Record the exact invocation + resolved gains next to the scalars: these runs are otherwise
+        # un-reproducible (no argv is logged anywhere), which cost us the exact CLI values after the fact.
+        try:
+            with open(os.path.join(live_plot_dir, "cli_args.txt"), "w") as f:
+                f.write("argv: " + " ".join(sys.argv) + "\n")
+                f.write(f"config: {args.config}\n")
+                f.write(f"kp={cfg.kp} kd={cfg.kd} hold_kp={cfg.hold_kp} effort_limit={cfg.effort_limit} "
+                        f"tau_abort={0.9 * cfg.effort_limit:.2f}Nm\n")
+                f.write(f"max_target_dev_deg={args.max_target_dev_deg} abort_err_deg={args.abort_err_deg} "
+                        f"max_joint_speed_rad_s={args.max_joint_speed_rad_s} link_lost_after_s={cfg.link_lost_after_s}\n")
+        except OSError as e:
+            print(f"[WARN] could not write cli_args.txt: {e!r}")
         print(f"[INFO] Live plot logging to: {live_plot_dir}")
 
     # --- DDS init ---
@@ -1203,8 +1448,12 @@ def main():
 
         low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
         low_state_sub.Init(_on_low_state, 10)
-        sportmode_sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
-        sportmode_sub.Init(_on_sportmode_state, 10)
+        # Only subscribe to SportModeState if the policy actually uses base_lin_vel. Current policies (47-dim)
+        # do not, and it stops publishing after ReleaseMode() anyway, so the subscription is pointless for them.
+        sportmode_sub = None
+        if include_base_lin_vel:
+            sportmode_sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+            sportmode_sub.Init(_on_sportmode_state, 10)
 
         low_cmd_publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
         low_cmd_publisher.Init()
@@ -1235,7 +1484,10 @@ def main():
         # changes the joint positions by tens of degrees, so a pose captured here would be stale.
         # kp then starts gentle (see --startup_kp_fraction) and ramps alongside the position ramp, not
         # instantly -- see LowCmdTarget's and ramp_to_default_pose's docstrings for why.
-        startup_kp = cfg.kp * args.startup_kp_fraction
+        # The ramp climbs to cfg.hold_kp (>= cfg.kp): kp=25 is the policy's trained gain but is too soft to
+        # raise/hold the robot's weight off the ground before the policy is live, so the ramp uses a stiffer
+        # hold and the policy loop later drops kp back to cfg.kp on its first tick (see below).
+        startup_kp = cfg.hold_kp * args.startup_kp_fraction
         initial_snap = state.snapshot()
         hold_isaac_order = [initial_snap.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
 
@@ -1256,6 +1508,9 @@ def main():
 
     last_action = [0.0] * 12
     step = 0
+    policy_trace: list = []  # per-tick rows saved to policy_trace.npz with --live_plot (offline replay / diagnosis)
+    policy_tick = 0  # counts policy commands; drives the kp fade hold_kp -> kp after the ramp handover
+    handover_ticks = max(0, int(round(args.kp_handover_s / cfg.control_dt)))
     control_dt = cfg.control_dt
 
     gate = StepConfirmGate(args.steps_per_confirm) if args.steps_per_confirm is not None else None
@@ -1264,8 +1519,13 @@ def main():
               f"command(s) sent per SPACE press. Not real-time while this is on.")
 
     max_joint_step_rad = args.max_joint_speed_rad_s * control_dt
+    # The handover slew caps the target rate while kp is still faded high (hold_kp -> kp). It is never larger
+    # than the main slew, so raising --max_joint_speed_rad_s for balance recovery cannot un-protect the handoff.
+    handover_step_rad = min(args.handover_slew_rad_s, args.max_joint_speed_rad_s) * control_dt
     print(f"[INFO] Per-tick slew-rate limit: max {args.max_joint_speed_rad_s:.3f} rad/s "
-          f"({math.degrees(max_joint_step_rad):.1f} deg/joint/tick).")
+          f"({math.degrees(max_joint_step_rad):.1f} deg/joint/tick); "
+          f"{min(args.handover_slew_rad_s, args.max_joint_speed_rad_s):.3f} rad/s "
+          f"({math.degrees(handover_step_rad):.1f} deg/tick) during the kp handover fade.")
 
     # Gated runs count steps per keypress (each one a deliberate human action), free-running ones count
     # control ticks, so the same "no torque response" evidence needs far fewer gated steps (5) than ticks (25
@@ -1286,10 +1546,18 @@ def main():
             tau_abort_nm=0.9 * cfg.effort_limit,
             speed_watchdog=speed_watchdog,
             writer=live_plot_writer,
+            link_lost_after_s=cfg.link_lost_after_s,
         )
         print(f"[INFO] Tether: targets limited to {args.max_target_dev_deg:.0f} deg of actual "
               f"(max PD torque ~ kp*dev = {cfg.kp * math.radians(args.max_target_dev_deg):.1f} Nm); abort if error "
               f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm.")
+        tether_nm = cfg.kp * math.radians(args.max_target_dev_deg)
+        if tether_nm < 0.5 * 0.9 * cfg.effort_limit:
+            print(f"[WARN] Tether torque ceiling in the policy loop is only {tether_nm:.1f} Nm (kp {cfg.kp:.0f} x "
+                  f"{args.max_target_dev_deg:.0f} deg) -- less than the ~10-13 Nm the rear calves need to hold the "
+                  f"stance at kp {cfg.kp:.0f}, so the policy's correction gets clipped and the robot can sag "
+                  f"(real run). Raise --max_target_dev_deg (and --abort_err_deg above it) while keeping kp x dev "
+                  f"under the {0.9 * cfg.effort_limit:.1f} Nm abort.")
         print(f"[INFO] Joint-speed fault: abort if actual |velocity| exceeds "
               f"{args.speed_fault_cap_rad_s[0]:.1f}/{args.speed_fault_cap_rad_s[1]:.1f}/{args.speed_fault_cap_rad_s[2]:.1f} "
               f"rad/s (hip/thigh/calf) for {args.speed_fault_steps} consecutive steps.")
@@ -1337,20 +1605,31 @@ def main():
                 target_buf.set_kd(cfg.kd)
                 target_buf.set_kp(startup_kp)
                 print(f"[INFO] Holding actual pose at gentle kp={startup_kp:.1f}, kd={cfg.kd:.1f} "
-                      f"(full kp={cfg.kp:.1f}).")
+                      f"(ramp hold kp={cfg.hold_kp:.1f}, policy-loop kp={cfg.kp:.1f}).")
+                if cfg.hold_kp != cfg.kp:
+                    print(f"[INFO] Ramp raises the robot to default at kp={cfg.hold_kp:.1f}; kp drops to "
+                          f"{cfg.kp:.1f} on the first policy tick so the policy's active hold takes over.")
 
+                if args.lift_calf_tether_deg is not None:
+                    monitor.set_lift_mode(math.radians(args.lift_calf_tether_deg), 0.9 * CALF_RATED_NM)
+                    print(f"[INFO] Lift mode (ramp + settle only): calf tether {args.lift_calf_tether_deg:.0f} deg "
+                          f"(max calf torque ~ {cfg.hold_kp * math.radians(args.lift_calf_tether_deg):.0f} Nm), calf "
+                          f"torque abort {0.9 * CALF_RATED_NM:.0f} Nm; hips/thighs keep {args.max_target_dev_deg:.0f} deg "
+                          f"and {0.9 * cfg.effort_limit:.1f} Nm.")
                 ramp_to_default_pose(
                     target_buf, start_isaac_order, default_joint_pos_isaac_order, args.startup_ramp_s,
-                    cfg.control_dt, cfg.isaac_joint_order, start_kp=startup_kp, full_kp=cfg.kp, gate=gate,
-                    monitor=monitor,
+                    cfg.control_dt, cfg.isaac_joint_order, start_kp=startup_kp, full_kp=cfg.hold_kp, gate=gate,
+                    monitor=monitor, settle_s=args.settle_s, settle_tol_rad=math.radians(args.settle_tol_deg),
                 )
+                monitor.end_lift_mode()  # normal leash + torque abort for everything from here on
 
             while True:
                 tick_start = time.perf_counter()
                 snap = state.snapshot()
                 cmd = manual_cmd.get()
 
-                obs = build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, cmd, last_action)
+                obs = build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, cmd, last_action,
+                                        include_base_lin_vel=include_base_lin_vel)
                 with torch.inference_mode():
                     action = policy(obs)[0].tolist()
 
@@ -1363,20 +1642,28 @@ def main():
 
                 if target_buf is not None:
                     held_target = target_buf.get()
+                    # During the kp fade, kp is still near hold_kp (stiff): a fast target step there makes a big
+                    # torque spike (kp * step), the jerk/torque-abort seen when --max_joint_speed_rad_s was raised
+                    # globally. Keep the slew at the conservative handover value until kp has reached the policy's
+                    # gain, then open up to the full value for balance recovery.
+                    in_fade = cfg.hold_kp != cfg.kp and policy_tick < handover_ticks
+                    step_rad = handover_step_rad if in_fade else max_joint_step_rad
+                    active_slew = step_rad / control_dt  # true cap this tick, for the warning message
                     clamped_target, clipped_names = clamp_step(
-                        held_target, target_isaac_order, max_joint_step_rad, cfg.isaac_joint_order
+                        held_target, target_isaac_order, step_rad, cfg.isaac_joint_order
                     )
                     if clipped_names:
                         # Actual rate the policy's raw (unclamped) target implied this tick, rad/s -- vs.
-                        # args.max_joint_speed_rad_s, the cap that's about to be enforced below. Lets an
-                        # operator see HOW large the policy's ask was, not just that it was clipped.
+                        # active_slew, the cap that's about to be enforced below. Lets an operator see HOW large
+                        # the policy's ask was, not just that it was clipped.
                         policy_rates = {
                             name: (target_isaac_order[i] - held_target[i]) / control_dt
                             for i, name in enumerate(cfg.isaac_joint_order)
                         }
                         rate_str = ", ".join(f"{name}={policy_rates[name]:+.2f}rad/s" for name in clipped_names)
                         print(f"[WARN] step {step}: slew-rate limit clipped {len(clipped_names)} joint(s) "
-                              f"to {args.max_joint_speed_rad_s:.3f} rad/s (policy wanted: {rate_str})")
+                              f"to {active_slew:.3f} rad/s{' (handover)' if in_fade else ''} "
+                              f"(policy wanted: {rate_str})")
                     max_err, max_tau = monitor.check(target_buf.get(), kp_fraction=1.0)
                     clamped_target, tethered = monitor.limit_target(clamped_target)
                     if tethered:
@@ -1386,6 +1673,15 @@ def main():
                         print(f"[STEP {step}] {format_degrees(clamped_target, cfg.isaac_joint_order)}  "
                               f"| max|err|={math.degrees(max_err):.1f}deg max|tau_est|={max_tau:.2f}Nm\n")
                         gate.wait(poll=monitor.poll)
+                    # Fade kp from the stiff ramp hold to the policy's trained gain over the first
+                    # --kp_handover_s, applied in the same update as each policy target, so the policy's own
+                    # hold takes over progressively and the robot cannot sag in a gap between ramp and policy.
+                    if cfg.hold_kp != cfg.kp and policy_tick < max(handover_ticks, 1):
+                        target_buf.set_kp(handover_kp(policy_tick, handover_ticks, cfg.hold_kp, cfg.kp))
+                        if policy_tick == 0:
+                            print(f"[INFO] Policy control started: kp fading {cfg.hold_kp:.1f} -> {cfg.kp:.1f} "
+                                  f"over {args.kp_handover_s:.2f}s ({handover_ticks} ticks).")
+                    policy_tick += 1
                     target_buf.set(clamped_target)
                     # last_action MUST reflect what was actually sent (clamped_target), not the policy's raw
                     # wish (action) -- target_isaac_order is recomputed fresh from default_joint_pos every
@@ -1398,6 +1694,13 @@ def main():
                         (clamped_target[i] - default_joint_pos_isaac_order[i]) / cfg.action_scale
                         for i in range(12)
                     ]
+                    if live_plot_writer is not None:
+                        policy_trace.append((
+                            step, time.monotonic(), obs[0].tolist(), list(action), list(clamped_target),
+                            target_buf.get_kp(), len(clipped_names), len(tethered),
+                            [snap.tau_est[i] for i in sdk_to_isaac], [snap.joint_vel[i] for i in sdk_to_isaac],
+                            list(snap.foot_force), list(snap.quat_wxyz), list(snap.gyro),
+                        ))
                 else:
                     last_action = action
                     if args.dry_run and step % 50 == 0:
@@ -1405,6 +1708,7 @@ def main():
 
                 if live_plot_writer is not None:
                     lean, pitch = quat_to_pitch_lean(snap.quat_wxyz)
+                    actual_isaac = [snap.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
                     log_live_plot(
                         live_plot_writer,
                         step,
@@ -1413,6 +1717,9 @@ def main():
                         snap.gyro[2],
                         pitch,
                         lean,
+                        commanded_isaac=target_buf.get() if target_buf is not None else None,
+                        actual_isaac=actual_isaac,
+                        joint_names=cfg.isaac_joint_order,
                     )
 
                 step += 1
@@ -1452,6 +1759,29 @@ def main():
                 for _ in range(100):
                     low_cmd_publisher.Write(damp_cmd)
                     time.sleep(0.005)
+            # LowState link-health summary -- most useful over WiFi, where a p95/max gap approaching the
+            # link-loss threshold is the early warning that the link margin is too thin.
+            gs = state.gap_stats()
+            if gs["count"] > 0:
+                print(
+                    f"[LINK] LowState gaps over {gs['count']} msgs: max {gs['max_s'] * 1000:.0f} ms, "
+                    f"p95 {gs['p95_s'] * 1000:.0f} ms (link-loss threshold {cfg.link_lost_after_s * 1000:.0f} ms)"
+                    + ("  [sample buffer capped]" if gs["capped"] else "")
+                )
+            if policy_trace and live_plot_dir is not None:
+                try:
+                    import numpy as np
+
+                    cols = ("step", "t", "obs", "raw_action", "sent_target", "kp", "n_slew_clipped", "n_tethered",
+                            "tau_est", "joint_vel", "foot_force", "quat_wxyz", "gyro")
+                    np.savez_compressed(
+                        os.path.join(live_plot_dir, "policy_trace.npz"),
+                        **{c: np.array([row[i] for row in policy_trace]) for i, c in enumerate(cols)},
+                        joint_order=np.array(cfg.isaac_joint_order),
+                    )
+                    print(f"[INFO] Policy trace ({len(policy_trace)} ticks) saved to {live_plot_dir}/policy_trace.npz")
+                except Exception as e:  # noqa: BLE001 -- diagnostics must never mask the real exit path
+                    print(f"[WARN] could not save policy_trace.npz: {e!r}")
 
 
 if __name__ == "__main__":

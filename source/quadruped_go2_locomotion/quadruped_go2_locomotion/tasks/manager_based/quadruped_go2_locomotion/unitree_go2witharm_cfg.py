@@ -92,8 +92,12 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
             velocity_limit=30.1,
             velocity_limit_sim=PHYSX_JOINT_SPEED_LIMIT,
             armature=JOINT_ARMATURE,
-            stiffness=25.0,
-            damping=0.5,
+            # kp/kd raised 25/0.5 -> 40/0.8 (2026-10-30): the soft 25 could not passively hold the stance on
+            # real hardware, so the legs sagged at policy handover. 40 holds the default stance with far less
+            # sag. The deploy kp/kd (deploy/configs/go2_locomotion.yaml) MUST match these, since the policy's
+            # action->torque mapping is learned at this stiffness. Policies trained at 25 are not valid here.
+            stiffness=40.0,
+            damping=0.8,
             friction=0.0,
         ),
         "calves": DCMotorCfg(
@@ -103,8 +107,8 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
             velocity_limit=15.70,
             velocity_limit_sim=PHYSX_JOINT_SPEED_LIMIT,
             armature=JOINT_ARMATURE,
-            stiffness=25.0,
-            damping=0.5,
+            stiffness=40.0,  # see the hip_thigh note above; kept identical across groups as in training
+            damping=0.8,
             friction=0.0,
         ),
     },

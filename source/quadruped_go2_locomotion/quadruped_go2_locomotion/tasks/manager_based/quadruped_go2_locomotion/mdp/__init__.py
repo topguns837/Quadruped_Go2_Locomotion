@@ -9,6 +9,9 @@ from isaaclab.envs.mdp import *  # noqa: F401, F403
 
 from .curriculums import *  # noqa: F401, F403
 
+# Domain-randomisation events scaled by the curriculum difficulty (see mdp/events.py)
+from .events import *  # noqa: F401, F403
+
 # Joint position action with random control latency (see mdp/actions.py)
 from .actions import DelayedJointPositionActionCfg  # noqa: F401
 
