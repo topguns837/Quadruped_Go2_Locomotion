@@ -150,3 +150,15 @@ clearance and stance height within limits together:
    --policy …/2026-11-03_22-14-59/exported/policy.pt` shows the low stance (0.05–0.12 m, MuJoCo) and 0 falls.
    For the Isaac-true stance height, `scripts/rsl_rl/play.py --trace_out …` then read the root-height channel;
    `sim2sim/compare_traces.py` quantifies per-foot clearance and joint-target offsets across the two engines.
+
+## Correction (2026-11-04, after the hardware run)
+
+The reward-balance table above is real, but its reading of the smoothness terms was wrong in one respect: those
+penalties are computed on the *sampled* actions, and the trained policy's exploration noise std was 0.51-0.66
+(`Policy/mean_noise_std`). At that noise the logged `action_rate_l2` (about 9.8 per step) is almost entirely the noise
+itself; the deterministic policy on hardware has an action-rate value of about 0.001 in clean gait. So the
+smoothness trio was mainly a tax on exploration noise, not evidence that the gait was being flattened by jerk
+penalties. `foot_lift` being tiny next to `foot_sliding`, and `height_penalty` having almost no gradient, still stand.
+
+Hardware (15:12 run) also showed the kneeling was milder than MuJoCo suggested: about 2 cm below the default stance by
+a joint-angle estimate, against the 5 cm MuJoCo figure.
