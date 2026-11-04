@@ -6,16 +6,15 @@
 # was calibrated against this exact stiffness/damping/scale combination; using different real-hardware PD
 # gains would silently change what each action value means to the robot.
 
-policy_path: models/10_14_26_real_hardware_parity_tested/exported/policy.pt  # JIT export -- takes the raw
-  # observation vector and returns actions directly (obs normalization baked in). NOT model_9999.pt (that's
+policy_path: models/11_04_26_kp40_curriculum/exported/policy.pt  # JIT export -- takes the raw
+  # observation vector and returns actions directly (obs normalization baked in). NOT model_2699.pt (that's
   # the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic class to
   # load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
   #
-  # First checkpoint trained under the real-hardware-parity config (no PhysX joint-speed clamp, no action
-  # clipping, nominal armature + domain randomization -- see CLAUDE.md "Real-hardware parity (2026-10-13)").
-  # Operator-confirmed working on real hardware this session (hoisted + policy loop, see
-  # models/10_14_26_real_hardware_parity_tested/SUMMARY.md for the full report, including a known ~20-26 deg
-  # real-vs-simulated standing-pose gap on a few joints). Update this once a better checkpoint replaces it.
+  # 47-dim policy (no base_lin_vel) from the DR-curriculum retrain (run go2_kp40_curriculum_ppo/
+  # 2026-11-03_22-14-59, 18k iterations total). NOT yet tried on hardware; sim2sim only. Expect a lower stance
+  # and foot skim -- see gait_realism_diagnosis.md. The previous hardware-tested policy is
+  # models/10_14_26_real_hardware_parity_tested/ (50-dim; swap policy_path back to use it).
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
 network_interface: null  # REQUIRED before first run -- the HOST NIC on the robot's 192.168.123.0/24 network.

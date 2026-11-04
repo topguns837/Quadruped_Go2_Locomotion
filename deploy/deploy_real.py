@@ -1343,6 +1343,14 @@ def parse_args():
         "70-97 deg from the legs, torque hit 32 Nm (> effort limit) and the robot cut torque with a red LED.",
     )
     parser.add_argument(
+        "--policy_max_target_dev_deg", type=float, default=None,
+        help="Tether for the POLICY LOOP only, applied after the startup ramp and settle finish. Default (unset): "
+        "the policy loop uses --max_target_dev_deg like the ramp. Set it large (e.g. 1000) to stop the tether "
+        "reshaping the policy's targets (sim has no tether) while the ramp keeps --max_target_dev_deg: the ramp "
+        "needs its tether to wait for legs that lag the target (a robot rising from a crouch or a mat), and "
+        "without it the commanded-vs-actual error grows until --abort_err_deg trips (real run: 30 deg at ~7 s).",
+    )
+    parser.add_argument(
         "--abort_err_deg", type=float, default=30.0,
         help="Stop (damping) if commanded-vs-actual error stays above this for 3 consecutive steps.",
     )
@@ -1622,6 +1630,10 @@ def main():
                     monitor=monitor, settle_s=args.settle_s, settle_tol_rad=math.radians(args.settle_tol_deg),
                 )
                 monitor.end_lift_mode()  # normal leash + torque abort for everything from here on
+                if args.policy_max_target_dev_deg is not None:
+                    monitor.max_dev_rad = math.radians(args.policy_max_target_dev_deg)
+                    print(f"[INFO] Ramp done. Policy-loop tether: {args.policy_max_target_dev_deg:.0f} deg "
+                          f"(ramp used {args.max_target_dev_deg:.0f} deg).")
 
             while True:
                 tick_start = time.perf_counter()

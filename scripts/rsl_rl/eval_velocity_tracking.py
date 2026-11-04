@@ -173,8 +173,11 @@ def run_mujoco(policy_path: str, config_path: str) -> tuple[dict[str, dict[str, 
     robot = s2s.MujocoGo2(model, cfg, motor_limits="hardware")
     default_isaac = robot.default_isaac
     policy, obs_dim = s2s.load_policy(policy_path)
-    if obs_dim != 50:
-        raise ValueError(f"Expected a 50-dim (current) policy, got {obs_dim}-dim -- can't compare against Isaac.")
+    layout = s2s.OBS_LAYOUT.get(obs_dim)
+    # 47 (no base_lin_vel) and 50 (with it) are the current 5-wide-command layouts; the 6-wide legacy ones need a
+    # height command this comparison does not feed.
+    if layout is None or layout["cmd_width"] != 5 or layout["has_height_obs"]:
+        raise ValueError(f"Expected a 47- or 50-dim (current) policy, got {obs_dim}-dim.")
 
     results: dict[str, dict[str, float]] = {}
     mean_joint_pos: dict[str, np.ndarray] = {}
@@ -185,7 +188,13 @@ def run_mujoco(policy_path: str, config_path: str) -> tuple[dict[str, dict[str, 
         num_steps = round(seg.duration / cfg.control_dt)
         for k in range(num_steps):
             obs = s2s.deploy_real.build_observation(
-                cfg, robot.to_robot_state(), sdk_to_isaac, default_isaac, list(seg.command), last_action
+                cfg,
+                robot.to_robot_state(),
+                sdk_to_isaac,
+                default_isaac,
+                list(seg.command),
+                last_action,
+                include_base_lin_vel=layout["has_lin_vel"],
             )
             with torch.inference_mode():
                 action = policy(obs)[0].numpy()
