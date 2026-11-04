@@ -1,0 +1,58 @@
+# Named hardware test profiles for deploy_real.py / deploy_real_wireless.py:  --test_profile <name>
+#
+# Edit any value here and it takes effect on the NEXT run (this file is re-read at every launch).
+# Precedence per value:  explicit CLI flag  >  this profile  >  the built-in default in deploy_real.py.
+# So `--test_profile cautionary --max_joint_speed_rad_s 5` runs the cautionary profile with only the slew changed.
+#
+# Keys are the names of the deploy_real.py flags (without the leading --). Omit a key to keep its default.
+# NOT configurable here and active in every profile: the torque abort (0.9 x effort_limit in the robot config),
+# the TorqueResponseWatchdog (limp detector), the L2+B controller stop, and link-loss detection.
+# speed_fault_cap_rad_s below is the real-robot analogue of the sim's rated joint speed (hip/thigh 30.1, calf 15.7);
+# raising it above those values prints a warning at startup.
+#
+# Meaning of the main knobs:
+#   max_joint_speed_rad_s      per-tick slew cap on the commanded target (rad/s; 2.618 = 3 deg per 50 Hz tick).
+#   max_target_dev_deg         tether during the startup ramp/settle: target may lead the real joint by at most this.
+#   policy_max_target_dev_deg  tether during the policy loop (omit = same as max_target_dev_deg).
+#   abort_err_deg              abort if commanded-vs-actual error stays above this for 3 ticks (keep > the tether).
+#   hold_kp / lift_calf_tether_deg   startup lift from a crouch: calf torque ceiling = hold_kp x lift tether
+#                              (60 x 25 deg = 26 Nm; the rear calves need ~19 Nm; 40 x 25 stalls).
+#   kp_handover_s              seconds to fade kp from hold_kp to the policy's kp after the policy starts.
+
+# First touch of an unproven policy: target rate and distance both tightly limited.
+cautionary:
+  max_joint_speed_rad_s: 2.618
+  max_target_dev_deg: 15.0
+  policy_max_target_dev_deg: 15.0
+  abort_err_deg: 30.0
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+
+# A policy already seen to behave: slew and policy tether widened (the 2026-10-30 session's values).
+confident:
+  max_joint_speed_rad_s: 15.0
+  max_target_dev_deg: 15.0
+  policy_max_target_dev_deg: 45.0
+  abort_err_deg: 55.0
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+
+# Sim parity: nothing reshapes the policy's targets in the policy loop (what the 2026-11-04 15:39 run used).
+# The startup ramp keeps its 15 deg tether (it needs it to lift from a crouch). The torque abort, speed abort and
+# error abort still stop a genuine fault; a high-frequency buzz is below all of them, so keep a hand on L2+B.
+no_limits:
+  max_joint_speed_rad_s: 1000.0
+  max_target_dev_deg: 15.0
+  policy_max_target_dev_deg: 1000.0
+  abort_err_deg: 30.0
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5

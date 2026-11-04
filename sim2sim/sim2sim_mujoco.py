@@ -430,6 +430,17 @@ def parse_args():
         "(0..2 in training). Default 0.",
     )
     parser.add_argument(
+        "--floor_solref", type=float, nargs=2, default=None, metavar=("TIMECONST", "DAMPRATIO"),
+        help="Soften the floor contact (MuJoCo default 0.02 1.0) to emulate a compliant surface such as the mat "
+        "used in hardware tests, e.g. 0.06 0.5. Default: rigid.",
+    )
+    parser.add_argument(
+        "--obs_delay", type=int, default=0,
+        help="Feed the policy the proprioceptive state (joint pos/vel, gyro, gravity) from this many control steps "
+        "(20 ms) ago, emulating hardware sensor latency. last_action is NOT delayed (the policy remembers what it "
+        "sent). Used to reproduce the 24.9 Hz hardware buzz in sim. Default 0.",
+    )
+    parser.add_argument(
         "--joint_speed_cap", type=float, nargs=3, default=None, metavar=("HIP", "THIGH", "CALF"),
         help="Hard-clip joint speeds (rad/s) per joint type after every physics step, emulating PhysX's "
         "maxJointVelocity, which Isaac enforces and MuJoCo lacks (see MujocoGo2). E.g. 30.1 30.1 15.7.",
@@ -449,7 +460,7 @@ def main():
     global ARMATURE
     if args.armature is not None:
         ARMATURE = args.armature
-    model, spec = build_model()
+    model, spec = build_model(floor_solref=tuple(args.floor_solref) if args.floor_solref else None)
     if args.save_xml:
         with open(args.save_xml, "w") as f:
             f.write(spec.to_xml())
@@ -476,7 +487,7 @@ def main():
         f"has_height_obs={layout['has_height_obs']}{height_source_note} nominal_height={nominal_height:.3f} m "
         f"mass={float(np.sum(model.body_mass)):.2f} kg dt={model.opt.timestep} decimation={DECIMATION} "
         f"motor_limits={args.motor_limits} (calf {robot.effort_limit[-1]:.2f} Nm @ "
-        f"{robot.velocity_limit[-1]:.2f} rad/s) armature={ARMATURE} action_delay={args.action_delay} "
+        f"{robot.velocity_limit[-1]:.2f} rad/s) armature={ARMATURE} action_delay={args.action_delay} obs_delay={args.obs_delay} "
         f"joint_speed_cap={args.joint_speed_cap if args.joint_speed_cap else 'off'}"
     )
 
@@ -526,6 +537,7 @@ def main():
         dt = cfg.control_dt
         last_action = [0.0] * 12
         target_history: list[np.ndarray] = [robot.default_isaac.copy()] * (args.action_delay + 1)
+        state_history: list = []
         stats: list[SegmentStats] = []
         step = 0
         stop = False
@@ -545,8 +557,11 @@ def main():
                 base_height_obs = None
                 if layout["has_height_obs"]:
                     base_height_obs = robot.base_height if args.height_source == "true" else nominal_height
+                state_history.append(robot.to_robot_state())
+                if len(state_history) > args.obs_delay + 1:
+                    state_history.pop(0)
                 obs = deploy_real.build_observation(
-                    cfg, robot.to_robot_state(), sdk_to_isaac, default_isaac, manual_cmd, last_action,
+                    cfg, state_history[0], sdk_to_isaac, default_isaac, manual_cmd, last_action,
                     base_height=base_height_obs, include_base_lin_vel=layout["has_lin_vel"],
                 )
                 with torch.inference_mode():

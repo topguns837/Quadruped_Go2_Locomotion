@@ -81,7 +81,10 @@ FLOOR_FRICTION = 1.0
 TIMESTEP = 0.005  # sim.dt in quadruped_go2_locomotion_env_cfg.py
 
 
-def build_model(menagerie_xml: str = MENAGERIE_GO2_XML) -> tuple[mujoco.MjModel, mujoco.MjSpec]:
+def build_model(
+    menagerie_xml: str = MENAGERIE_GO2_XML, floor_solref: tuple[float, float] | None = None
+) -> tuple[mujoco.MjModel, mujoco.MjSpec]:
+    """floor_solref=(timeconst, dampratio) softens the floor contact (MuJoCo default 0.02, 1.0); None = default."""
     if not os.path.isfile(menagerie_xml):
         raise FileNotFoundError(f"{menagerie_xml} not found. Run sim2sim/fetch_go2_model.sh first.")
     spec = mujoco.MjSpec.from_file(menagerie_xml)
@@ -97,6 +100,7 @@ def build_model(menagerie_xml: str = MENAGERIE_GO2_XML) -> tuple[mujoco.MjModel,
         contype=1,
         conaffinity=FLOOR_CONAFFINITY,
         rgba=[0.25, 0.3, 0.35, 1],
+        **({"solref": list(floor_solref)} if floor_solref is not None else {}),
     )
 
     arm = spec.body("base").add_body(name="arm_mount", pos=list(ARM_MOUNT_POS))

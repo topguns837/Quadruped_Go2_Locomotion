@@ -43,3 +43,20 @@ Full command:
     deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot \
       --hold_kp 60 --lift_calf_tether_deg 25 \
       --max_joint_speed_rad_s 1000 --policy_max_target_dev_deg 1000
+
+## Test profiles (replace the long flag string)
+
+`--test_profile cautionary | confident | no_limits` loads the matching block of `deploy/configs/test_profiles.yaml`
+(slew, tethers, abort, speed-fault, startup-lift values). The file is re-read at every launch, so edits apply from
+the next run; an explicit flag still overrides one value. The startup banner and `cli_args.txt` record the resolved
+values. `no_limits` is what the 2026-11-04 15:39 run used:
+
+    deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --test_profile no_limits
+
+## Hardware results, 2026-11-04
+
+- Startup lift, handover and stand were clean; pitch/lean tracked (corr 0.93/0.97); the commands that were sent
+  (forward <= 0.22, lateral 0.29) did not produce stepping because the policy stands below ~0.3 m/s, in MuJoCo too.
+- 15:39 run: gait-like motion on -X (-0.19 to -0.27 m/s), then at ~51.8 s, after a pitch command, a 24.9 Hz
+  (control Nyquist) joint oscillation that did not recover; stopped with L2+B. Peak torque 13.9 Nm and joint speed
+  4.1 rad/s, so no abort could fire. Commanded joint rate 6 rad/s RMS vs 0.1 in clean gait (about 50x).

@@ -1212,12 +1212,58 @@ HOIST_PAUSE_PROMPT = """
 Press SPACE when the robot is hoisted (or on the ground, if skipping the hoist) to start the startup ramp..."""
 
 
+_RATED_SPEED_CAP = (30.1, 30.1, 15.7)  # hip, thigh, calf rad/s: unitree_go2witharm_cfg.py velocity_limit
+
+
+def load_test_profile(path: str, name: str, valid: set[str]) -> dict:
+    """Load one named block from the test-profiles YAML and validate it against the real flag names.
+
+    Returns {flag_dest: value} ready for argparse's set_defaults. Raises on an unknown profile or key so a typo
+    fails loudly at startup instead of silently running with a default.
+    """
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if name not in data:
+        raise ValueError(f"test profile '{name}' not found in {path}. Available: {sorted(data)}")
+    profile = data[name]
+    if not isinstance(profile, dict):
+        raise ValueError(f"test profile '{name}' in {path} must be a mapping of flag name -> value")
+    reserved = {"test_profile", "test_profiles_file", "config", "network_interface"}
+    bad = [k for k in profile if k not in valid or k in reserved]
+    if bad:
+        raise ValueError(f"test profile '{name}' in {path} has unknown/unsupported key(s) {bad}")
+    cap = profile.get("speed_fault_cap_rad_s")
+    if cap is not None:
+        ok = isinstance(cap, (list, tuple)) and len(cap) == 3 and all(isinstance(c, (int, float)) and c > 0 for c in cap)
+        if not ok:
+            raise ValueError(f"test profile '{name}': speed_fault_cap_rad_s must be 3 positive numbers (hip/thigh/calf)")
+        profile["speed_fault_cap_rad_s"] = [float(c) for c in cap]
+        if any(c > r + 1e-9 for c, r in zip(cap, _RATED_SPEED_CAP)):
+            print(f"[WARN] test profile '{name}': speed_fault_cap_rad_s {cap} is above the rated "
+                  f"{list(_RATED_SPEED_CAP)}; the measured-speed abort is looser than the motors' rating.")
+    steps = profile.get("speed_fault_steps")
+    if steps is not None and (not isinstance(steps, int) or steps < 1):
+        raise ValueError(f"test profile '{name}': speed_fault_steps must be an integer >= 1")
+    return profile
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Deploy a trained Go2 policy on real hardware.")
     parser.add_argument(
         "--config", type=str, default=os.path.join(os.path.dirname(__file__), "configs", "go2_locomotion.yaml")
     )
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
+    parser.add_argument(
+        "--test_profile", type=str, default=None,
+        help="Name of a profile in --test_profiles_file (cautionary / confident / no_limits, or your own): fills the "
+        "slew, tether, abort, speed-fault and startup-lift values from the YAML so they need not be passed one by "
+        "one. The file is re-read every run. An explicit flag on the command line still overrides the profile.",
+    )
+    parser.add_argument(
+        "--test_profiles_file", type=str,
+        default=os.path.join(os.path.dirname(__file__), "configs", "test_profiles.yaml"),
+        help="YAML file holding the named test profiles.",
+    )
     parser.add_argument(
         "--link_lost_after",
         type=float,
@@ -1372,11 +1418,25 @@ def parse_args():
         "--network_interface lo (deploy/fake_robot.py); refused otherwise, since publishing LowCmd to a real "
         "robot whose sport controller is still active is unsafe.",
     )
-    return parser.parse_args()
+    # Named test profiles (deploy/configs/test_profiles.yaml): read fresh on every launch. They become the argparse
+    # defaults, so precedence is  explicit CLI flag > profile > built-in default.
+    pre, _ = parser.parse_known_args()
+    profile: dict | None = None
+    if pre.test_profile is not None:
+        profile = load_test_profile(pre.test_profiles_file, pre.test_profile, valid={a.dest for a in parser._actions})
+        parser.set_defaults(**profile)
+    args = parser.parse_args()
+    args.test_profile_values = profile
+    return args
 
 
 def main():
     args = parse_args()
+    if args.test_profile_values is not None:
+        print(f"[INFO] Test profile '{args.test_profile}' ({args.test_profiles_file}); explicit CLI flags override it:")
+        for k, v in args.test_profile_values.items():
+            note = "" if getattr(args, k) == v else f"   (profile {v}, overridden)"
+            print(f"         {k} = {getattr(args, k)}{note}")
     cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp)
 
     if args.skip_release and cfg.network_interface != "lo":
@@ -1428,6 +1488,9 @@ def main():
             with open(os.path.join(live_plot_dir, "cli_args.txt"), "w") as f:
                 f.write("argv: " + " ".join(sys.argv) + "\n")
                 f.write(f"config: {args.config}\n")
+                if args.test_profile_values is not None:
+                    resolved = {k: getattr(args, k) for k in args.test_profile_values}
+                    f.write(f"test_profile: {args.test_profile} resolved={resolved}\n")
                 f.write(f"kp={cfg.kp} kd={cfg.kd} hold_kp={cfg.hold_kp} effort_limit={cfg.effort_limit} "
                         f"tau_abort={0.9 * cfg.effort_limit:.2f}Nm\n")
                 f.write(f"max_target_dev_deg={args.max_target_dev_deg} abort_err_deg={args.abort_err_deg} "
