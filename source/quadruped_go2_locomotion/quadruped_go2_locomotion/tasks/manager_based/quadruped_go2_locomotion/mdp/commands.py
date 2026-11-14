@@ -154,13 +154,15 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
             self.vel_command_b[:] = self.manual_command
             return
         super()._update_command()
-        # Copy pitch and lean targets into the command buffer
-        self.vel_command_b[:, 3] = self.target_pitch
-        self.vel_command_b[:, 4] = self.target_lean
-        # Zero pitch and lean for standing envs
+        # Zero pitch and lean for standing envs BEFORE copying them into the command buffer, so a standing env's
+        # whole command (all five terms) is exactly zero on the same step. (Zeroing after the copy left a stale
+        # non-zero pitch/lean for one step, which flips the hard stand-still gate off for that step.)
         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
         self.target_pitch[standing_env_ids] = 0.0
         self.target_lean[standing_env_ids] = 0.0
+        # Copy pitch and lean targets into the command buffer
+        self.vel_command_b[:, 3] = self.target_pitch
+        self.vel_command_b[:, 4] = self.target_lean
 
     def _update_metrics(self):
         """Extends the base tracking-error metrics with the raw commanded values themselves."""

@@ -205,6 +205,7 @@ class ActionsCfg:
 
     # Same affine map as before (default + 0.25 * action, no clipping), but each applied target lags the policy output by
     # 0-2 control steps (random per env per episode): the robot's command path is not instantaneous. See mdp/actions.py.
+    # The delay range scales with env.difficulty_scale (none at 0, the full 0-2 at 1).
     joint_pos = mdp.DelayedJointPositionActionCfg(
         asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True, max_delay_steps=2
     )
@@ -306,16 +307,18 @@ class EventCfg:
     # iteration 0 stalled the previous run (52% falls vs 4% without it). They are reset events (redrawn each episode)
     # because a startup event is drawn once and cannot follow a curriculum.
     #
-    # Everything else in this class (friction, PD gains, armature, joint friction, the velocity push) stays on at
-    # full strength from the start: they are the hardware-parity randomisations the previous good policy trained with.
+    # The velocity push (push_robot) and the action delay (ActionsCfg.joint_pos) follow the same scale since iter4
+    # phase-2. Everything else in this class (friction, PD gains, armature, joint friction) stays on at full strength
+    # from the start: they are the hardware-parity randomisations the previous good policy trained with.
     robot_mass = EventTerm(
         func=mdp.randomize_base_mass_curriculum,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            # kg added to the base (battery, payload, arm differences) at full difficulty. +-5 kg is ~+-32% of the
-            # ~15.6 kg robot. The base body is ~6.9 kg, so -5 kg lands ~1.9 kg. The inertia is scaled with the mass.
-            "max_abs_kg": 5.0,
+            # kg added to the base (battery, payload, arm differences) at full difficulty. iter4 realistic: +-5 -> +-2 kg
+            # (~+-13% of the ~15.6 kg robot). The Go2 sim-to-real norm is ~+-1 kg; +-2 allows arm/payload spread while
+            # staying a realistic disturbance, not an adversarial load. The inertia is scaled with the mass.
+            "max_abs_kg": 2.0,
         },
     )
     # Centre-of-mass offset on the base at full difficulty: a payload/battery is rarely bolted exactly at the
@@ -327,7 +330,7 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "max_xyz": (0.10, 0.08, 0.15),  # meters
+            "max_xyz": (0.06, 0.05, 0.08),  # meters; iter4 realistic: tightened from (0.10, 0.08, 0.15)
         },
     )
     actuator_gains = EventTerm(
@@ -345,7 +348,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "armature_distribution_params": (0.5, 2.0),  # x nominal JOINT_ARMATURE
+            "armature_distribution_params": (0.75, 1.5),  # x nominal JOINT_ARMATURE; iter4 realistic: 4x range -> 2x
             "operation": "scale",
         },
     )
@@ -358,25 +361,28 @@ class EventCfg:
             "operation": "abs",
         },
     )
+    # iter4 phase-2: the kick now follows env.difficulty_scale (0 -> none, 1 -> +-0.5 m/s), like the force push below.
     push_robot = EventTerm(
-        func=mdp.push_by_setting_velocity,
+        func=mdp.push_velocity_curriculum,
         mode="interval",
         interval_range_s=(8.0, 15.0),
-        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+        params={"max_velocity": 0.5},
     )
     # External force/torque shoves on the trunk, in ADDITION to the velocity kick above: a real push is a
     # force the policy must actively resist, not an instantaneous velocity reset. Applied to the base body and
     # re-sampled every interval (persisting between), so it is a shifting disturbance field. Curriculum-scaled: at full
-    # difficulty +-40 N on each axis (robot ~15.6 kg, weight ~153 N) and +-5 Nm torque.
-    # Disabled in the PLAY cfg (nominal physics for sim2sim parity), like push_robot.
+    # difficulty +-15 N on each axis (robot ~15.6 kg, weight ~153 N, so ~10% of weight) and +-2 Nm torque.
+    # iter4 realistic: reduced from +-40 N / +-5 Nm. At 40 N (26% of weight) held for seconds the policy learned to
+    # crouch and leave the default pose to avoid falling (posture eroded at difficulty >0.5); 15 N is a mild
+    # slope/lean/drag, a realistic disturbance rather than an adversary. Disabled in the PLAY cfg, like push_robot.
     push_robot_force = EventTerm(
         func=mdp.push_force_curriculum,
         mode="interval",
         interval_range_s=(5.0, 12.0),
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "max_force": 40.0,
-            "max_torque": 5.0,
+            "max_force": 15.0,
+            "max_torque": 2.0,
         },
     )
 
@@ -445,18 +451,44 @@ class RewardsCfg:
     """Reward terms for the MDP."""
 
     # -- task
+    # Velocity tracking is a TWO-SCALE sum (total weights unchanged: 10 linear, 2 yaw):
+    #  * a TIGHT speed-scaled term (std = max(floor, 0.5*|cmd|), equal to the old fixed 0.5 at >= 1 m/s) carries most of
+    #    the weight, so a robot that is not following the command scores ~0 from it at any command >= 0.2 m/s -- the fix
+    #    for the old dead zone (a fixed std 0.5 let a STANDING robot keep 0.70 of the reward at 0.3 m/s, 0.96 at 0.1);
+    #  * a BROAD fixed-std term (the original kernel) at lower weight keeps a dense gradient everywhere. Calibration
+    #    showed the tight term alone is flat for a robot that has not started moving (400-iteration run: linear
+    #    tracking stuck at ~0.65 and twice the velocity error of the old run), so exploration never found walking.
+    # Standing at cmd 0.3 now scores 0.4*10*0.70 + 0.6*10*0.02 = 2.9/10; tracking perfectly scores 10.
     track_lin_vel_xy_exp = RewTerm(
-        func=mdp.track_lin_vel_xy_exp,
-        weight=10.0,
-        params={
-            "command_name": "base_velocity",
-            "std": math.sqrt(0.25),
-        },
+        func=mdp.track_lin_vel_xy_exp_rel,
+        weight=6.0,
+        params={"command_name": "base_velocity", "std_floor": 0.08, "rel": 0.5},
+    )
+    track_lin_vel_xy_broad = RewTerm(
+        func=mdp.track_lin_vel_xy_exp, weight=4.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
     track_ang_vel_z_exp = RewTerm(
-        func=mdp.track_ang_vel_z_exp,
-        weight=2.0,  # was 0.5 (20:1 under lin_vel); Round 3 used 5.0, which cut lin_vel's tracking share to 48%
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+        func=mdp.track_ang_vel_z_exp_rel,
+        weight=1.2,
+        params={"command_name": "base_velocity", "std_floor": 0.1, "rel": 0.5},
+    )
+    track_ang_vel_z_broad = RewTerm(
+        func=mdp.track_ang_vel_z_exp, weight=0.8, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+    # Standing-when-commanded penalty: the exponential kernels above still let a standing robot bank most of the BROAD
+    # term at a small command (~2.9/10 at 0.3 m/s, ~5/10 at 0.1), so the gradient off standstill is weak -- the dead
+    # zone. This penalises the speed error along the commanded direction as a FRACTION of the command (bounded [0, 1]):
+    # standing costs the full weight at any command size, a tracker pays ~0, overshoot is penalised too. It replaces an
+    # L1 m/s deficit that was negligible at 0.1 m/s (weight -1.5) or, when raised (-4.5), so large at high speed that the
+    # policy fell and overshot 1.6-1.9x. Hard-gated off for a zero linear command. -4.0 picked over -2.0 from 400-iteration
+    # calibration: best velocity error (0.91), no falls at 0.5/0.8 m/s, steps from 0.2 m/s (see
+    # low_speed_standing_penalty_plan.md; single seed, so re-check low-speed stepping on later checkpoints).
+    standing_when_commanded = RewTerm(
+        func=mdp.standing_when_commanded, weight=-4.0, params={"command_name": "base_velocity"}
+    )
+    # Yaw analogue (L1 rad/s shortfall, one-sided); the dead zone is mainly linear, so this stays light.
+    track_ang_vel_deficit = RewTerm(
+        func=mdp.track_ang_vel_deficit, weight=-0.5, params={"command_name": "base_velocity"}
     )
     track_pitch_exp = RewTerm(
         func=mdp.track_pitch_exp,
@@ -478,10 +510,52 @@ class RewardsCfg:
     # Smoothness / effort penalties, strengthened 2026-10-30 so a smooth, low-torque gait is LEARNED rather
     # than only clipped at deploy (the real robot showed high torque and jerky corrections). These trade off
     # against command tracking -- retune if tracking suffers; watch peak_tau in the sim2sim summary.
-    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-3.0e-5)  # was -1.0e-5
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-5.0e-7)  # was -2.5e-7
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.03)  # was -0.01 (jerk between policy outputs)
-    dof_vel_l2 = RewTerm(func=mdp.joint_vel_l2, weight=-1.0e-4)  # new: penalize fast joint motion directly
+    # Every quadratic rate/effort penalty below is CLAMPED (max_value, in the unit of the summed-square value): the
+    # stock terms are unbounded, and a physics edge case that gives a large-but-finite joint velocity/torque would
+    # otherwise produce a huge negative spike (the failure class behind base_height's max_penalty). Each clamp sits
+    # ~4-5x ABOVE the value a noisy-but-sane policy produces (trained noise std ~0.5), so the gradient is unchanged in
+    # normal operation and only pathological outliers are cut. Worst-case clamped total per second is about -11 (trio
+    # reverted to heavy), plus up to ~-2.6 from the bounded speed-deficit terms, vs +10 tracking + ~+6 pitch/lean + +2
+    # alive in-distribution -- so a sane step stays net-positive and falling is never the cheaper option.
+    # The smoothness trio was briefly eased (2026-11-04) to relieve the dead zone / foot-drag, then reverted: the
+    # one-sided speed-deficit penalty (track_lin/ang_vel_deficit below) now carries the "move when commanded" load
+    # directly, so the trio can stay heavy for hardware smoothness. Weights are back to the iter1 values.
+    dof_torques_l2 = RewTerm(
+        func=mdp.joint_torques_l2_clamped, weight=-3.0e-5, params={"max_value": 6.0e3}
+    )
+    dof_acc_l2 = RewTerm(
+        func=mdp.joint_acc_l2_clamped, weight=-5.0e-7, params={"max_value": 5.0e6}
+    )
+    # action_rate back to -0.03. It penalizes any motion, but the high-frequency buzz is caught more specifically by
+    # action_jerk_l2 and joint_torque_rate_l2 below (2nd-difference / torque-rate penalties bite the 24.9 Hz Nyquist
+    # limit cycle seen on hardware without flattening a clean trot), so this stays a broad smoothness term.
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clamped, weight=-0.03, params={"max_value": 50.0})
+    dof_vel_l2 = RewTerm(  # penalize fast joint motion directly
+        func=mdp.joint_vel_l2_clamped, weight=-1.0e-4, params={"max_value": 1.5e3}
+    )
+    # Weights calibrated on the 2026-11-04 hardware traces (per-step value summed over 12 joints, deterministic
+    # policy): jerk good gait 0.0026 / buzz 10.96; torque-rate (Nm^2) good gait 0.17 / buzz 162. They are computed
+    # on SAMPLED actions though: at the trained noise std ~0.5 the exploration noise alone gives jerk ~18 and
+    # torque-rate ~300 per step, so the weights are sized for a noise tax of ~0.5/s and ~0.3/s (about 5% of the
+    # ~10/s tracking reward each) -- the buzz then adds a comparable, consistent cost the policy can remove for free.
+    action_jerk_l2 = RewTerm(  # iter2 NEW: 2nd diff of action (anti-buzz)
+        func=mdp.action_jerk_l2, weight=-0.03, params={"max_value": 150.0}
+    )
+    joint_torque_rate_l2 = RewTerm(  # iter2 NEW: d(applied torque)/step, anti-chatter
+        func=mdp.joint_torque_rate_l2,
+        weight=-1.0e-3,
+        params={"asset_cfg": SceneEntityCfg("robot"), "max_value": 2.0e3},
+    )
+    # -- safety (P0). A terminating contact has no reward penalty of its own, so without these a net-negative step
+    # (jerky/noisy early policy) makes ending the episode by falling the cheapest escape. is_alive keeps every
+    # in-distribution step net-positive; the fall penalty makes termination strictly worse than any bad state the
+    # clamped penalties above can produce. Reward-manager terms are weight * value * step_dt (0.02), so
+    # is_alive 2.0 is +2/s and the fall -500 is a one-off -10 return (is_terminated excludes the time_out and
+    # terrain_out_of_bounds truncations, and includes body/arm contact and invalid_state).
+    is_alive = RewTerm(func=mdp.is_alive, weight=2.0)
+    # iter4 phase-2: -500 -> -750 (fall return -10 -> -15). Falling gets strictly costlier as the difficulty
+    # curriculum ramps in phase 2; is_alive stays +2.0 so "don't fall" doesn't over-weight command tracking.
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-750.0)
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -509,8 +583,13 @@ class RewardsCfg:
     # center. There is no height COMMAND any more (see mdp.commands' module docstring): no reliable height
     # measurement exists on real hardware, so this fixed target is the only height regulation left.
     height_penalty = RewTerm(
-        func=mdp.base_height_l2_pitch,
-        weight=-1.65,
+        func=mdp.base_height_l1_pitch,
+        # iter3: L2 -> L1 and -4.0 -> -8.0. The quadratic was flat near small errors (a ~10 cm droop logged only
+        # ~0.04/s and the policy knelt); L1 has a constant gradient so 5 cm always costs 0.4/s, 10 cm 0.8/s,
+        # meaningful vs ~+14/s of tracking but below track_lin (~6-10/s) so it won't dominate. No transient blow-up.
+        # iter4 phase-2: -8.0 -> -12.0 (10 cm costs 1.2/s, 2 cm 0.24/s) to hold height as randomisation ramps in.
+        # iter4 realistic: -12.0 -> -15.0; with disturbances also reduced, posture holds without a crouch-freeze.
+        weight=-15.0,
         params={
             "command_name": "base_velocity",
             "target_height": 0.337,
@@ -548,23 +627,29 @@ class RewardsCfg:
     # Stand on all four feet in the default pose when commanded to stand; 0 once a velocity is commanded.
     stand_still = RewTerm(
         func=mdp.stand_still_default_pose,
-        weight=1.0,
+        # iter3: 1.0 -> 2.5. iter2's stand_still collapsed to ~0 (even zero-command envs left default pose), so the
+        # default-pose attractor was too weak. Now also factors in an explicit zero-velocity term (vel_scale=0.1):
+        # reward is planted * default_pose * exp(-|v|^2/vel_scale), still hard-gated to an all-zero command.
+        # iter4 phase-2: 2.5 -> 4.0 (gated to zero-command envs, so no cost to tracking).
+        # iter4 realistic: 4.0 -> 5.0 to hold the default stance harder under the (now gentler) disturbances.
+        weight=5.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
             "command_name": "base_velocity",
+            "vel_scale": 0.1,
         },
     )
     # foot lift reward -- reward feet above min_height when not in contact
     foot_lift = RewTerm(
         func=mdp.foot_lift_exp,
-        weight=0.1,  # tune: increase for stronger lift encouragement
+        weight=0.5,  # iter2: 0.1 -> 0.5 so clearing a foot actually pays vs the sliding/smoothness penalties
         params={
             "std": math.sqrt(0.01),  # 0.1 m e-folding height
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             "feet_body_names": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-            "min_height": 0.10,  # 10 cm (Round 3; was 5 cm)
+            "min_height": 0.03,  # iter2: 0.10 -> 0.03; 10 cm was unreachable so the policy skimmed/dragged instead
         },
     )
     # -- optional penalties
@@ -625,7 +710,9 @@ class CurriculumCfg:
         params={
             "up_thresh": 0.8,
             "down_thresh": 0.4,
-            "step": 0.05,
+            # iter4 realistic: step 0.05 -> 0.025 (half the increment, ~2x slower ramp, gentler jumps) so posture
+            # consolidates at each level instead of being outrun by big difficulty steps.
+            "step": 0.025,
             "dwell_steps": 6000,  # env steps per window, 24 per PPO iteration -> 250 iterations
             "settle_steps": 2000,  # one full episode: don't count episodes that began at the old difficulty
             "min_episodes": 500,

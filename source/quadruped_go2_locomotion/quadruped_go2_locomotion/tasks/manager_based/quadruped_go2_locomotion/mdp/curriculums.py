@@ -107,3 +107,41 @@ class difficulty_scale(ManagerTermBase):
             self._window_start, self._survived, self._total = now, 0, 0
 
         return torch.tensor(env.difficulty_scale)
+
+
+def get_curriculum_state(env) -> dict:
+    """Snapshot the curriculum state that lives in the running process and is NOT part of an RSL-RL checkpoint.
+
+    ``difficulty_scale`` (the domain-randomisation strength) and the per-env terrain levels are plain attributes of
+    the environment, so a restarted process would begin again at difficulty 0 and random terrain levels. Batched
+    training (scripts/train_batched.sh) saves this next to every checkpoint (``curriculum_<N>.pt``) and restores it
+    on resume with :func:`set_curriculum_state`.
+
+    Args:
+        env: The environment (wrapped or not).
+    """
+    base = env.unwrapped
+    state = {"difficulty_scale": float(getattr(base, "difficulty_scale", 0.0))}
+    terrain = base.scene.terrain
+    if getattr(terrain, "terrain_origins", None) is not None and hasattr(terrain, "terrain_levels"):
+        state["terrain_levels"] = terrain.terrain_levels.detach().cpu().clone()
+    return state
+
+
+def set_curriculum_state(env, state: dict) -> None:
+    """Restore a snapshot from :func:`get_curriculum_state`; the caller should reset the env afterwards.
+
+    The terrain levels are only restored when the env count matches the snapshot (a different ``--num_envs`` between
+    batches would make per-env levels meaningless); the difficulty scale is always restored.
+    """
+    base = env.unwrapped
+    base.difficulty_scale = float(state["difficulty_scale"])
+    terrain = base.scene.terrain
+    levels = state.get("terrain_levels")
+    if levels is None or getattr(terrain, "terrain_origins", None) is None:
+        return
+    if levels.shape != terrain.terrain_levels.shape:
+        print(f"[WARN] curriculum: terrain levels not restored (saved {tuple(levels.shape)}, env {tuple(terrain.terrain_levels.shape)})")
+        return
+    terrain.terrain_levels[:] = levels.to(terrain.terrain_levels.device)
+    terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]

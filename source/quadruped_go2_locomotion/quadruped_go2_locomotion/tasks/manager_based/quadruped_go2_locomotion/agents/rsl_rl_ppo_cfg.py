@@ -16,7 +16,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # New experiment dir: this policy drops base_lin_vel from the actor (47-dim), trains at kp 40 and ramps the mass /
     # COM / push randomisation with a curriculum (CurriculumCfg.difficulty), so it is not resume-compatible with the
     # old 50-dim / kp-25 checkpoints or with go2_kp40_no_lin_vel_ppo (full randomisation from iteration 0).
-    experiment_name = "go2_kp40_curriculum_ppo"
+    experiment_name = "go2_kp40_iter3_ppo"
     empirical_normalization = True
     # Asymmetric actor-critic: the actor sees only the hardware-available `policy` group (no base_lin_vel);
     # the critic sees the privileged `critic` group (includes base_lin_vel). The critic is discarded at
@@ -44,3 +44,4 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+

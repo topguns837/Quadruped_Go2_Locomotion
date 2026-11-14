@@ -27,12 +27,22 @@ from .commands import (
 from .rewards import (
     track_pitch_exp,
     track_lean_exp,
-    base_height_l2_pitch,
+    base_height_l1_pitch,
     hip_crossing_l2,
     foot_sliding_exp,
     foot_lift_exp,
     GaitDiagonalCoordination,
-    stand_still_default_pose,  # noqa: F401
+    stand_still_default_pose,
+    action_jerk_l2,
+    joint_torque_rate_l2,
+    track_lin_vel_xy_exp_rel,
+    track_ang_vel_z_exp_rel,
+    standing_when_commanded,
+    track_ang_vel_deficit,
+    action_rate_l2_clamped,
+    joint_vel_l2_clamped,
+    joint_acc_l2_clamped,
+    joint_torques_l2_clamped,  # noqa: F401
 )
 
 # Safety-net termination for non-finite (NaN/Inf) simulation state
