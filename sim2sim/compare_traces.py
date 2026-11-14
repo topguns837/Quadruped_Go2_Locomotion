@@ -24,17 +24,44 @@ import os
 
 import numpy as np
 
-# Observation layout of the 50-dim policy (see deploy_real.build_observation / ObservationsCfg).
-OBS_TERMS = [
-    ("base_lin_vel", 0, 3),
-    ("base_ang_vel", 3, 6),
-    ("projected_gravity", 6, 9),
-    ("command", 9, 14),
-    ("joint_pos_rel", 14, 26),
-    ("joint_vel", 26, 38),
-    ("last_action", 38, 50),
-]
+# Observation layouts by policy input size, mirroring deploy_real.OBS_LAYOUT (cmd_width, has_height_obs, has_lin_vel):
+#   47: current (no base_lin_vel, 5-wide command)   50: with base_lin_vel   51/52: legacy 6-wide command (+ base_height).
+# The term order is that of deploy_real.build_observation / ObservationsCfg. The slice of every term depends on the
+# size, so it is derived from the trace's own observation width and never assumed to be 50.
+OBS_LAYOUT = {
+    47: (5, False, False),
+    50: (5, False, True),
+    51: (6, False, True),
+    52: (6, True, True),
+}
 ACTION_SCALE = 0.25
+
+
+def obs_terms(obs_dim: int) -> list[tuple[str, int, int]]:
+    """[(term name, start, stop)] for an observation of width `obs_dim`."""
+    if obs_dim not in OBS_LAYOUT:
+        raise ValueError(f"unknown observation width {obs_dim}; known widths are {sorted(OBS_LAYOUT)}")
+    cmd_width, has_height, has_lin_vel = OBS_LAYOUT[obs_dim]
+    widths = []
+    if has_lin_vel:
+        widths.append(("base_lin_vel", 3))
+    widths += [("base_ang_vel", 3), ("projected_gravity", 3)]
+    if has_height:
+        widths.append(("base_height", 1))
+    widths += [("command", cmd_width), ("joint_pos_rel", 12), ("joint_vel", 12), ("last_action", 12)]
+    terms, i = [], 0
+    for name, w in widths:
+        terms.append((name, i, i + w))
+        i += w
+    assert i == obs_dim, (i, obs_dim)
+    return terms
+
+
+def term_slice(obs_dim: int, name: str) -> slice | None:
+    for n, a, b in obs_terms(obs_dim):
+        if n == name:
+            return slice(a, b)
+    return None
 
 
 def load(path: str) -> dict[str, np.ndarray]:
@@ -50,7 +77,7 @@ def load(path: str) -> dict[str, np.ndarray]:
 
 def term_stats(obs: np.ndarray, settle: int) -> dict[str, tuple[float, float, float, float]]:
     out = {}
-    for name, a, b in OBS_TERMS:
+    for name, a, b in obs_terms(obs.shape[1]):
         x = obs[settle:, a:b]
         out[name] = (float(x.mean()), float(x.std()), float(x.min()), float(x.max()))
     return out
@@ -68,15 +95,20 @@ def metrics(t: dict[str, np.ndarray], settle_s: float) -> dict[str, float]:
     dt = float(t["dt"]) if "dt" in t else 0.02
     s = int(round(settle_s / dt))
     m: dict[str, float] = {"steps_used": float(len(t["obs"]) - s), "duration_s": (len(t["obs"]) - s) * dt}
-    lv = t["lin_vel_com_b"] if "lin_vel_com_b" in t else t["obs"][:, 0:3]
-    lv = lv[s:]
-    m["lin_vel_xy_rms"] = float(np.sqrt((lv[:, :2] ** 2).sum(axis=1).mean()))
-    m["lin_vel_xy_peak"] = float(np.abs(lv[:, :2]).max())
-    m["lin_vel_x_mean"] = float(lv[:, 0].mean())
-    m["lin_vel_y_mean"] = float(lv[:, 1].mean())
-    av = t["obs"][s:, 3:6]
+    obs_dim = t["obs"].shape[1]
+    # base linear velocity: the trace's own field when present; else the observation's base_lin_vel term, which only
+    # a policy that observes it (not the 47-dim one) has
+    lv_slice = term_slice(obs_dim, "base_lin_vel")
+    lv = t["lin_vel_com_b"] if "lin_vel_com_b" in t else (t["obs"][:, lv_slice] if lv_slice is not None else None)
+    if lv is not None:
+        lv = lv[s:]
+        m["lin_vel_xy_rms"] = float(np.sqrt((lv[:, :2] ** 2).sum(axis=1).mean()))
+        m["lin_vel_xy_peak"] = float(np.abs(lv[:, :2]).max())
+        m["lin_vel_x_mean"] = float(lv[:, 0].mean())
+        m["lin_vel_y_mean"] = float(lv[:, 1].mean())
+    av = t["obs"][s:, term_slice(obs_dim, "base_ang_vel")]
     m["ang_vel_rms"] = float(np.sqrt((av**2).sum(axis=1).mean()))
-    jv = t["obs"][s:, 26:38]
+    jv = t["obs"][s:, term_slice(obs_dim, "joint_vel")]
     m["joint_vel_rms"] = float(np.sqrt((jv**2).mean()))
     act = t["action"][s:]
     m["action_step_rms"] = float(np.sqrt((np.diff(act, axis=0) ** 2).mean()))
@@ -103,7 +135,10 @@ def main() -> None:
 
     print(f"=== Observation terms (mean / std over steps after {args.settle_s:.1f} s; shown per scalar element) ===")
     stats = [term_stats(t["obs"], settle) for t in traces]
-    for term, _, _ in OBS_TERMS:
+    widths = {t["obs"].shape[1] for t in traces}
+    if len(widths) != 1:
+        raise SystemExit(f"traces have different observation widths {sorted(widths)}: not the same policy")
+    for term, _, _ in obs_terms(widths.pop()):
         print(f"\n{term}")
         for n, st in zip(names, stats):
             mean, std, lo, hi = st[term]

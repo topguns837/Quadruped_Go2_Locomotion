@@ -23,7 +23,7 @@ source/quadruped_go2_locomotion/          # Isaac Lab extension package
       agents/rsl_rl_ppo_cfg.py        # PPO hyperparameters
       mdp/
         commands.py                    # UniformVelocityCommandCfgWithPitch (extends isaac lab velocity commands with pitch/lean)
-        rewards.py                     # Custom rewards: track_pitch_exp, track_lean_exp, base_height_l2_pitch, hip_crossing_l2
+        rewards.py                     # Custom rewards: track_pitch_exp, track_lean_exp, base_height_l1_pitch, hip_crossing_l2
         observations.py               # Depth observation term
         curriculums.py                # terrain_levels_vel curriculum
 scripts/
@@ -95,6 +95,10 @@ Then use the same pattern: `isaaclab-python -c "..."`
 # Resume training
 ../IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2 --resume --headless
 
+# Batched training: 2000-iteration chunks, each in a fresh process so host RAM and VRAM are released between chunks.
+# Run inside the container; resumes from the latest checkpoint and writes to ONE folder (train.py --run_dir).
+BATCH=2000 TARGET=18000 EXTRA="--headless --num_envs 2048" bash scripts/train_batched.sh
+
 # Play a trained checkpoint
 ../IsaacLab/isaaclab.sh -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play --num_envs 1
 
@@ -117,8 +121,8 @@ Then use the same pattern: `isaaclab-python -c "..."`
 - **Observations**: base_lin_vel, base_ang_vel, projected_gravity, velocity_commands, joint_pos, joint_vel, last_action (with additive uniform noise)
 - **Commands** (5-dim: lin_x, lin_y, ang_z, pitch, lean): lin_vel_x [-1,1], lin_vel_y [-1,1], ang_vel_z [-1,1], heading [-pi,pi], pitch (`ang_pos_y`) [-0.6,0.6], lean (`ang_pos_x`) [-0.3,0.3]. No height command: there is no reliable way to measure base height on real hardware, so the robot is instead held near a fixed default stance height (0.337m) purely via `height_penalty` -- see `mdp/commands.py`'s module docstring.
 - **Actions**: joint position control (scale=0.25, default offset), no clipping. Each applied target lags the policy output by 0-2 control steps (random per env per episode, `mdp/actions.py` `DelayedJointPositionAction`); `last_action` stays the policy's own undelayed output
-- **Real-hardware parity (2026-10-13)**: PhysX's hard joint-speed clamp is DISABLED (`PHYSX_JOINT_SPEED_LIMIT=500` in `unitree_go2witharm_cfg.py`; before this every policy was trained with a hidden clamp of 30.1 rad/s hip/thigh and 15.7 calf that the real robot and MuJoCo do not have, so **all policies trained before 2026-10-13 are not valid for hardware**). Nominal joint armature 0.01 (`JOINT_ARMATURE`, an assumption until measured) plus startup randomisation in `EventCfg`: friction static 0.5-1.2 / dynamic 0.4-1.0, base mass -1..+2 kg, PD gains x0.9-1.1, armature x0.5-2.0, joint friction 0-0.1 Nm, pushes +/-0.5 m/s every 8-15 s. `QuadrupedLocomotionEnvCfg_PLAY` turns all of that off (nominal physics, no delay) so play and sim2sim compare like for like. No safety layer is in training by design; any robot-side capping is added in deploy, not here
-- **Rewards**: track_lin_vel_xy_exp(10.0), track_ang_vel_z_exp(2.0), track_pitch_exp(3.0, std 0.2), track_lean_exp(3.0, std 0.141), lin_vel_z_l2(-2.0), ang_vel_xy_l2(-0.05), dof_torques_l2(-1e-5), dof_acc_l2(-2.5e-7), action_rate_l2(-0.01), undesired_contacts(-1.0), undesired_contacts_arm(-1.0), height_penalty(-1.65, target_height=0.337), hip_crossing(-0.5), foot_sliding(-1.0, on contact-point velocity), foot_lift(0.1), gait_coordination(1.0, dense trot shaping, scaled by command magnitude), stand_still(1.0, four feet planted in default pose, scaled by 1 - command magnitude), dof_pos_limits(-1.0), joint_deviation(-0.005). `patches/round3_weights_and_height.patch` no longer applies (its height hunks conflict with the height-command removal); kept as a historical artifact only
+- **Real-hardware parity (2026-10-13)**: PhysX's hard joint-speed clamp is DISABLED (`PHYSX_JOINT_SPEED_LIMIT=500` in `unitree_go2witharm_cfg.py`; before this every policy was trained with a hidden clamp of 30.1 rad/s hip/thigh and 15.7 calf that the real robot and MuJoCo do not have, so **all policies trained before 2026-10-13 are not valid for hardware**). Nominal joint armature 0.01 (`JOINT_ARMATURE`, an assumption until measured) plus startup randomisation in `EventCfg`: friction static 0.5-1.2 / dynamic 0.4-1.0, base mass -1..+2 kg, PD gains x0.9-1.1, armature x0.5-2.0, joint friction 0-0.1 Nm, pushes +/-0.5 m/s every 8-15 s. iter4 realistic (2026-11-08): disturbance magnitudes reduced to realistic sim-to-real levels (external force +-40->+-15 N, torque +-5->+-2 Nm, base mass +-5->+-2 kg, COM/armature tightened), difficulty step 0.05->0.025 (slower ramp), and posture weights raised (height_penalty -15, stand_still 5.0, fall penalty -750); push and action delay scale with the difficulty curriculum. `QuadrupedLocomotionEnvCfg_PLAY` turns all of that off (nominal physics, no delay) so play and sim2sim compare like for like. No safety layer is in training by design; any robot-side capping is added in deploy, not here
+- **Rewards**: track_lin_vel_xy_exp(10.0), track_ang_vel_z_exp(2.0), track_pitch_exp(3.0, std 0.2), track_lean_exp(3.0, std 0.141), lin_vel_z_l2(-2.0), ang_vel_xy_l2(-0.05), dof_torques_l2(-1e-5), dof_acc_l2(-2.5e-7), action_rate_l2(-0.01), undesired_contacts(-1.0), undesired_contacts_arm(-1.0), height_penalty(-15.0 from iter4 realistic, L1 abs-error, target_height=0.337), hip_crossing(-0.5), foot_sliding(-1.0, on contact-point velocity), foot_lift(0.1), gait_coordination(1.0, dense trot shaping, scaled by command magnitude), stand_still(5.0 from iter4 realistic, zero velocity + four feet planted in default pose, gated to a fully zero command), dof_pos_limits(-1.0), joint_deviation(-0.005). `patches/round3_weights_and_height.patch` no longer applies (its height hunks conflict with the height-command removal); kept as a historical artifact only
 - **Terminations**: time_out (40s), body_contact (base touch >1.0N), terrain_out_of_bounds (a truncation; the terrain border is 70m so it should never fire)
 - **Standing envs**: rel_standing_envs=0.12 (zero command on every component)
 - **PPO**: 10000 max iterations, 24 steps/env, lr=1e-3, gamma=0.99, hidden=[256,512,128], elu, checkpoint every 100 iterations
@@ -160,13 +164,15 @@ Reward terms in `mdp/rewards.py` follow the Isaac Lab MDP pattern: `def reward_t
 
 ## Working with Commands
 
-The pitch/lean command extension in `mdp/commands.py` adds components [3] (pitch) and [4] (lean) to the base command buffer (5-dim total). There is no height component: see that file's module docstring for why, and `mdp/rewards.py`'s `base_height_l2_pitch` for how height is regulated instead (a fixed `target_height`, not a command). The robot should lean forward/backward while walking toward the sampled pitch angle. When modifying commands, ensure observation terms (e.g., `velocity_commands`) correctly feed the command values to the policy.
+The pitch/lean command extension in `mdp/commands.py` adds components [3] (pitch) and [4] (lean) to the base command buffer (5-dim total). There is no height component: see that file's module docstring for why, and `mdp/rewards.py`'s `base_height_l1_pitch` for how height is regulated instead (a fixed `target_height`, not a command). The robot should lean forward/backward while walking toward the sampled pitch angle. When modifying commands, ensure observation terms (e.g., `velocity_commands`) correctly feed the command values to the policy.
 
 ## Training Artifacts
 
 - Checkpoints saved to `logs/rsl_rl/<experiment_name>/<timestamp>/model_<N>.pt`
 - Exported policy (JIT + ONNX) in `logs/rsl_rl/<experiment_name>/<timestamp>/exported/policy.pt`
 - Config dumps in `logs/rsl_rl/<experiment_name>/<timestamp>/params/env.yaml` and `params/agent.yaml`
+- `curriculum_<N>.pt` next to every `model_<N>.pt` (written by `train.py`): the domain-randomisation `difficulty_scale` and the per-env terrain levels. They live in the env process, not in the RSL-RL checkpoint, so restoring them on `--resume` is what keeps a restarted process (batched training) from silently restarting the curriculum at difficulty 0. A checkpoint without one (older runs) prints a warning and the curriculum restarts
+- Batched runs (`scripts/train_batched.sh`): RSL-RL names a batch's last checkpoint `model_{end-1}` (`model_1999`, `model_3999`, ...) and a resume restarts at the loaded checkpoint's number, so one iteration repeats per batch. The adaptive learning rate and the logged episode-reward buffers also restart each batch (a short transient in `Train/mean_reward` right after each seam, not a regression)
 
 ## Git updates
 

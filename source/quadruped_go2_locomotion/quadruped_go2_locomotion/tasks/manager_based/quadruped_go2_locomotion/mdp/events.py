@@ -102,6 +102,24 @@ class randomize_base_com_curriculum(ManagerTermBase):
         asset.root_physx_view.set_coms(coms, env_ids)
 
 
+def push_velocity_curriculum(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    max_velocity: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Kick the base with a random planar velocity ``U(-max_velocity * s, +max_velocity * s)`` on x and y.
+
+    Same as ``isaaclab.envs.mdp.push_by_setting_velocity`` (the velocity is ADDED to the current root velocity), but
+    the range follows the curriculum difficulty ``s``: at 0 the kick is exactly zero, at 1 it is ``max_velocity``.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    s = _scale(env)
+    vel_w = asset.data.root_vel_w[env_ids]
+    vel_w[:, 0:2] += math_utils.sample_uniform(-max_velocity * s, max_velocity * s, (len(env_ids), 2), asset.device)
+    asset.write_root_velocity_to_sim(vel_w, env_ids=env_ids)
+
+
 def push_force_curriculum(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,

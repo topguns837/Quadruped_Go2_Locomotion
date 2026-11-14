@@ -61,6 +61,17 @@ parser.add_argument(
 )
 parser.add_argument("--trace_steps", type=int, default=1100, help="Control steps to record with --trace_out.")
 parser.add_argument(
+    "--scenario",
+    type=str,
+    default=None,
+    help=(
+        "With --trace_out: replay a scenario YAML (sim2sim/scenarios/*.yaml, or a schedule written by "
+        "sim2sim/random_commands.py / sim2sim_mujoco.py --save_scenario) as fixed-command segments instead of a "
+        "zero command, so the trace can be compared with the MuJoCo run of the same file. The run lasts exactly "
+        "the scenario's length (--trace_steps is ignored) and episode timeouts are disabled, so only falls reset."
+    ),
+)
+parser.add_argument(
     "--trace_deterministic_reset",
     action="store_true",
     default=False,
@@ -79,6 +90,37 @@ parser.add_argument(
         "scripts/live_dashboard.py --logdir logs/play_dashboard."
     ),
 )
+parser.add_argument(
+    "--no_depth_view",
+    action="store_true",
+    default=False,
+    help=(
+        "Disable the live depth-camera viewer window. The viewer is shown automatically whenever the task "
+        "has a 'depth_camera' sensor and the GUI is up (not --headless). It renders the actual sensor tensor "
+        "the policy consumes, not the viewport RGB render the Camera Inspector shows."
+    ),
+)
+parser.add_argument(
+    "--depth_view_every",
+    type=int,
+    default=2,
+    help="Refresh the depth viewer every N control steps (higher = cheaper). Only affects the viewer.",
+)
+parser.add_argument(
+    "--depth_view_env",
+    type=int,
+    default=0,
+    help="Which environment's depth image the viewer/--save_depth_dir shows.",
+)
+parser.add_argument(
+    "--save_depth_dir",
+    type=str,
+    default=None,
+    help=(
+        "Also save a colorized depth PNG every --depth_view_every steps to this directory (works headless; "
+        "a fallback for when the live omni.ui window isn't available)."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -88,6 +130,10 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+# The stairs task carries a depth camera in its observations, so the RTX sensor pipeline must be on. Force
+# it for any -Stairs task so --enable_cameras never has to be passed by hand.
+if args_cli.task is not None and "Stairs" in args_cli.task:
+    args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -95,6 +141,16 @@ sys.argv = [sys.argv[0]] + hydra_args
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+# Enable the Camera Inspector tool (Tools -> Sensors -> Camera Inspector) by default, so it doesn't need
+# to be manually turned on via Window -> Extensions every session. Harmless to enable even headless (it's
+# a GUI panel; it just won't be visible with no window), so no args_cli.headless gate needed.
+import omni.kit.app  # noqa: E402
+
+if not args_cli.headless:
+    omni.kit.app.get_app().get_extension_manager().set_extension_enabled_immediate(
+        "isaacsim.util.camera_inspector", True
+    )
 
 """Rest everything follows."""
 
@@ -194,6 +250,119 @@ def _log_live_plot(writer, env, target_height: float):
     writer.flush()
 
 
+class _DepthViewer:
+    """Live view of the depth sensor's actual output tensor -- the thing the vision policy will consume --
+    not the viewport RGB render the Camera Inspector shows. Depth is colorized (near = red ... far = blue,
+    invalid/no-return pixels = magenta) so step edges and sensor holes are obvious at a glance; the window
+    title carries min/max/mean depth and the invalid-pixel fraction as a numeric cross-check.
+
+    Reads the sensor's data type and clipping range straight off the camera cfg, so it works both before and
+    after the planned switch of data_types (distance_to_camera -> distance_to_image_plane) with no change
+    here. Degrades gracefully: any omni.ui issue disables the live window but leaves play running (and
+    --save_depth_dir still writes PNGs); with --save_depth_dir alone it works headless.
+    """
+
+    # near -> far color ramp (red, orange, yellow, green, blue), RGB in [0, 1].
+    _STOPS = [
+        (1.00, 0.16, 0.16),
+        (1.00, 0.63, 0.00),
+        (0.90, 0.90, 0.00),
+        (0.00, 0.82, 0.00),
+        (0.16, 0.31, 1.00),
+    ]
+
+    def __init__(self, camera, data_type: str, near: float, far: float, env_idx: int, save_dir: str | None,
+                 show_window: bool):
+        self._camera = camera
+        self._data_type = data_type
+        self._near = float(near)
+        self._far = float(far)
+        self._env_idx = env_idx
+        self._save_dir = save_dir
+        self._stops = None  # built lazily on the tensor's device
+        self._save_count = 0
+        self._window = None
+        self._provider = None
+        self._label = None
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+        if show_window:
+            self._try_build_window()
+
+    def _try_build_window(self):
+        try:
+            import omni.ui as ui
+
+            w, h = int(self._camera.cfg.width), int(self._camera.cfg.height)
+            scale = max(1, int(round(480 / max(w, h))))
+            self._provider = ui.ByteImageProvider()
+            self._window = ui.Window("Depth Camera (policy input)", width=w * scale + 20, height=h * scale + 60)
+            with self._window.frame:
+                with ui.VStack(spacing=4):
+                    self._label = ui.Label("depth: waiting for first frame", height=18)
+                    ui.ImageWithProvider(self._provider, width=w * scale, height=h * scale)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] depth viewer: could not create omni.ui window ({exc}); live view disabled.")
+            self._window = None
+            self._provider = None
+
+    def _colorize(self, depth: torch.Tensor) -> torch.Tensor:
+        """depth: (H, W) float tensor -> (H, W, 4) uint8 RGBA on the same device."""
+        if self._stops is None:
+            self._stops = torch.tensor(self._STOPS, device=depth.device, dtype=torch.float32)
+        invalid = ~torch.isfinite(depth) | (depth <= 0.0)
+        t = ((depth - self._near) / max(self._far - self._near, 1e-6)).clamp(0.0, 1.0)
+        n = self._stops.shape[0] - 1
+        scaled = (t * n).nan_to_num(0.0)
+        idx = scaled.floor().clamp(0, n - 1).long()
+        frac = (scaled - idx).unsqueeze(-1)
+        rgb = self._stops[idx] * (1.0 - frac) + self._stops[idx + 1] * frac
+        rgb[invalid] = torch.tensor([1.0, 0.0, 1.0], device=depth.device)
+        rgba = torch.cat([rgb, torch.ones_like(rgb[..., :1])], dim=-1)
+        return (rgba * 255.0).to(torch.uint8)
+
+    def update(self, step: int):
+        if self._window is None and self._save_dir is None:
+            return
+        out = self._camera.data.output.get(self._data_type)
+        if out is None or out.shape[0] <= self._env_idx:
+            return
+        depth = out[self._env_idx, ..., 0]
+        finite = depth[torch.isfinite(depth) & (depth > 0.0)]
+        invalid_frac = 1.0 - (finite.numel() / depth.numel())
+        stats = (
+            f"depth [{self._data_type}]  min {finite.min().item():.2f}  max {finite.max().item():.2f}  "
+            f"mean {finite.mean().item():.2f} m  invalid {invalid_frac * 100:.1f}%"
+            if finite.numel() > 0
+            else f"depth [{self._data_type}]  all pixels invalid"
+        )
+        rgba = self._colorize(depth).cpu().numpy()
+        if self._label is not None:
+            self._label.text = stats
+        if self._provider is not None:
+            h, w = rgba.shape[:2]
+            try:
+                self._provider.set_bytes_data(rgba.reshape(-1).tolist(), [w, h])
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] depth viewer: set_bytes_data failed ({exc}); disabling live view.")
+                self._provider = None
+                self._window = None
+        if self._save_dir is not None:
+            self._save_png(rgba, step)
+
+    def _save_png(self, rgba, step: int):
+        path = os.path.join(self._save_dir, f"depth_{self._save_count:05d}_step{step}.png")
+        self._save_count += 1
+        try:
+            import matplotlib.image as mpimg
+
+            mpimg.imsave(path, rgba)
+        except Exception:  # noqa: BLE001
+            import numpy as np
+
+            np.save(path.replace(".png", ".npy"), rgba)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -233,6 +402,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         }
         env_cfg.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         print("[INFO] trace: deterministic reset (default pose, zero velocity).")
+
+    if args_cli.scenario:
+        if not args_cli.trace_out:
+            raise SystemExit("--scenario needs --trace_out (it replays the scenario while recording the trace).")
+        # A 40 s episode timeout would reset the robot mid-schedule and be mistaken for a fall: only falls reset.
+        env_cfg.episode_length_s = 1.0e6
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
@@ -333,7 +508,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             cmd_term.set_manual_command([0.0, 0.0, 0.0, 0.0, 0.0])
         trace = {k: [] for k in ("obs", "action", "target", "joint_pos", "joint_vel", "torque", "root_pos",
                                  "root_quat", "lin_vel_origin_b", "lin_vel_com_b", "ang_vel_b", "foot_force",
-                                 "command", "done")}
+                                 "command", "done", "fell")}
+        scenario_cmds = None
+        if args_cli.scenario:
+            import yaml
+
+            _dt = env.unwrapped.step_dt
+            scenario_cmds = []
+            for _seg in yaml.safe_load(open(args_cli.scenario))["segments"]:
+                _cmd = [float(v) for v in _seg["command"]]
+                if len(_cmd) != 5:
+                    raise ValueError(f"scenario segment {_seg['name']!r}: command must have 5 values")
+                scenario_cmds += [_cmd] * round(float(_seg["duration"]) / _dt)
+            args_cli.trace_steps = len(scenario_cmds)
+            cmd_term.set_manual_command(scenario_cmds[0])
+            print(f"[INFO] trace: replaying scenario {args_cli.scenario} ({len(scenario_cmds)} steps)")
         _robot = env.unwrapped.scene["robot"]
         _sensor = env.unwrapped.scene["contact_forces"]
         _foot_ids = [_sensor.body_names.index(n) for n in ("FL_foot", "FR_foot", "RL_foot", "RR_foot")]
@@ -363,6 +552,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # (see RewardsCfg.height_penalty in quadruped_go2_locomotion_env_cfg.py).
         live_plot_target_height = env_cfg.rewards.height_penalty.params["target_height"]
 
+    # Debug visualization: draw an RGB coordinate-frame gizmo at the depth camera's reported world pose
+    # each step, if this task has one (only the stairs tasks do). Lets you see exactly where the sensor
+    # thinks it is/which way it thinks it's facing, directly in the viewport -- useful for diagnosing
+    # camera mount-pose issues without reading raw tensors.
+    depth_camera_marker = None
+    if "depth_camera" in env.unwrapped.scene.keys():
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        from isaaclab.markers.config import FRAME_MARKER_CFG
+
+        # Single-prototype config, not a copy of FRAME_MARKER_CFG directly -- that one bundles a SECOND
+        # "connecting_line" prototype (meant for a two-point line-plus-frame visualization), which left
+        # marker_indices ambiguous for our single-point use and is the likely reason nothing appeared.
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/DepthCameraFrame",
+            markers={"frame": FRAME_MARKER_CFG.markers["frame"]},
+        )
+        marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)  # small, the real D435f housing is ~90mm
+        depth_camera_marker = VisualizationMarkers(marker_cfg)
+        depth_camera_marker.set_visibility(True)
+
+    # Live depth viewer: shows the sensor tensor the policy consumes (see _DepthViewer). Auto-on when the
+    # task has a depth camera; needs --enable_cameras for the sensor to produce output. --no_depth_view to
+    # suppress, --save_depth_dir to also dump PNGs (works headless).
+    depth_viewer = None
+    if "depth_camera" in env.unwrapped.scene.keys() and (not args_cli.no_depth_view or args_cli.save_depth_dir):
+        camera = env.unwrapped.scene["depth_camera"]
+        data_type = camera.cfg.data_types[0]
+        near, far = camera.cfg.spawn.clipping_range
+        depth_viewer = _DepthViewer(
+            camera=camera,
+            data_type=data_type,
+            near=near,
+            far=far,
+            env_idx=args_cli.depth_view_env,
+            save_dir=args_cli.save_depth_dir,
+            show_window=not args_cli.headless and not args_cli.no_depth_view,
+        )
+
     dt = env.unwrapped.step_dt
 
     # reset environment
@@ -373,6 +600,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if trace is not None and scenario_cmds is not None:
+                _i = len(trace["obs"])
+                if _i == 0 or scenario_cmds[_i] != scenario_cmds[_i - 1]:
+                    cmd_term.set_manual_command(scenario_cmds[_i])
+                    # the observation computed at the end of the last step still holds the previous command
+                    obs = env.get_observations()
             # agent stepping
             actions = policy(obs)
             if trace is not None:
@@ -399,12 +632,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     env.unwrapped.command_manager.get_command("base_velocity")[0, :5].cpu().numpy().copy()
                 )
                 trace["done"].append(float(dones[0].item()))
+                # a real fall (base/arm touched the ground), as opposed to a timeout reset
+                trace["fell"].append(float(env.unwrapped.termination_manager.terminated[0].item()))
                 if len(trace["obs"]) >= args_cli.trace_steps:
                     break
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if live_plot_writer is not None:
             _log_live_plot(live_plot_writer, env, live_plot_target_height)
+        if depth_camera_marker is not None:
+            camera = env.unwrapped.scene["depth_camera"]
+            depth_camera_marker.visualize(
+                translations=camera.data.pos_w,
+                orientations=camera.data.quat_w_world,
+                marker_indices=[0] * camera.data.pos_w.shape[0],
+            )
+        if depth_viewer is not None:
+            _vstep = env.unwrapped.common_step_counter
+            if _vstep % args_cli.depth_view_every == 0:
+                depth_viewer.update(_vstep)
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

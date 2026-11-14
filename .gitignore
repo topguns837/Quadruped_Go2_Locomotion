@@ -29,6 +29,13 @@
 # payload. Keep the two in sync, or repoint the payload inside go2withOpenXstatic.usd at the `.usda` instead.
 !/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/openManipulator/open_manipulator_x_static.usd
 
+# Third deliberate exception, same reason as the two above: the stairs task's visual-only RealSense D435
+# mesh (converted from the Collada file bundled with Isaac Sim's own Kaya-robot URDF sample, since Isaac
+# Sim's asset library only ships a D455, not a D435) has no other distribution mechanism -- it isn't
+# pulled from Nucleus at runtime, so quadruped_go2_locomotion_stairs_env_cfg.py's realsense_mesh entry
+# can't load it at all without this file present.
+!/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/realsense_d435/realsense_d435.usd
+
 # Python
 .DS_Store
 **/*.egg-info/

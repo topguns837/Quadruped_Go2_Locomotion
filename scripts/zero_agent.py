@@ -23,6 +23,11 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
+# The stairs task carries a depth camera in its observations, so the RTX sensor pipeline must be on. Force
+# it for any -Stairs task so --enable_cameras never has to be passed by hand.
+if args_cli.task is not None and "Stairs" in args_cli.task:
+    args_cli.enable_cameras = True
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app

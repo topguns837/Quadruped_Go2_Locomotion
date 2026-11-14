@@ -210,7 +210,13 @@ class LiveDashboard:
             try:
                 while True:
                     self._update(frame)
-                    self.fig.savefig(output_path)
+                    # Write to a temp file and rename it over the target: savefig() straight onto output_path
+                    # truncates and rewrites the file in place, and feh memory-maps the image, so a truncation
+                    # while it is mapped (e.g. a second dashboard on the same PNG) kills it with a bus error.
+                    # os.replace is atomic, so a viewer always sees a complete file and keeps its old inode.
+                    tmp_path = f"{output_path}.{os.getpid()}.tmp"
+                    self.fig.savefig(tmp_path, format="png")
+                    os.replace(tmp_path, output_path)
                     frame += 1
                     time.sleep(interval_ms / 1000)
             except KeyboardInterrupt:

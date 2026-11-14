@@ -43,6 +43,11 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+# The stairs task carries a depth camera in its observations, so the RTX sensor pipeline must be on. Force
+# it for any -Stairs task so --enable_cameras never has to be passed by hand (and training doesn't silently
+# start without the depth stream the policy needs).
+if args_cli.task is not None and "Stairs" in args_cli.task:
+    args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -153,6 +158,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"Exact experiment name requested from command line: {log_dir}")
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
+    if args_cli.run_dir:
+        # Batched training (scripts/train_batched.sh): reuse one fixed folder so every batch appends to the same
+        # checkpoints and tfevents instead of starting a new timestamped run.
+        log_dir = args_cli.run_dir
     log_dir = os.path.join(log_root_path, log_dir)
 
     # set the IO descriptors export flag if requested
@@ -203,11 +212,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+
+    # Curriculum state (domain-randomisation difficulty, terrain levels) lives in the env process, not in the RSL-RL
+    # checkpoint, so a restarted process (batched training) would silently begin again at difficulty 0. Save it next
+    # to every checkpoint as curriculum_<N>.pt and restore it below on resume.
+    import re
+
+    from quadruped_go2_locomotion.tasks.manager_based.quadruped_go2_locomotion.mdp.curriculums import (
+        get_curriculum_state,
+        set_curriculum_state,
+    )
+
+    _save_checkpoint = runner.save
+
+    def _save_with_curriculum(path, *save_args, **save_kwargs):
+        _save_checkpoint(path, *save_args, **save_kwargs)
+        torch.save(get_curriculum_state(env), re.sub(r"model_(\d+)\.pt$", r"curriculum_\1.pt", path))
+
+    runner.save = _save_with_curriculum
+
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        curriculum_path = re.sub(r"model_(\d+)\.pt$", r"curriculum_\1.pt", resume_path)
+        if os.path.isfile(curriculum_path):
+            curriculum_state = torch.load(curriculum_path, map_location="cpu")
+            set_curriculum_state(env, curriculum_state)
+            env.reset()  # robots re-spawn on the restored terrain levels
+            print(f"[INFO]: Restored curriculum from {curriculum_path}: difficulty={curriculum_state['difficulty_scale']:.3f}")
+        else:
+            print(f"[WARN]: No curriculum state next to {resume_path}; difficulty and terrain levels restart from scratch.")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

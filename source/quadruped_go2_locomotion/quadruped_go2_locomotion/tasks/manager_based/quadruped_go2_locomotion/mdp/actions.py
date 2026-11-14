@@ -45,7 +45,11 @@ class DelayedJointPositionAction(JointPositionAction):
 
     def _resample_delay(self, env_ids: Sequence[int] | slice | torch.Tensor) -> None:
         n = self.num_envs if isinstance(env_ids, slice) else len(env_ids)
-        self._delay[env_ids] = torch.randint(0, self._max_delay + 1, (n,), device=self.device)
+        # The latency range follows the curriculum difficulty (env.difficulty_scale, 0 -> 1): none at 0, the full
+        # 0..max_delay_steps at 1. When no curriculum is running the attribute is absent and the full range applies.
+        scale = min(max(float(getattr(self._env, "difficulty_scale", 1.0)), 0.0), 1.0)
+        effective_max = int(round(self._max_delay * scale))
+        self._delay[env_ids] = torch.randint(0, effective_max + 1, (n,), device=self.device)
 
     def process_actions(self, actions: torch.Tensor):
         super().process_actions(actions)  # raw_actions and the undelayed processed target

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.assets import Articulation
+from isaaclab.envs.mdp import rewards as _stock
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import wrap_to_pi
 
@@ -79,16 +80,22 @@ def track_lean_exp(
     return reward
 
 
-def base_height_l2_pitch(
+def base_height_l1_pitch(
     env: ManagerBasedRLEnv,
     command_name: str,
     target_height: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pitch_sensitivity: float = 0.25,
     lean_sensitivity: float = 0.08,
-    max_penalty: float = 4.0,
+    max_penalty: float = 2.0,
 ) -> torch.Tensor:
     """Height penalty toward a fixed default stance height, with a small pitch/lean allowance.
+
+    **L1 (absolute error), not L2.** A quadratic height penalty is flat near zero error -- at -4 weight a
+    ~10 cm droop logged only ~0.04/s against ~+14/s of tracking rewards, so the policy knelt (front legs
+    folded, base low) nearly for free, and raising the weight enough to bite at 5 cm made normal transients
+    (foot-strike, pitch change) spike and destabilise. L1 has a constant gradient: a 5 cm droop always costs
+    ``0.05 * |weight|``, a 10 cm droop ``0.10 * |weight|``, with no transient blow-up. See the iter-3 plan.
 
     There is no height COMMAND any more (see mdp.commands.UniformVelocityCommandWithPitch's docstring for
     why: no reliable height measurement exists on real hardware). `target_height` is a fixed constant
@@ -97,10 +104,10 @@ def base_height_l2_pitch(
     isn't penalized for naturally sitting slightly lower/higher while pitching or leaning.
 
     `max_penalty` is defence in depth: `root_pos_w[:, 2]` has no physical bound (unlike `joint_pos`), so an
-    unclamped squared error can reach millions if a robot ever leaves the terrain and free-falls (observed:
-    the world edge is at +-148 m, robots walked off it, and one fall reached 4e6 here). The primary fix is a
-    wider terrain border plus the `terrain_out_of_bounds` termination; this clamp only bounds the damage.
-    max_penalty=4.0 saturates at a 2 m height error, far beyond any normal operation.
+    unclamped absolute error can reach hundreds if a robot ever leaves the terrain and free-falls (observed:
+    the world edge is at +-148 m, robots walked off it here). The primary fix is a wider terrain border plus
+    the `terrain_out_of_bounds` termination; this clamp only bounds the damage. max_penalty=2.0 saturates at
+    a 2 m height error, far beyond any normal operation.
 
     Args:
         command_name: Name of the command to read the current pitch/lean from.
@@ -121,9 +128,9 @@ def base_height_l2_pitch(
     cmd_lean = cmd[:, 4]
     # Compute adaptive target height: fixed target height + offset from commanded angles
     adaptive_target = target_height + pitch_sensitivity * torch.abs(cmd_pitch) + lean_sensitivity * torch.abs(cmd_lean)
-    # L2 penalty from adaptive target, clamped -- see max_penalty above
-    penalty = torch.clamp(torch.square(asset.data.root_pos_w[:, 2] - adaptive_target), max=max_penalty)
-    diagnostics.log_step(env, "reward.base_height_l2_pitch", penalty)
+    # L1 penalty (absolute height error) from adaptive target, clamped -- see max_penalty above
+    penalty = torch.clamp(torch.abs(asset.data.root_pos_w[:, 2] - adaptive_target), max=max_penalty)
+    diagnostics.log_step(env, "reward.base_height_l1_pitch", penalty)
     return penalty
 
 
@@ -379,6 +386,27 @@ def _motion_blend(env: ManagerBasedRLEnv, command_name: str, cmd_scale: float) -
     return torch.clamp(speed / cmd_scale, 0.0, 1.0)
 
 
+# Hard command gates (replace the graded _motion_blend for the stand/gait split). The stand reward is a bool
+# mask on the WHOLE command (lin_x, lin_y, ang_z, pitch, lean): the instant any term is non-zero the policy must
+# track it, not stand. Gait shaping is gated on the velocity terms only (a trot only applies when locomoting).
+# 0.01 = the manual slider's resolution. Not 1e-4: the heading controller commands yaw = 0.5 * heading_error, which
+# decays toward zero but is never exactly zero, so a tiny threshold would flip a settled env between the stand and
+# gait regimes on numerical dust. Anything a human can set on the slider (>= 0.01) still counts as commanded.
+_CMD_EPS = 1e-2
+
+
+def _velocity_commanded(env: ManagerBasedRLEnv, command_name: str, eps: float = _CMD_EPS) -> torch.Tensor:
+    """True per env when any of lin_x / lin_y / ang_z is commanded non-zero."""
+    cmd = env.command_manager.get_command(command_name)
+    return (cmd[:, :3].abs() > eps).any(dim=-1)
+
+
+def _any_commanded(env: ManagerBasedRLEnv, command_name: str, eps: float = _CMD_EPS) -> torch.Tensor:
+    """True per env when any of lin_x / lin_y / ang_z / pitch / lean is commanded non-zero."""
+    cmd = env.command_manager.get_command(command_name)
+    return (cmd[:, :5].abs() > eps).any(dim=-1)
+
+
 class GaitDiagonalCoordination(ManagerTermBase):
     """Dense reward for a trot: weight alternating between the FL+RR and FR+RL diagonals.
 
@@ -425,7 +453,8 @@ class GaitDiagonalCoordination(ManagerTermBase):
         airborne = total < min_total_force
         s = torch.where(airborne, torch.zeros_like(total), (fa - fb) / total.clamp(min=min_total_force))
         self._ema += self._alpha * (s - self._ema)
-        reward = torch.abs(s) * (1.0 - torch.abs(self._ema)) * _motion_blend(env, command_name, cmd_scale)
+        # Hard-gated on the velocity command (full credit when locomoting, 0 when not); cmd_scale is unused now.
+        reward = torch.abs(s) * (1.0 - torch.abs(self._ema)) * _velocity_commanded(env, command_name).float()
         diagnostics.log_step(env, "reward.gait_coordination", reward)
         return reward
 
@@ -436,17 +465,20 @@ def stand_still_default_pose(
     feet_body_names: list[str],
     command_name: str = "base_velocity",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    cmd_scale: float = 0.15,
     contact_threshold: float = 1.0,
     pose_scale: float = 0.5,
-    posture_cmd_tol: float = 0.05,
+    vel_scale: float = 0.1,
 ) -> torch.Tensor:
-    """Reward standing on all four feet in the default joint pose when the command says stand.
+    """Reward standing still -- zero velocity, four feet planted, default joint pose -- when the command is zero.
 
-    ``feet_planted * default_pose``: feet_planted is the fraction of feet with contact force above
+    ``feet_planted * default_pose * zero_vel``: feet_planted is the fraction of feet with contact force above
     ``contact_threshold`` (lifting any foot loses reward), default_pose is exp(-sum_j (q_j - q0_j)^2 /
-    pose_scale) over all joints. If a pitch or lean is commanded (> posture_cmd_tol rad) the pose factor is
-    1, leaving posture to track_pitch/lean so they never fight. Scaled by 1 - blend weight (see _motion_blend).
+    pose_scale) over all joints, and zero_vel is exp(-(vx^2 + vy^2 + yaw_rate^2) / vel_scale) so actually holding
+    still (not drifting/creeping) is rewarded explicitly -- at vel_scale=0.1 a 0.1 m/s drift pays ~0.90, 0.2 m/s
+    ~0.67. **Hard-gated to a fully zero command** (lin_x, lin_y, ang_z, pitch and lean all zero): the instant any
+    term is commanded the reward is 0 and the policy must track that command instead (track_lin / track_ang /
+    track_pitch / track_lean do the rewarding). There is no longer a pitch/lean exception -- a commanded
+    pitch/lean is a tracking target, not a stand.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     sensor = env.scene.sensors[sensor_cfg.name]
@@ -454,9 +486,191 @@ def stand_still_default_pose(
     planted = (torch.norm(sensor.data.net_forces_w[:, feet_idx], dim=-1) > contact_threshold).float().mean(dim=1)
     pose_err = torch.sum(torch.square(asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
     default_pose = torch.exp(-pose_err / pose_scale)
-    cmd = env.command_manager.get_command(command_name)
-    posture_cmd = torch.maximum(torch.abs(cmd[:, 3]), torch.abs(cmd[:, 4])) > posture_cmd_tol
-    default_pose = torch.where(posture_cmd, torch.ones_like(default_pose), default_pose)
-    reward = planted * default_pose * (1.0 - _motion_blend(env, command_name, cmd_scale))
+    # explicit zero-velocity factor: base-frame planar linear velocity + yaw rate
+    vel = torch.cat([asset.data.root_lin_vel_b[:, :2], asset.data.root_ang_vel_b[:, 2:3]], dim=1)
+    zero_vel = torch.exp(-torch.sum(torch.square(vel), dim=1) / vel_scale)
+    reward = planted * default_pose * zero_vel * (~_any_commanded(env, command_name)).float()
     diagnostics.log_step(env, "reward.stand_still", reward)
     return reward
+
+
+class action_jerk_l2(ManagerTermBase):
+    """Penalize the second difference of the policy action (jerk): ``sum_j (a_t - 2 a_{t-1} + a_{t-2})^2``.
+
+    The first difference (``action_rate_l2``) penalizes any motion, so raising it to kill high-frequency chatter
+    also flattens a clean 1-3 Hz trot (it was suppressing foot lift). The second difference instead weights high
+    frequencies far more heavily: a smooth trot has small jerk, while a Nyquist (every-other-tick) limit cycle --
+    the 24.9 Hz buzz seen on hardware 2026-11-04 -- is maximal. So this term targets the buzz specifically and
+    lets ``action_rate_l2`` stay low. ``env.action_manager`` only keeps one previous action, so this caches the
+    previous first-difference itself.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._prev_rate = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            self._prev_rate.zero_()
+        else:
+            self._prev_rate[env_ids] = 0.0
+
+    def __call__(self, env: ManagerBasedRLEnv, max_value: float | None = None) -> torch.Tensor:
+        rate = env.action_manager.action - env.action_manager.prev_action
+        jerk = rate - self._prev_rate
+        self._prev_rate = rate.clone()
+        reward = torch.sum(torch.square(jerk), dim=1)
+        if max_value is not None:
+            reward = torch.clamp(reward, max=max_value)
+        diagnostics.log_step(env, "reward.action_jerk_l2", reward)
+        return reward
+
+
+class joint_torque_rate_l2(ManagerTermBase):
+    """Penalize the rate of change of applied joint torque: ``sum_j (tau_t - tau_{t-1})^2`` (Nm^2 per step^2).
+
+    Targets actuator chatter directly. On hardware 2026-11-04 the torque-rate RMS was ~6 Nm/s during a clean gait
+    but ~184 Nm/s during the buzz (~30x), so a quadratic penalty separates them strongly. Caches the previous
+    applied torque (the articulation does not expose a rate).
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._asset_cfg = cfg.params.get("asset_cfg", SceneEntityCfg("robot"))
+        asset: Articulation = env.scene[self._asset_cfg.name]
+        self._prev_tau = torch.zeros(env.num_envs, asset.data.applied_torque.shape[1], device=env.device)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            self._prev_tau.zero_()
+        else:
+            self._prev_tau[env_ids] = 0.0
+
+    def __call__(
+        self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), max_value: float | None = None
+    ) -> torch.Tensor:
+        asset: Articulation = env.scene[asset_cfg.name]
+        tau = asset.data.applied_torque
+        rate = tau - self._prev_tau
+        self._prev_tau = tau.clone()
+        reward = torch.sum(torch.square(rate), dim=1)
+        if max_value is not None:
+            reward = torch.clamp(reward, max=max_value)
+        diagnostics.log_step(env, "reward.joint_torque_rate_l2", reward)
+        return reward
+
+
+def track_lin_vel_xy_exp_rel(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std_floor: float = 0.08,
+    rel: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Linear-velocity tracking with a tolerance that scales with the commanded speed.
+
+    ``exp(-|v_cmd - v|^2 / s^2)`` with ``s = max(std_floor, rel * |v_cmd|)``. A fixed std (Isaac Lab's
+    ``track_lin_vel_xy_exp``) is lenient at low command: with std 0.5 a robot standing still scores 0.70 of the
+    reward at a 0.3 m/s command and 0.96 at 0.1, so low-speed walking has almost no gradient and the policy stood
+    still below ~0.3 m/s on hardware. With ``rel=0.5`` the tolerance is half the commanded speed: standing scores
+    ~0.02 for any command >= 0.2 m/s, while at speed (>= 1 m/s) ``s`` equals the old std of 0.5, so high-speed
+    behaviour is unchanged. ``std_floor`` keeps the kernel from collapsing for tiny commands.
+    """
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    err = torch.sum(torch.square(cmd - asset.data.root_lin_vel_b[:, :2]), dim=1)
+    s = torch.clamp(rel * torch.norm(cmd, dim=1), min=std_floor)
+    return torch.exp(-err / s**2)
+
+
+def track_ang_vel_z_exp_rel(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std_floor: float = 0.1,
+    rel: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Yaw-rate tracking with a tolerance that scales with the commanded rate (see track_lin_vel_xy_exp_rel)."""
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, 2]
+    err = torch.square(cmd - asset.data.root_ang_vel_b[:, 2])
+    s = torch.clamp(rel * torch.abs(cmd), min=std_floor)
+    return torch.exp(-err / s**2)
+
+
+def standing_when_commanded(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    eps: float = _CMD_EPS,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Scale-free, two-sided penalty for not moving at the commanded linear speed (fixes the low-speed dead zone).
+
+    ``clamp(|(|v_cmd| - v . v_cmd_hat)| / |v_cmd|, 0, 1)``: the speed error along the command direction as a
+    fraction of the commanded speed. Standing still scores 1.0 at ANY command size, so the pull off standstill is
+    the same at 0.1 m/s as at 1 m/s (the earlier L1 deficit, in m/s, shrank with the command and was negligible at
+    0.1 m/s; raising its weight made it huge at high speed and the policy fell and overshot). Overshoot and moving
+    the wrong way are penalised too, clamped at 1, so the term is bounded in [0, 1] and needs no extra clamp. A
+    robot tracking the command pays ~0. Hard-gated off for a zero linear command (standing envs are owned by
+    stand_still_default_pose).
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd_xy = env.command_manager.get_command(command_name)[:, :2]
+    cmd_mag = torch.norm(cmd_xy, dim=1)
+    safe_mag = cmd_mag.clamp(min=1e-6)
+    cmd_hat = cmd_xy / safe_mag.unsqueeze(1)
+    v_proj = (asset.data.root_lin_vel_b[:, :2] * cmd_hat).sum(dim=1)
+    penalty = ((cmd_mag - v_proj).abs() / safe_mag).clamp(max=1.0) * (cmd_mag > eps).float()
+    diagnostics.log_step(env, "reward.standing_when_commanded", penalty)
+    return penalty
+
+
+def track_ang_vel_deficit(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    eps: float = _CMD_EPS,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """One-sided L1 penalty for under-shooting the commanded yaw rate (rad/s).
+
+    ``relu(|w_cmd| - max(0, w_z * sign(w_cmd)))``: the shortfall of yaw rate in the commanded turn direction.
+    Secondary to the linear term (the observed dead zone is mainly linear), but keeps the "move when told"
+    gradient symmetric for turning. Hard-gated off for a zero yaw command.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd_z = env.command_manager.get_command(command_name)[:, 2]
+    w_signed = (asset.data.root_ang_vel_b[:, 2] * torch.sign(cmd_z)).clamp(min=0.0)
+    deficit = (cmd_z.abs() - w_signed).clamp(min=0.0) * (cmd_z.abs() > eps).float()
+    diagnostics.log_step(env, "reward.track_ang_vel_deficit", deficit)
+    return deficit
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Clamped versions of the stock unbounded L2 penalties. Each is sum(x^2) with no upper bound, so a physics edge case
+# (a large-but-finite joint velocity/torque that invalid_state does not catch) could produce a huge negative spike and
+# destabilise PPO -- the same failure that forced base_height_l2_pitch's max_penalty. ``max_value`` is set well ABOVE
+# the value a noisy-but-sane policy produces (so the gradient is untouched in normal operation) and far below a
+# blow-up, bounding the worst-case per-step cost.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def action_rate_l2_clamped(env: ManagerBasedRLEnv, max_value: float) -> torch.Tensor:
+    return torch.clamp(_stock.action_rate_l2(env), max=max_value)
+
+
+def joint_vel_l2_clamped(
+    env: ManagerBasedRLEnv, max_value: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return torch.clamp(_stock.joint_vel_l2(env, asset_cfg), max=max_value)
+
+
+def joint_acc_l2_clamped(
+    env: ManagerBasedRLEnv, max_value: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return torch.clamp(_stock.joint_acc_l2(env, asset_cfg), max=max_value)
+
+
+def joint_torques_l2_clamped(
+    env: ManagerBasedRLEnv, max_value: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    return torch.clamp(_stock.joint_torques_l2(env, asset_cfg), max=max_value)
