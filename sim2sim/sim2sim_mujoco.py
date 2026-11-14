@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "deploy"))
 sys.path.insert(0, _SIM2SIM_DIR)
 
 import deploy_real  # noqa: E402
+import random_commands  # noqa: E402
 from go2_model import build_model  # noqa: E402
 
 DECIMATION = 4  # quadruped_go2_locomotion_env_cfg.py
@@ -406,6 +407,21 @@ def parse_args():
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--scenario", default=None, help="YAML list of command segments (see sim2sim/scenarios/).")
     source.add_argument("--manual_commands", action="store_true", help="Drive commands from the slider GUI.")
+    source.add_argument(
+        "--random_seed", type=int, default=None,
+        help="Drive the run with a seeded RANDOM command schedule (every component uniform over the training "
+        "range, ~12%% all-zero segments; see sim2sim/random_commands.py). Use --save_scenario to write the schedule "
+        "out so Isaac (play.py --scenario) can replay the identical commands.",
+    )
+    parser.add_argument("--random_segments", type=int, default=20, help="Number of random segments.")
+    parser.add_argument("--random_segment_s", type=float, default=4.0, help="Seconds per random segment.")
+    parser.add_argument(
+        "--random_scale", type=float, default=1.0,
+        help="Multiply every training command range by this (1.0 = the full training range).",
+    )
+    parser.add_argument(
+        "--save_scenario", default=None, help="With --random_seed: also write the generated schedule to this YAML."
+    )
     parser.add_argument("--command_file", default="/tmp/manual_command.json")
     parser.add_argument(
         "--duration", type=float, default=None,
@@ -493,6 +509,18 @@ def main():
 
     if args.scenario:
         segments = load_scenario(args.scenario)
+    elif args.random_seed is not None:
+        raw = random_commands.generate_segments(
+            args.random_seed, args.random_segments, args.random_segment_s, scale=args.random_scale
+        )
+        segments = [Segment(s["name"], s["duration"], s["command"]) for s in raw]
+        if args.save_scenario:
+            random_commands.write_scenario(
+                args.save_scenario, raw,
+                f"Random command schedule: seed={args.random_seed} segments={args.random_segments} "
+                f"segment_s={args.random_segment_s} scale={args.random_scale}",
+            )
+            print(f"[INFO] Wrote random schedule to {args.save_scenario}")
     else:
         if args.duration is not None:
             duration = args.duration
@@ -532,7 +560,7 @@ def main():
     trace = None
     if args.trace_out:
         trace = {k: [] for k in ("obs", "action", "target", "joint_pos", "joint_vel", "torque", "root_pos", "root_quat",
-                                 "lin_vel_origin_b", "lin_vel_com_b", "ang_vel_b", "foot_force", "command")}
+                                 "lin_vel_origin_b", "lin_vel_com_b", "ang_vel_b", "foot_force", "command", "fell")}
     try:
         dt = cfg.control_dt
         last_action = [0.0] * 12
@@ -613,6 +641,8 @@ def main():
                 step += 1
 
                 reason = robot.fallen()
+                if trace is not None:
+                    trace["fell"].append(1.0 if reason else 0.0)
                 if reason:
                     seg_stats.falls += 1
                     print(f"[FALL] {seg.name} t={k * dt:.2f} s: {reason}")

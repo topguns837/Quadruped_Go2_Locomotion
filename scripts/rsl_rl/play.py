@@ -61,6 +61,17 @@ parser.add_argument(
 )
 parser.add_argument("--trace_steps", type=int, default=1100, help="Control steps to record with --trace_out.")
 parser.add_argument(
+    "--scenario",
+    type=str,
+    default=None,
+    help=(
+        "With --trace_out: replay a scenario YAML (sim2sim/scenarios/*.yaml, or a schedule written by "
+        "sim2sim/random_commands.py / sim2sim_mujoco.py --save_scenario) as fixed-command segments instead of a "
+        "zero command, so the trace can be compared with the MuJoCo run of the same file. The run lasts exactly "
+        "the scenario's length (--trace_steps is ignored) and episode timeouts are disabled, so only falls reset."
+    ),
+)
+parser.add_argument(
     "--trace_deterministic_reset",
     action="store_true",
     default=False,
@@ -95,6 +106,16 @@ sys.argv = [sys.argv[0]] + hydra_args
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+# Enable the Camera Inspector tool (Tools -> Sensors -> Camera Inspector) by default, so it doesn't need
+# to be manually turned on via Window -> Extensions every session. Harmless to enable even headless (it's
+# a GUI panel; it just won't be visible with no window), so no args_cli.headless gate needed.
+import omni.kit.app  # noqa: E402
+
+if not args_cli.headless:
+    omni.kit.app.get_app().get_extension_manager().set_extension_enabled_immediate(
+        "isaacsim.util.camera_inspector", True
+    )
 
 """Rest everything follows."""
 
@@ -234,6 +255,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         print("[INFO] trace: deterministic reset (default pose, zero velocity).")
 
+    if args_cli.scenario:
+        if not args_cli.trace_out:
+            raise SystemExit("--scenario needs --trace_out (it replays the scenario while recording the trace).")
+        # A 40 s episode timeout would reset the robot mid-schedule and be mistaken for a fall: only falls reset.
+        env_cfg.episode_length_s = 1.0e6
+
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
@@ -333,7 +360,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             cmd_term.set_manual_command([0.0, 0.0, 0.0, 0.0, 0.0])
         trace = {k: [] for k in ("obs", "action", "target", "joint_pos", "joint_vel", "torque", "root_pos",
                                  "root_quat", "lin_vel_origin_b", "lin_vel_com_b", "ang_vel_b", "foot_force",
-                                 "command", "done")}
+                                 "command", "done", "fell")}
+        scenario_cmds = None
+        if args_cli.scenario:
+            import yaml
+
+            _dt = env.unwrapped.step_dt
+            scenario_cmds = []
+            for _seg in yaml.safe_load(open(args_cli.scenario))["segments"]:
+                _cmd = [float(v) for v in _seg["command"]]
+                if len(_cmd) != 5:
+                    raise ValueError(f"scenario segment {_seg['name']!r}: command must have 5 values")
+                scenario_cmds += [_cmd] * round(float(_seg["duration"]) / _dt)
+            args_cli.trace_steps = len(scenario_cmds)
+            cmd_term.set_manual_command(scenario_cmds[0])
+            print(f"[INFO] trace: replaying scenario {args_cli.scenario} ({len(scenario_cmds)} steps)")
         _robot = env.unwrapped.scene["robot"]
         _sensor = env.unwrapped.scene["contact_forces"]
         _foot_ids = [_sensor.body_names.index(n) for n in ("FL_foot", "FR_foot", "RL_foot", "RR_foot")]
@@ -373,6 +414,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if trace is not None and scenario_cmds is not None:
+                _i = len(trace["obs"])
+                if _i == 0 or scenario_cmds[_i] != scenario_cmds[_i - 1]:
+                    cmd_term.set_manual_command(scenario_cmds[_i])
+                    # the observation computed at the end of the last step still holds the previous command
+                    obs = env.get_observations()
             # agent stepping
             actions = policy(obs)
             if trace is not None:
@@ -399,6 +446,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     env.unwrapped.command_manager.get_command("base_velocity")[0, :5].cpu().numpy().copy()
                 )
                 trace["done"].append(float(dones[0].item()))
+                # a real fall (base/arm touched the ground), as opposed to a timeout reset
+                trace["fell"].append(float(env.unwrapped.termination_manager.terminated[0].item()))
                 if len(trace["obs"]) >= args_cli.trace_steps:
                     break
             # reset recurrent states for episodes that have terminated
