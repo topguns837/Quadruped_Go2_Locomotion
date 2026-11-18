@@ -1408,6 +1408,13 @@ def parse_args():
         "folded pose in the air). Default off: lay the robot prone yourself (controller L2+A twice) instead.",
     )
     parser.add_argument(
+        "--low_pass", type=float, nargs="?", const=5.0, default=None, metavar="HZ",
+        help="Low-pass (EMA) the policy ACTION before it becomes the joint target, at this cutoff (Hz). Bare "
+        "--low_pass uses 5 Hz. Off by default. Suppresses the ~25 Hz every-tick 'buzz' (the policy amplifying "
+        "joint-velocity sensor noise); validated in sim2sim (sim2sim_mujoco.py --action_lpf_hz). Applied upstream "
+        "of the slew/tether safety layers; last_action still reflects the actually-sent (clamped) target.",
+    )
+    parser.add_argument(
         "--no_pause_for_hoist", action="store_true", default=False,
         help="Skip the pause after release (where the legs are held damped, kp=0/kd=3, so you can hoist the "
         "robot) and go straight to the startup ramp. Default: pause.",
@@ -1578,6 +1585,14 @@ def main():
         state.ready = True
 
     last_action = [0.0] * 12
+    # Optional action low-pass (--low_pass HZ): EMA on the policy action before it forms the joint target, to
+    # suppress the ~25 Hz buzz (see the arg help). alpha = 1 - exp(-2*pi*fc*dt); action_filt is lazily seeded with
+    # the first action so there is no startup lurch. Off when --low_pass is not given.
+    action_lpf_alpha = None
+    if args.low_pass is not None:
+        action_lpf_alpha = 1.0 - math.exp(-2.0 * math.pi * args.low_pass * cfg.control_dt)
+        print(f"[INFO] Action low-pass ON: {args.low_pass:.1f} Hz (EMA alpha={action_lpf_alpha:.3f}).")
+    action_filt: list[float] | None = None
     step = 0
     policy_trace: list = []  # per-tick rows saved to policy_trace.npz with --live_plot (offline replay / diagnosis)
     policy_tick = 0  # counts policy commands; drives the kp fade hold_kp -> kp after the ramp handover
@@ -1708,11 +1723,24 @@ def main():
                 with torch.inference_mode():
                     action = policy(obs)[0].tolist()
 
+                # Optional action low-pass: the MOTOR target is built from the smoothed action; the raw `action`
+                # is still logged (policy_trace) and the slew/tether layers below act on the smoothed target.
+                if action_lpf_alpha is not None:
+                    if action_filt is None:
+                        action_filt = list(action)  # lazy seed: no startup transient
+                    else:
+                        action_filt = [
+                            action_filt[i] + action_lpf_alpha * (action[i] - action_filt[i]) for i in range(12)
+                        ]
+                    action_for_target = action_filt
+                else:
+                    action_for_target = action
+
                 # Isaac-ordered target joint positions. PD gains/mode/head are fixed at init (init_low_cmd);
                 # only this target changes per policy tick. Actual publishing happens on the separate ~500 Hz
                 # thread started above -- this loop only updates the shared buffer at the 50 Hz policy rate.
                 target_isaac_order = [
-                    default_joint_pos_isaac_order[i] + cfg.action_scale * action[i] for i in range(12)
+                    default_joint_pos_isaac_order[i] + cfg.action_scale * action_for_target[i] for i in range(12)
                 ]
 
                 if target_buf is not None:

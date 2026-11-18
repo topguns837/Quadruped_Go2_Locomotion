@@ -6,7 +6,7 @@
 # was calibrated against this exact stiffness/damping/scale combination; using different real-hardware PD
 # gains would silently change what each action value means to the robot.
 
-policy_path: models/11_04_26_kp40_curriculum/exported/policy.pt  # JIT export -- takes the raw
+policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # JIT export -- takes the raw
   # observation vector and returns actions directly (obs normalization baked in). NOT model_2699.pt (that's
   # the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic class to
   # load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.

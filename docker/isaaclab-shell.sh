@@ -79,7 +79,12 @@ PLAY_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/play_dashboard.png"
 # and fails on a missing "FILL_IN_NIC" input file, instead of erroring obviously. A bare placeholder word
 # has no such failure mode. network_mode: host (docker-compose.yml) is what makes binding a specific host
 # NIC from inside this container possible at all.
-HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --max_target_dev_deg 25 --dry_run"
+# --test_profile confident: gives the startup ramp hold_kp=60 + lift_calf_tether_deg=25 (hold_kp 40 stalls the lift
+# to default pose) plus the wider policy-loop tether/slew. --low_pass (5 Hz EMA on the action) suppresses the ~25 Hz
+# every-tick buzz (the policy amplifying joint-velocity sensor noise); validated in sim2sim. The explicit
+# --max_target_dev_deg overrides the profile's ramp tether per-value. Drop --low_pass for an unfiltered run; swap to
+# --test_profile cautionary (slower slew) for the first touch of an unproven policy.
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --test_profile confident --max_target_dev_deg 25 --low_pass --dry_run"
 
 # Same live-dashboard setup as play's, reading deploy_real.py's --live_plot output instead (logs/hardware_dashboard/,
 # same tag names as play.py's --live_plot -- see deploy_real.py's log_live_plot). Same --exclude-panels/
