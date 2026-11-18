@@ -466,6 +466,29 @@ def parse_args():
         help="Write a per-control-step .npz trace (obs, action, joint/root state, torque, foot forces) for "
         "comparing against an Isaac trace; see sim2sim/compare_traces.py. Off by default.",
     )
+    parser.add_argument(
+        "--obs_noise", type=float, default=0.0,
+        help="Add additive uniform observation noise each step, as this multiple of TRAINING noise amplitudes "
+        "(base_ang_vel ±0.2, projected_gravity ±0.05, joint_pos ±0.01, joint_vel ±1.5; none on command/last_action). "
+        "0 = clean (default). 1.0 = training level. Tests whether sensor-noise amplification causes the ~25 Hz buzz.",
+    )
+    parser.add_argument("--obs_noise_seed", type=int, default=0, help="Seed for --obs_noise RNG (reproducibility).")
+    parser.add_argument(
+        "--jv_noise_scale", type=float, default=1.0,
+        help="Extra multiplier on ONLY the joint-velocity observation noise (on top of --obs_noise). <1 emulates "
+        "filtering/denoising dq before the policy; tests whether quieter dq removes the buzz. Default 1.0.",
+    )
+    parser.add_argument(
+        "--action_lpf_hz", type=float, default=0.0,
+        help="Low-pass (EMA) the policy ACTION before it becomes the joint target, at this cutoff (Hz). 0 = off. "
+        "Emulates a deploy-side output filter. last_action fed back to the policy stays the raw output.",
+    )
+    parser.add_argument("--kp", type=float, default=None, help="Override the config PD stiffness (default: config kp).")
+    parser.add_argument(
+        "--kd", type=float, default=None,
+        help="Override the config PD damping (default: config kd=0.8). Higher kd damps the ~25 Hz buzz; note it is a "
+        "sim-to-real mismatch vs the training kd unless you also retrain.",
+    )
     parser.add_argument("--save_xml", default=None, help="Write the compiled MuJoCo model to this XML path and exit.")
     return parser.parse_args()
 
@@ -494,7 +517,40 @@ def main():
     is_legacy = layout["cmd_width"] == 6
     nominal_height = NOMINAL_HEIGHT_M["legacy" if is_legacy else "new"]
     cfg = load_sim_config(args.config, policy_path)
+    # PD-gain overrides for the kd damping sweep (default: keep the config's values). Raising kd above the
+    # training value (0.8) damps the ~25 Hz limit cycle but is a sim-to-real mismatch -- see the plan.
+    if args.kp is not None:
+        cfg.kp = args.kp
+    if args.kd is not None:
+        cfg.kd = args.kd
     sdk_to_isaac, _ = deploy_real.build_joint_index_maps(cfg)
+    # Per-element additive observation-noise amplitudes matching TRAINING (ObservationsCfg Unoise), in
+    # build_observation's term order, so --obs_noise injects the sensor noise the sim normally has off. Tests
+    # whether the policy amplifies sensor noise into the ~25 Hz buzz. Only ang_vel/gravity/joint_pos/joint_vel noisy.
+    noise_amp = None
+    noise_rng = None
+    if args.obs_noise > 0.0:
+        term_amp = {"base_lin_vel": 0.0, "base_ang_vel": 0.2, "projected_gravity": 0.05, "base_height": 0.0,
+                    "command": 0.0, "joint_pos": 0.01, "joint_vel": 1.5, "last_action": 0.0}
+        amp = []
+        if layout["has_lin_vel"]:
+            amp += [term_amp["base_lin_vel"]] * 3
+        amp += [term_amp["base_ang_vel"]] * 3 + [term_amp["projected_gravity"]] * 3
+        if layout["has_height_obs"]:
+            amp += [term_amp["base_height"]]
+        amp += [term_amp["command"]] * layout["cmd_width"] + [term_amp["joint_pos"]] * 12 \
+            + [term_amp["joint_vel"]] * 12 + [term_amp["last_action"]] * 12
+        assert len(amp) == obs_dim, (len(amp), obs_dim)
+        noise_amp = torch.tensor(amp, dtype=torch.float32) * args.obs_noise
+        # scale ONLY the joint_vel block (12 wide) for the "quieter dq" test
+        jv_start = (3 if layout["has_lin_vel"] else 0) + 6 + (1 if layout["has_height_obs"] else 0) \
+            + layout["cmd_width"] + 12
+        noise_amp[jv_start:jv_start + 12] *= args.jv_noise_scale
+        noise_rng = torch.Generator().manual_seed(args.obs_noise_seed)
+    # Deploy-side action low-pass (EMA) test: cutoff -> per-step smoothing coefficient.
+    action_lpf_alpha = None
+    if args.action_lpf_hz > 0.0:
+        action_lpf_alpha = 1.0 - float(np.exp(-2.0 * np.pi * args.action_lpf_hz * cfg.control_dt))
     robot = MujocoGo2(model, cfg, motor_limits=args.motor_limits, joint_speed_cap=args.joint_speed_cap)
     default_isaac = robot.default_isaac.tolist()
     height_source_note = f" (obs source: {args.height_source})" if layout["has_height_obs"] else ""
@@ -502,6 +558,7 @@ def main():
         f"[INFO] policy={policy_path} obs_dim={obs_dim} cmd_width={layout['cmd_width']} "
         f"has_height_obs={layout['has_height_obs']}{height_source_note} nominal_height={nominal_height:.3f} m "
         f"mass={float(np.sum(model.body_mass)):.2f} kg dt={model.opt.timestep} decimation={DECIMATION} "
+        f"kp={cfg.kp} kd={cfg.kd} "
         f"motor_limits={args.motor_limits} (calf {robot.effort_limit[-1]:.2f} Nm @ "
         f"{robot.velocity_limit[-1]:.2f} rad/s) armature={ARMATURE} action_delay={args.action_delay} obs_delay={args.obs_delay} "
         f"joint_speed_cap={args.joint_speed_cap if args.joint_speed_cap else 'off'}"
@@ -564,6 +621,7 @@ def main():
     try:
         dt = cfg.control_dt
         last_action = [0.0] * 12
+        action_sent = np.zeros(12)  # EMA state for --action_lpf_hz (the smoothed action that forms the target)
         target_history: list[np.ndarray] = [robot.default_isaac.copy()] * (args.action_delay + 1)
         state_history: list = []
         stats: list[SegmentStats] = []
@@ -592,9 +650,18 @@ def main():
                     cfg, state_history[0], sdk_to_isaac, default_isaac, manual_cmd, last_action,
                     base_height=base_height_obs, include_base_lin_vel=layout["has_lin_vel"],
                 )
+                if noise_amp is not None:
+                    # additive uniform noise U(-amp, amp) per element, as in training (enable_corruption)
+                    obs = obs + (torch.rand(obs.shape, generator=noise_rng) * 2.0 - 1.0) * noise_amp
                 with torch.inference_mode():
                     action = policy(obs)[0].numpy()
-                target = robot.default_isaac + cfg.action_scale * action
+                # deploy-side output low-pass: the MOTOR target uses the filtered action; last_action fed back to
+                # the policy stays the raw output (the policy "remembers what it decided", as in training).
+                if action_lpf_alpha is not None:
+                    action_sent = action_sent + action_lpf_alpha * (action - action_sent)
+                else:
+                    action_sent = action
+                target = robot.default_isaac + cfg.action_scale * action_sent
                 target_history.append(target)
                 robot.step(target_history[max(0, len(target_history) - 1 - args.action_delay)])
                 if len(target_history) > args.action_delay + 1:
