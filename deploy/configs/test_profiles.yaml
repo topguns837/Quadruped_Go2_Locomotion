@@ -1,4 +1,5 @@
-# Named hardware test profiles for deploy_real.py / deploy_real_wireless.py:  --test_profile <name>
+# Named hardware test/deploy profiles for deploy_real.py / deploy_real_wireless.py:  --test_profile <name>
+# (--deploy_profile is an alias for the same flag.)
 #
 # Edit any value here and it takes effect on the NEXT run (this file is re-read at every launch).
 # Precedence per value:  explicit CLI flag  >  this profile  >  the built-in default in deploy_real.py.
@@ -18,6 +19,19 @@
 #   hold_kp / lift_calf_tether_deg   startup lift from a crouch: calf torque ceiling = hold_kp x lift tether
 #                              (60 x 25 deg = 26 Nm; the rear calves need ~19 Nm; 40 x 25 stalls).
 #   kp_handover_s              seconds to fade kp from hold_kp to the policy's kp after the policy starts.
+#   low_pass                   action low-pass cutoff in Hz (EMA) to suppress the ~25 Hz buzz; omit = off, a value
+#                              (e.g. 5.0) turns it on. See models/11_18_26_iter4_realistic/SUMMARY.md.
+#   calf_tau_abort_nm          per-calf torque abort in the policy loop (default ~41 Nm = 0.9 x the calf rating;
+#                              the global abort is the hip/thigh rating ~21 Nm).
+#   policy_path                override the exported policy .pt from --config, so a profile picks the policy too.
+#   live_dashboard             start the live graphs (scripts/live_dashboard.py) for this run -- replaces the
+#                              separate tmux dashboard/viewer panes. Implies --live_plot (it reads that log folder).
+#   dashboard_viewer           also open a feh window on the dashboard PNG (needs DISPLAY + feh; skipped with a
+#                              warning otherwise -- the run is never blocked by the graphs).
+#   dashboard_output           PNG the dashboard writes / feh shows (/tmp/hardware_dashboard.png; training uses
+#                              /tmp/dashboard.png, so the two never collide).
+#   Per-run CLI: --live_dashboard / --no_live_dashboard, --dashboard_viewer / --no_dashboard_viewer,
+#   --dashboard_output PATH.
 
 # First touch of an unproven policy: target rate and distance both tightly limited.
 cautionary:
@@ -30,6 +44,9 @@ cautionary:
   hold_kp: 60.0
   lift_calf_tether_deg: 25.0
   kp_handover_s: 0.5
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
 
 # A policy already seen to behave: slew and policy tether widened (the 2026-10-30 session's values).
 confident:
@@ -42,6 +59,9 @@ confident:
   hold_kp: 60.0
   lift_calf_tether_deg: 25.0
   kp_handover_s: 0.5
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
 
 # Sim parity: nothing reshapes the policy's targets in the policy loop (what the 2026-11-04 15:39 run used).
 # The startup ramp keeps its 15 deg tether (it needs it to lift from a crouch). The torque abort, speed abort and
@@ -56,3 +76,27 @@ no_limits:
   hold_kp: 60.0
   lift_calf_tether_deg: 25.0
   kp_handover_s: 0.5
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+
+# The setup validated on hardware 2026-11-18/19 with models/11_18_26_iter4_realistic: the `confident` limits with the
+# startup-ramp tether widened to 25 deg, the 5 Hz action low-pass (suppresses the ~25 Hz buzz) and the per-calf torque
+# abort at its own rating. Selects the policy too, so ONE name reproduces the whole run:
+#   deploy/deploy_real.py --network_interface <nic> --manual_commands --deploy_profile iter4_realistic
+iter4_realistic:
+  policy_path: models/11_18_26_iter4_realistic/exported/policy.pt
+  max_joint_speed_rad_s: 15.0
+  max_target_dev_deg: 25.0
+  policy_max_target_dev_deg: 45.0
+  abort_err_deg: 55.0
+  calf_tau_abort_nm: 40.9
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  low_pass: 5.0
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png

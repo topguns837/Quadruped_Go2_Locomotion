@@ -61,6 +61,8 @@ from datetime import datetime
 import torch
 import yaml
 
+import dashboard_launch
+
 try:
     from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
@@ -112,9 +114,12 @@ class DeployConfig:
 
 
 def load_config(path: str, cli_network_interface: str | None, cli_link_lost_after: float | None = None,
-                cli_hold_kp: float | None = None) -> DeployConfig:
+                cli_hold_kp: float | None = None, cli_policy_path: str | None = None) -> DeployConfig:
     with open(path) as f:
         raw = yaml.safe_load(f)
+    # policy_path: CLI / profile (--policy_path) > config file. Lets a deploy profile select the policy without a
+    # separate config file, the one thing the config YAML otherwise pins per policy.
+    policy_path = cli_policy_path or raw["policy_path"]
     network_interface = cli_network_interface or raw["network_interface"]
     if not network_interface:
         raise ValueError(
@@ -136,7 +141,7 @@ def load_config(path: str, cli_network_interface: str | None, cli_link_lost_afte
     else:
         hold_kp = float(raw.get("hold_kp", kp))
     return DeployConfig(
-        policy_path=raw["policy_path"],
+        policy_path=policy_path,
         control_dt=float(raw["control_dt"]),
         network_interface=network_interface,
         link_lost_after_s=link_lost_after_s,
@@ -818,7 +823,7 @@ class SafetyMonitor:
     def __init__(self, state: "LatestRobotState", sdk_to_isaac: list[int], watchdog: TorqueResponseWatchdog,
                  joint_names: list[str], max_dev_rad: float, abort_err_rad: float, abort_steps: int,
                  tau_abort_nm: float, speed_watchdog: "JointSpeedWatchdog | None" = None, writer=None,
-                 link_lost_after_s: float = LINK_LOST_AFTER_S):
+                 link_lost_after_s: float = LINK_LOST_AFTER_S, calf_tau_abort_nm: float | None = None):
         self.state = state
         self.sdk_to_isaac = sdk_to_isaac
         self.watchdog = watchdog
@@ -828,6 +833,13 @@ class SafetyMonitor:
         self.abort_err_rad = abort_err_rad
         self.abort_steps = abort_steps
         self.tau_abort_nm = tau_abort_nm
+        # Persistent per-calf torque abort for the WHOLE run (ramp + policy loop), separate from the transient
+        # lift-mode calf abort. The global tau_abort_nm = 0.9 * effort_limit uses the hip/thigh rating (~23.5 Nm),
+        # but the calves are rated ~45.4 Nm (CALF_RATED_NM); applying the hip/thigh cap to a calf aborts it at
+        # under half its rating. A legitimate hard step or lateral command loads a front calf to ~20 Nm statically
+        # (hardware run 2026-11-19 tripped FL_calf at 21 Nm / 30 deg during a lin_y sidestep while hip/thigh never
+        # exceeded 17 Nm). None keeps the global cap for the calves too.
+        self.calf_tau_abort_nm = calf_tau_abort_nm
         self.writer = writer
         self.link_lost_after_s = link_lost_after_s
         self._tick = 0
@@ -899,8 +911,13 @@ class SafetyMonitor:
         tau_isaac = [snap.tau_est[sdk_i] for sdk_i in self.sdk_to_isaac]
         for i, t in enumerate(tau_isaac):
             limit = self.tau_abort_nm
-            if self._lift_calf_tau_abort_nm is not None and self._is_calf(i):
-                limit = self._lift_calf_tau_abort_nm
+            if self._is_calf(i):
+                # Lift mode's calf abort (ramp only) takes precedence; otherwise the persistent policy-loop
+                # calf abort, if set. Both are the calf's own (higher) rating, so the calf keeps it throughout.
+                if self._lift_calf_tau_abort_nm is not None:
+                    limit = self._lift_calf_tau_abort_nm
+                elif self.calf_tau_abort_nm is not None:
+                    limit = self.calf_tau_abort_nm
             if abs(t) >= limit:
                 raise TrackingFault(
                     f"Joint {self.joint_names[i]} torque {abs(t):.1f} Nm is at/over {limit:.1f} Nm. "
@@ -1254,10 +1271,16 @@ def parse_args():
     )
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument(
-        "--test_profile", type=str, default=None,
+        "--policy_path", type=str, default=None,
+        help="Override the policy exported .pt selected in --config (policy_path). Settable in a deploy profile so "
+        "a profile can pick both the policy and its safety limits. CLI > profile > the config file's value.",
+    )
+    parser.add_argument(
+        "--test_profile", "--deploy_profile", type=str, default=None, dest="test_profile",
         help="Name of a profile in --test_profiles_file (cautionary / confident / no_limits, or your own): fills the "
-        "slew, tether, abort, speed-fault and startup-lift values from the YAML so they need not be passed one by "
-        "one. The file is re-read every run. An explicit flag on the command line still overrides the profile.",
+        "slew, tether, abort, speed-fault, startup-lift, low_pass and policy_path values from the YAML so they need "
+        "not be passed one by one. --deploy_profile is an alias. The file is re-read every run. An explicit flag on "
+        "the command line still overrides the profile.",
     )
     parser.add_argument(
         "--test_profiles_file", type=str,
@@ -1284,6 +1307,25 @@ def parse_args():
         action="store_true",
         default=False,
         help="Log per-step commanded-vs-actual data to logs/hardware_dashboard/, same tags as play.py's --live_plot.",
+    )
+    # Graphs while deploying: deploy_real starts scripts/live_dashboard.py (+ feh) itself, pointed at this run's own
+    # --live_plot folder, instead of separate tmux dashboard/viewer panes. Explicit underscore pairs so a CLI flag
+    # can turn a profile's setting either way (BooleanOptionalAction would emit --no-live-dashboard).
+    parser.add_argument(
+        "--live_dashboard", dest="live_dashboard", action="store_true", default=False,
+        help="Start the live-graph dashboard (and viewer) for this run. Implies --live_plot. Profile-able.",
+    )
+    parser.add_argument("--no_live_dashboard", dest="live_dashboard", action="store_false", default=False,
+                        help="Force the live dashboard off, overriding a profile's live_dashboard: true.")
+    parser.add_argument(
+        "--dashboard_viewer", dest="dashboard_viewer", action="store_true", default=True,
+        help="Open feh on the dashboard PNG (default on; only used with --live_dashboard). Profile-able.",
+    )
+    parser.add_argument("--no_dashboard_viewer", dest="dashboard_viewer", action="store_false", default=True,
+                        help="Do not open the viewer window (the PNG is still written).")
+    parser.add_argument(
+        "--dashboard_output", type=str, default=dashboard_launch.DEFAULT_OUTPUT,
+        help="PNG the dashboard writes and feh shows (default %(default)s, separate from training's). Profile-able.",
     )
     parser.add_argument(
         "--dry_run",
@@ -1339,6 +1381,15 @@ def parse_args():
         "instantly). An instant 60 -> 25 drop let the real robot sag ~40 deg before the policy took the load.",
     )
     parser.add_argument("--settle_tol_deg", type=float, default=6.0, help="Settle target, see --settle_s.")
+    parser.add_argument(
+        "--calf_tau_abort_nm", type=float, default=0.9 * CALF_RATED_NM,
+        help="Torque abort for the CALVES in the policy loop (default 0.9 x the calf's 45.4 Nm rating ~ 41 Nm). "
+        "Separate from the global torque abort (0.9 x effort_limit ~ 21 Nm), which is the hip/thigh rating and "
+        "otherwise gets applied to the calves too -- aborting them at under half their rating. A legitimate hard "
+        "step or lateral (lin_y) command loads a front calf to ~20 Nm statically (hardware run 2026-11-19 tripped "
+        "FL_calf at 21 Nm / 30 deg during a sidestep while hip/thigh stayed under 17 Nm). Hips and thighs keep the "
+        "global abort. Set equal to 0.9 x effort_limit to restore the old single-threshold behaviour.",
+    )
     parser.add_argument(
         "--lift_calf_tether_deg", type=float, default=None,
         help="Startup lift only (ramp + settle; off by default): widen the CALF tether to this many degrees and "
@@ -1434,6 +1485,8 @@ def parse_args():
         parser.set_defaults(**profile)
     args = parser.parse_args()
     args.test_profile_values = profile
+    if args.live_dashboard:
+        args.live_plot = True  # the dashboard reads the --live_plot log folder
     return args
 
 
@@ -1444,7 +1497,7 @@ def main():
         for k, v in args.test_profile_values.items():
             note = "" if getattr(args, k) == v else f"   (profile {v}, overridden)"
             print(f"         {k} = {getattr(args, k)}{note}")
-    cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp)
+    cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp, args.policy_path)
 
     if args.skip_release and cfg.network_interface != "lo":
         raise ValueError(
@@ -1505,6 +1558,8 @@ def main():
         except OSError as e:
             print(f"[WARN] could not write cli_args.txt: {e!r}")
         print(f"[INFO] Live plot logging to: {live_plot_dir}")
+        if args.live_dashboard:
+            dashboard_launch.start(live_plot_dir, args.dashboard_output, viewer=args.dashboard_viewer)
 
     # --- DDS init ---
     low_cmd_publisher = None
@@ -1633,10 +1688,12 @@ def main():
             speed_watchdog=speed_watchdog,
             writer=live_plot_writer,
             link_lost_after_s=cfg.link_lost_after_s,
+            calf_tau_abort_nm=args.calf_tau_abort_nm,
         )
         print(f"[INFO] Tether: targets limited to {args.max_target_dev_deg:.0f} deg of actual "
               f"(max PD torque ~ kp*dev = {cfg.kp * math.radians(args.max_target_dev_deg):.1f} Nm); abort if error "
-              f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm.")
+              f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm "
+              f"(calves {args.calf_tau_abort_nm:.1f} Nm).")
         tether_nm = cfg.kp * math.radians(args.max_target_dev_deg)
         if tether_nm < 0.5 * 0.9 * cfg.effort_limit:
             print(f"[WARN] Tether torque ceiling in the policy loop is only {tether_nm:.1f} Nm (kp {cfg.kp:.0f} x "

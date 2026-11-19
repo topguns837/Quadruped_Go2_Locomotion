@@ -27,14 +27,26 @@ recreate_container
 # needs no `+` prefix; a wrong path fails fast with "Key '...' is not in
 # struct" rather than silently doing nothing).
 if is_weak_gpu; then
-    TRAIN_ARGS="--num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True"
+    # Dev-watch on a weak GPU: 1 env in a GUI window on a small cached terrain. This stays on train.py directly
+    # (NOT the profile orchestrator) because train_phased.sh -> train_batched.sh runs HEADLESS in fixed-size
+    # batches -- that is for real training, not interactive watching.
+    TRAIN_CMD="isaaclab -p scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2 --num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True"
     PLAY_ARGS="--num_envs 1 --rendering_mode performance env.scene.terrain.terrain_generator.num_rows=3 env.scene.terrain.terrain_generator.num_cols=5 env.scene.terrain.terrain_generator.use_cache=True env.viewer.origin_type=env"
+    # train.py does not start any graphs itself, so this branch keeps the separate dashboard + viewer panes.
+    TRAIN_SEPARATE_DASH=1
 else
-    TRAIN_ARGS="--num_envs 2048 --max_iterations 18000 --headless"
+    # Real training is PROFILE-DRIVEN: training_profiles/iter4_realistic.yaml defines the phases, iterations,
+    # batching, disturbances and reward weights as a complete, auditable snapshot. Edit that file, or pass a
+    # different --profile (e.g. aggressive), to change the run; a trailing `key=value` still overrides per-run
+    # and --num_envs/--seed override all phases. See scripts/train_phased.sh / scripts/train_profile.py.
+    # (Was: train.py --num_envs 2048 --max_iterations 18000 --headless; the profile now owns envs/iters/batching.)
+    TRAIN_CMD="bash scripts/train_phased.sh --profile iter4_realistic"
     PLAY_ARGS=""
+    # The profile's `dashboard` / `viewer` params make train_batched.sh start the live graphs (and feh) itself at the
+    # start of every batch, so no separate dashboard/viewer panes are created for the train window.
+    TRAIN_SEPARATE_DASH=0
 fi
 
-TRAIN_CMD="isaaclab -p scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2 ${TRAIN_ARGS}"
 PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play ${PLAY_ARGS} --manual_commands --live_plot"
 
 # live_dashboard.py's default matplotlib backend crashes in this container (no working Qt/GTK binding --
@@ -42,7 +54,9 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # saves a PNG instead of opening a window, and feh --reload displays that PNG, auto-refreshing on the
 # same interval. --logdir points at the experiment root, not one specific run, so it always picks up
 # whichever run is most recently modified.
-DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_kp40_curriculum_ppo --output /tmp/dashboard.png"
+# Only used by the weak-GPU watch mode (TRAIN_SEPARATE_DASH=1): a profile-driven run starts its own graphs.
+# Must match that run's experiment folder.
+DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_kp40_iter4_realistic --output /tmp/dashboard.png"
 VIEW_CMD="feh --scale-down --reload 0.5 /tmp/dashboard.png"
 
 # Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate
@@ -84,13 +98,14 @@ PLAY_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/play_dashboard.png"
 # every-tick buzz (the policy amplifying joint-velocity sensor noise); validated in sim2sim. The explicit
 # --max_target_dev_deg overrides the profile's ramp tether per-value. Drop --low_pass for an unfiltered run; swap to
 # --test_profile cautionary (slower slew) for the first touch of an unproven policy.
-HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --live_plot --test_profile confident --max_target_dev_deg 25 --low_pass --dry_run"
-
-# Same live-dashboard setup as play's, reading deploy_real.py's --live_plot output instead (logs/hardware_dashboard/,
-# same tag names as play.py's --live_plot -- see deploy_real.py's log_live_plot). Same --exclude-panels/
-# --y-range-multiplier reasoning as PLAY_DASHBOARD_CMD above; training's DASHBOARD_CMD is unaffected.
-HARDWARE_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/hardware_dashboard --output /tmp/hardware_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
-HARDWARE_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/hardware_dashboard.png"
+# Profiles live in deploy/configs/test_profiles.yaml and can also set policy_path and low_pass, so a single
+# `--deploy_profile <name>` (alias of --test_profile) can pick the policy AND its safety limits; any explicit flag
+# here still overrides the profile. Add `--policy_path models/<dir>/exported/policy.pt` to try another policy.
+# --deploy_profile iter4_realistic (deploy/configs/test_profiles.yaml) now carries everything this line used to spell out
+# (the confident limits, --max_target_dev_deg 25, --low_pass, the policy path) PLUS the live graphs: live_dashboard /
+# dashboard_viewer make deploy_real.py start the dashboard and feh itself, so there is no separate dashboard or
+# viewer pane for the hardware window any more. Edit the profile, or override one value with a flag here.
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --deploy_profile iter4_realistic --dry_run"
 
 # Tier-1 read-only pre-flight check (deploy/preflight_check.py) -- structurally incapable of publishing
 # anything (no ChannelPublisher/LowCmd_ import in that file at all), so it's safe to run alongside
@@ -124,10 +139,12 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux send-keys -t isaaclab:list-envs "isaaclab -p scripts/list_envs.py"
   tmux new-window -t isaaclab -n train
   tmux send-keys -t isaaclab:train "'"${TRAIN_CMD}"'"
-  DASH_PANE=$(tmux split-window -h -t isaaclab:train -P -F "#{pane_id}")
-  tmux send-keys -t "$DASH_PANE" "'"${DASHBOARD_CMD}"'"
-  VIEW_PANE=$(tmux split-window -v -t "$DASH_PANE" -P -F "#{pane_id}")
-  tmux send-keys -t "$VIEW_PANE" "'"${VIEW_CMD}"'"
+  if [ "'"${TRAIN_SEPARATE_DASH}"'" = 1 ]; then
+    DASH_PANE=$(tmux split-window -h -t isaaclab:train -P -F "#{pane_id}")
+    tmux send-keys -t "$DASH_PANE" "'"${DASHBOARD_CMD}"'"
+    VIEW_PANE=$(tmux split-window -v -t "$DASH_PANE" -P -F "#{pane_id}")
+    tmux send-keys -t "$VIEW_PANE" "'"${VIEW_CMD}"'"
+  fi
   tmux select-pane -t isaaclab:train.0
   tmux new-window -t isaaclab -n play
   tmux send-keys -t isaaclab:play "'"${PLAY_CMD}"'"
@@ -139,12 +156,8 @@ docker exec -it "${CONTAINER_NAME}" bash -lc '
   tmux new-window -t isaaclab -n hardware
   HW_CMD_PANE=$(tmux display-message -p -t isaaclab:hardware -F "#{pane_id}")
   tmux send-keys -t "$HW_CMD_PANE" "'"${HARDWARE_CMD}"'"
-  HW_DASH_PANE=$(tmux split-window -h -t "$HW_CMD_PANE" -P -F "#{pane_id}")
-  tmux send-keys -t "$HW_DASH_PANE" "'"${HARDWARE_DASHBOARD_CMD}"'"
   HW_PREFLIGHT_PANE=$(tmux split-window -v -t "$HW_CMD_PANE" -P -F "#{pane_id}")
   tmux send-keys -t "$HW_PREFLIGHT_PANE" "'"${PREFLIGHT_CMD}"'"
-  HW_VIEW_PANE=$(tmux split-window -v -t "$HW_DASH_PANE" -P -F "#{pane_id}")
-  tmux send-keys -t "$HW_VIEW_PANE" "'"${HARDWARE_VIEW_CMD}"'"
   tmux select-pane -t "$HW_CMD_PANE"
   tmux new-window -t isaaclab -n sim2sim
   tmux send-keys -t isaaclab:sim2sim "'"${SIM2SIM_CMD}"'"

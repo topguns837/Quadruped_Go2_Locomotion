@@ -191,7 +191,8 @@ def main() -> int:
     metrics_log = log.csv("metrics_1hz.csv", METRIC_COLUMNS)
     log.start_flusher(1.0)
 
-    cfg = dr.load_config(args.config, args.network_interface or "udp-relay", args.link_lost_after)
+    cfg = dr.load_config(args.config, args.network_interface or "udp-relay", args.link_lost_after,
+                         args.hold_kp, args.policy_path)
     key = rl.load_key(relay_args.relay_key_file)
     sdk_to_isaac, isaac_to_sdk = dr.build_joint_index_maps(cfg)
     default_joint_pos_isaac_order = [cfg.default_joint_pos[name] for name in cfg.isaac_joint_order]
@@ -217,6 +218,8 @@ def main() -> int:
         live_plot_dir = os.path.join("logs", "hardware_dashboard", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         live_plot_writer = SummaryWriter(log_dir=live_plot_dir)
         print(f"[INFO] Live plot logging to: {live_plot_dir}")
+        if args.live_dashboard:
+            dr.dashboard_launch.start(live_plot_dir, args.dashboard_output, viewer=args.dashboard_viewer)
 
     # --- relay connection (replaces deploy_real's DDS init) ---
     client_log = log if per_packet else rlg.RunLog(None, "desktop")
@@ -299,6 +302,7 @@ def main() -> int:
         speed_watchdog=speed_watchdog,
         writer=live_plot_writer,
         link_lost_after_s=cfg.link_lost_after_s,
+        calf_tau_abort_nm=args.calf_tau_abort_nm,
         relay_client=client,
     )
     loop_win = {"loop": rlg.Histogram(thresholds=LOOP_THRESHOLDS), "infer": rlg.Histogram(thresholds=LOOP_THRESHOLDS),
@@ -338,7 +342,8 @@ def main() -> int:
         threading.Thread(target=_metrics_loop, name="desktop-metrics", daemon=True).start()
     print(f"[INFO] Tether: targets limited to {args.max_target_dev_deg:.0f} deg of actual "
           f"(max PD torque ~ kp*dev = {cfg.kp * math.radians(args.max_target_dev_deg):.1f} Nm); abort if error "
-          f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm.")
+          f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm "
+          f"(calves {args.calf_tau_abort_nm:.1f} Nm).")
     print(f"[INFO] Joint-speed fault: abort if actual |velocity| exceeds "
           f"{args.speed_fault_cap_rad_s[0]:.1f}/{args.speed_fault_cap_rad_s[1]:.1f}/{args.speed_fault_cap_rad_s[2]:.1f} "
           f"rad/s (hip/thigh/calf) for {args.speed_fault_steps} consecutive steps.")
