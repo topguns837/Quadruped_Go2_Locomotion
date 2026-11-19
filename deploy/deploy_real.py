@@ -107,6 +107,10 @@ class DeployConfig:
     default_joint_pos: dict[str, float]
     link_lost_after_s: float = 0.5  # LINK_LOST_AFTER_S; defaulted so direct constructors (sim2sim) keep working
     hold_kp: float | None = None  # startup-ramp stiffness; None = same as kp (old single-stiffness behaviour)
+    # Number of observation frames the policy expects stacked (ObservationsCfg.HISTORY_LENGTH in training). 1 =
+    # single-frame (every policy before iter5_hist6). Must equal the training value, and obs_dim == base_dim * this.
+    history_length: int = 1
+    joint_vel_filter_hz: float | None = None  # EMA low-pass on the joint_vel obs; None = off (current policy)
 
     def __post_init__(self) -> None:
         if self.hold_kp is None:
@@ -114,7 +118,8 @@ class DeployConfig:
 
 
 def load_config(path: str, cli_network_interface: str | None, cli_link_lost_after: float | None = None,
-                cli_hold_kp: float | None = None, cli_policy_path: str | None = None) -> DeployConfig:
+                cli_hold_kp: float | None = None, cli_policy_path: str | None = None,
+                cli_history_length: int | None = None) -> DeployConfig:
     with open(path) as f:
         raw = yaml.safe_load(f)
     # policy_path: CLI / profile (--policy_path) > config file. Lets a deploy profile select the policy without a
@@ -132,6 +137,12 @@ def load_config(path: str, cli_network_interface: str | None, cli_link_lost_afte
         link_lost_after_s = cli_link_lost_after
     else:
         link_lost_after_s = float(raw.get("link_lost_after", LINK_LOST_AFTER_S))
+    # history_length: CLI / profile (--history_length) > config `history_length` > 1 (single frame, the default so
+    # the current single-frame policy deploys unchanged). Must equal the policy's training history; a mismatch is
+    # caught by policy_obs_layout against the net's input width.
+    history_length = int(cli_history_length if cli_history_length is not None else raw.get("history_length", 1))
+    if history_length < 1:
+        raise ValueError(f"history_length must be >= 1, got {history_length}")
     kp = float(raw["kp"])
     # hold_kp: stiffness for the startup ramp only (the policy loop runs at kp). CLI > config > kp (old
     # behaviour). See the config comment and ramp_to_default_pose() -- kp is too soft to raise the robot's
@@ -153,6 +164,8 @@ def load_config(path: str, cli_network_interface: str | None, cli_link_lost_afte
         isaac_joint_order=list(raw["isaac_joint_order"]),
         sdk_joint_order=list(raw["sdk_joint_order"]),
         default_joint_pos=dict(raw["default_joint_pos"]),
+        history_length=history_length,
+        joint_vel_filter_hz=raw.get("joint_vel_filter_hz"),
     )
 
 
@@ -343,18 +356,60 @@ def quat_to_pitch_lean(quat_wxyz: tuple[float, float, float, float]) -> tuple[fl
 # ---------------------------------------------------------------------------------------------------------
 
 
+DEFAULT_HEIGHT_M = 0.337  # the default joint pose's stance height (CommandsCfg.nominal_height)
+# Range the height command is trained over (CommandsCfg ranges.height in quadruped_go2_locomotion_env_cfg.py).
+# Commands outside it are clamped here so a stray slider value can never ask the policy for a stance it was never
+# taught (tests/test_obs_history.py checks this equals the env cfg).
+HEIGHT_COMMAND_RANGE_M = (0.28, 0.38)
+
+
 class ManualCommandBuffer:
+    """Latest manual command. get() stays the 5 velocity/pitch/lean values (what 47-dim policies take); the
+    commanded stance height is kept separately and appended per layout by command_for_layout()."""
+
     def __init__(self):
         self._lock = threading.Lock()
         self._values = [0.0, 0.0, 0.0, 0.0, 0.0]  # lin_x, lin_y, ang_z, pitch, lean
+        self._height = DEFAULT_HEIGHT_M
 
-    def set(self, values: list[float]) -> None:
+    def set(self, values: list[float], height: float | None = None) -> None:
         with self._lock:
             self._values = list(values)
+            if height is not None:  # an old slider (no height key) leaves the last height alone
+                self._height = float(height)
 
     def get(self) -> list[float]:
         with self._lock:
             return list(self._values)
+
+    def get_height(self) -> float:
+        with self._lock:
+            return self._height
+
+
+def parse_command_json(data: dict) -> tuple[list[float], float | None]:
+    """The slider's JSON -> ([lin_x, lin_y, ang_z, pitch, lean], height or None). `height` is optional so a slider
+    written before the height command existed still works; the other five keys are required (KeyError)."""
+    values = [data["lin_vel_x"], data["lin_vel_y"], data["ang_vel_z"], data["pitch"], data["lean"]]
+    height = data.get("height")
+    return values, (None if height is None else float(height))
+
+
+def command_for_layout(cmd: list[float], layout: dict, height: float = DEFAULT_HEIGHT_M) -> list[float]:
+    """The command floats a policy with this layout expects (``layout['cmd_width']`` of them).
+
+    ``cmd`` is 5 values (lin_x, lin_y, ang_z, pitch, lean) or 6 (with its own height). A 5-wide layout gets the first
+    five. A 6-wide layout gets the commanded height appended -- ``cmd[5]`` if given, else ``height`` -- clamped to
+    HEIGHT_COMMAND_RANGE_M.
+    """
+    if len(cmd) not in (5, 6):
+        raise ValueError(f"command must have 5 or 6 values, got {len(cmd)}")
+    base = list(cmd[:5])
+    if layout["cmd_width"] == 5:
+        return base
+    h = cmd[5] if len(cmd) == 6 else height
+    lo, hi = HEIGHT_COMMAND_RANGE_M
+    return base + [min(max(float(h), lo), hi)]
 
 
 def _manual_command_file_poll_loop(buf: ManualCommandBuffer, path: str, poll_interval: float = 0.1):
@@ -367,15 +422,8 @@ def _manual_command_file_poll_loop(buf: ManualCommandBuffer, path: str, poll_int
             if mtime != last_mtime:
                 with open(path) as f:
                     data = json.load(f)
-                buf.set(
-                    [
-                        data["lin_vel_x"],
-                        data["lin_vel_y"],
-                        data["ang_vel_z"],
-                        data["pitch"],
-                        data["lean"],
-                    ]
-                )
+                values, height = parse_command_json(data)
+                buf.set(values, height)
                 last_mtime = mtime
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             pass
@@ -1151,22 +1199,133 @@ def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, ac
 # `has_height_obs` inserts a base_height term; `has_lin_vel` prepends base_lin_vel. sim2sim imports this.
 #   47: current policies -- NO base_lin_vel (dropped: dead on hardware after ReleaseMode), 5-wide command.
 #   50: older 5-wide-command policies WITH base_lin_vel, no height obs.
+#   48: height-command policies -- NO base_lin_vel, 6-wide command [lin_x, lin_y, ang_z, pitch, lean, HEIGHT]. The
+#       height is the COMMANDED stance height (the robot has no way to measure the actual one); it is never an
+#       observation of the achieved height. Trained with history stacking, so the net input is 48 * history_length.
 #   51/52: legacy 6-wide-command policies (51: height command only; 52: + base_height observation).
 OBS_LAYOUT = {
     47: {"cmd_width": 5, "has_height_obs": False, "has_lin_vel": False},
+    48: {"cmd_width": 6, "has_height_obs": False, "has_lin_vel": False},
     50: {"cmd_width": 5, "has_height_obs": False, "has_lin_vel": True},
     51: {"cmd_width": 6, "has_height_obs": False, "has_lin_vel": True},
     52: {"cmd_width": 6, "has_height_obs": True, "has_lin_vel": True},
 }
 
 
-def policy_obs_layout(policy) -> tuple[int, dict]:
-    """(obs_dim, layout) read off the policy's first Linear layer; raises if the dim is unknown."""
+def policy_obs_layout(policy, history_length: int = 1) -> tuple[int, dict]:
+    """(base_frame_dim, layout) for a policy whose actual input is ``base_frame_dim * history_length``.
+
+    The exported net's first Linear layer input is the STACKED width (e.g. 282 = 47 * 6 for the iter5_hist6
+    policy). ``history_length`` is passed explicitly (from DeployConfig) rather than inferred by factoring the
+    width, which would be ambiguous. We assert the width divides evenly and the per-frame dim is a known layout.
+    """
     first_weight = next(p for p in policy.parameters() if p.dim() == 2)
-    obs_dim = int(first_weight.shape[1])
-    if obs_dim not in OBS_LAYOUT:
-        raise ValueError(f"policy expects a {obs_dim}-dim observation; known dims are {sorted(OBS_LAYOUT)}.")
-    return obs_dim, OBS_LAYOUT[obs_dim]
+    stacked_dim = int(first_weight.shape[1])
+    if history_length < 1:
+        raise ValueError(f"history_length must be >= 1, got {history_length}")
+    if stacked_dim % history_length != 0:
+        raise ValueError(
+            f"policy input dim {stacked_dim} is not divisible by history_length {history_length}; "
+            "the config's history_length does not match this policy."
+        )
+    base_dim = stacked_dim // history_length
+    if base_dim not in OBS_LAYOUT:
+        raise ValueError(
+            f"policy expects a {stacked_dim}-dim input = {base_dim} per-frame x {history_length} frames, but "
+            f"{base_dim} is not a known per-frame layout {sorted(OBS_LAYOUT)}."
+        )
+    return base_dim, OBS_LAYOUT[base_dim]
+
+
+# --- How the H-frame stack is laid out in the flat vector the policy consumes. MUST equal Isaac Lab's layout ---
+# exactly, or the policy sees scrambled history on hardware. There are two independent choices:
+#
+#   OBS_HISTORY_TERM_MAJOR: Isaac Lab applies a GROUP history_length by pushing it down to each observation TERM
+#     and concatenating the per-term histories (concatenate_terms=True). So the flat layout is TERM-major:
+#         [ang_vel(t-H+1..t), gravity(t-H+1..t), command(t-H+1..t), joint_pos(...), joint_vel(...), last_action(...)]
+#     NOT frame-major ([frame_{t-H+1}, ..., frame_t]). Set False only if the container parity check proves otherwise.
+#   OBS_HISTORY_NEWEST_LAST: within each term's (or the frame's) history, newest sample is LAST
+#     ([x_{t-H+1}, ..., x_t]). Isaac Lab's CircularBuffer orders oldest->newest. Flip if the check shows newest-first.
+#
+# VERIFY BOTH in the container against a real env before trusting a deploy (see the plan's parity check): build the
+# env with history_length=H, capture the flattened policy obs and the raw single frames, and assert this stacker
+# reproduces the env vector bit-for-bit. Only then is a hardware run safe.
+OBS_HISTORY_TERM_MAJOR = True
+OBS_HISTORY_NEWEST_LAST = True
+
+
+def frame_term_widths(base_dim: int, layout: dict) -> list[int]:
+    """Per-term widths within ONE frame, in build_observation's order, for term-major stacking. Sums to base_dim."""
+    widths: list[int] = []
+    if layout["has_lin_vel"]:
+        widths.append(3)  # base_lin_vel
+    widths += [3, 3]  # base_ang_vel, projected_gravity
+    if layout["has_height_obs"]:
+        widths.append(1)  # base_height
+    widths += [layout["cmd_width"], 12, 12, 12]  # command, joint_pos, joint_vel, last_action
+    assert sum(widths) == base_dim, (widths, base_dim)
+    return widths
+
+
+class ObsEmaFilter:
+    """First-order EMA low-pass on an observation vector (list[float]); same one-pole filter the training obs term
+    uses (mdp.obs_filters.alpha_from_cutoff), so the policy sees the same filtered joint_vel in sim and on hardware.
+    cutoff_hz=None disables it (exact passthrough), so a policy trained without the filter is unaffected."""
+
+    def __init__(self, cutoff_hz: float | None, dt: float):
+        self.alpha = None if cutoff_hz is None else (1.0 - math.exp(-2.0 * math.pi * cutoff_hz * dt))
+        self._y: list[float] | None = None
+
+    def reset(self) -> None:
+        self._y = None
+
+    def filter(self, x: list[float]) -> list[float]:
+        if self.alpha is None:
+            return list(x)
+        if self._y is None:  # first sample seeds the filter (no startup transient)
+            self._y = list(x)
+        else:
+            self._y = [y + self.alpha * (xi - y) for y, xi in zip(self._y, x)]
+        return list(self._y)
+
+
+class ObsHistory:
+    """Per-step ring buffer that turns single base_dim frames into the stacked vector the policy expects.
+
+    Mirrors Isaac Lab's group history: on the first push (or after reset()) the buffer is PADDED by repeating that
+    first frame H times (Isaac Lab fills a freshly reset CircularBuffer with the current obs), so the stack is
+    full-width from tick 0. The flat layout follows OBS_HISTORY_TERM_MAJOR / OBS_HISTORY_NEWEST_LAST.
+
+    term_widths: per-term widths within one frame (from frame_term_widths). Required for term-major; for
+    history_length==1 the two layouts are identical, so it may be omitted.
+    """
+
+    def __init__(self, history_length: int, term_widths: list[int] | None = None):
+        self.history_length = int(history_length)
+        self.term_widths = term_widths
+        self._buf: list[torch.Tensor] | None = None
+
+    def reset(self) -> None:
+        self._buf = None
+
+    def push_and_stack(self, frame: torch.Tensor) -> torch.Tensor:
+        """frame: (1, base_dim) -> (1, base_dim * history_length)."""
+        if self._buf is None:
+            self._buf = [frame.clone() for _ in range(self.history_length)]  # startup padding = repeat first frame
+        else:
+            self._buf.append(frame)
+            self._buf.pop(0)  # keep the newest H frames, oldest at index 0
+        ordered = self._buf if OBS_HISTORY_NEWEST_LAST else list(reversed(self._buf))
+        if self.history_length == 1 or not OBS_HISTORY_TERM_MAJOR:
+            return torch.cat(ordered, dim=1)  # frame-major (or trivial single frame)
+        # term-major: for each term, concatenate that term's slice across all frames, then concatenate terms
+        if self.term_widths is None:
+            raise ValueError("term-major stacking needs term_widths (pass frame_term_widths(base_dim, layout)).")
+        cols, a = [], 0
+        for w in self.term_widths:
+            cols.extend(f[:, a:a + w] for f in ordered)
+            a += w
+        return torch.cat(cols, dim=1)
 # ---------------------------------------------------------------------------------------------------------
 
 
@@ -1179,11 +1338,14 @@ def build_observation(
     last_action: list[float],
     base_height: float | None = None,
     include_base_lin_vel: bool = True,
+    joint_vel_filter: "ObsEmaFilter | None" = None,
 ) -> torch.Tensor:
     gravity_b = quat_rotate_inverse_wxyz(state.quat_wxyz, (0.0, 0.0, -1.0))
 
     joint_pos_isaac = [state.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
     joint_vel_isaac = [state.joint_vel[sdk_i] for sdk_i in sdk_to_isaac]
+    if joint_vel_filter is not None:  # EMA low-pass, same filter as the training obs term (noise resilience)
+        joint_vel_isaac = joint_vel_filter.filter(joint_vel_isaac)
     joint_pos_rel = [q - q0 for q, q0 in zip(joint_pos_isaac, default_joint_pos_isaac_order)]
 
     parts: list[float] = []
@@ -1276,6 +1438,11 @@ def parse_args():
         "--policy_path", type=str, default=None,
         help="Override the policy exported .pt selected in --config (policy_path). Settable in a deploy profile so "
         "a profile can pick both the policy and its safety limits. CLI > profile > the config file's value.",
+    )
+    parser.add_argument(
+        "--history_length", type=int, default=None,
+        help="Observation frames the policy was trained with (1 = single frame). Overrides the config's "
+        "history_length (default 1). Profile-able, so a deploy profile selects policy_path + history_length together.",
     )
     parser.add_argument(
         "--test_profile", "--deploy_profile", type=str, default=None, dest="test_profile",
@@ -1499,7 +1666,8 @@ def main():
         for k, v in args.test_profile_values.items():
             note = "" if getattr(args, k) == v else f"   (profile {v}, overridden)"
             print(f"         {k} = {getattr(args, k)}{note}")
-    cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp, args.policy_path)
+    cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp, args.policy_path,
+                      args.history_length)
 
     if args.skip_release and cfg.network_interface != "lo":
         raise ValueError(
@@ -1522,10 +1690,14 @@ def main():
     print(f"[INFO] Loading policy from: {cfg.policy_path}")
     policy = torch.jit.load(cfg.policy_path)
     policy.eval()
-    obs_dim, obs_layout = policy_obs_layout(policy)
+    obs_dim, obs_layout = policy_obs_layout(policy, cfg.history_length)
     include_base_lin_vel = obs_layout["has_lin_vel"]
     print(f"[INFO] Policy observation dim {obs_dim}: base_lin_vel {'INCLUDED' if include_base_lin_vel else 'OMITTED'} "
           f"(SportModeState {'needed' if include_base_lin_vel else 'not needed -- it stops after ReleaseMode anyway'}).")
+    obs_history = ObsHistory(cfg.history_length, frame_term_widths(obs_dim, obs_layout))
+    jv_filter = ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
+    if cfg.history_length > 1:
+        print(f"[INFO] Stacking {cfg.history_length} observation frames -> policy input {obs_dim * cfg.history_length}.")
 
     state = LatestRobotState(num_joints=12)
 
@@ -1777,8 +1949,12 @@ def main():
                 snap = state.snapshot()
                 cmd = manual_cmd.get()
 
-                obs = build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, cmd, last_action,
-                                        include_base_lin_vel=include_base_lin_vel)
+                # `cmd` stays 5 values for logging; the policy gets what ITS layout takes (a height-command policy
+                # also gets the commanded stance height, clamped to the trained range).
+                obs_cmd = command_for_layout(cmd, obs_layout, manual_cmd.get_height())
+                frame = build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, obs_cmd, last_action,
+                                          include_base_lin_vel=include_base_lin_vel, joint_vel_filter=jv_filter)
+                obs = obs_history.push_and_stack(frame)  # (1, base_dim) -> (1, base_dim * history_length)
                 with torch.inference_mode():
                     action = policy(obs)[0].tolist()
 

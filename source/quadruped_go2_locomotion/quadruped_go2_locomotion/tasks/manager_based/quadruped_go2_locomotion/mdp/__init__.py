@@ -58,6 +58,7 @@ from .diagnostics import (
     logged_projected_gravity,
     logged_joint_pos_rel,
     logged_joint_vel_rel,
+    JointVelFiltered,
     logged_last_action,
     logged_generated_commands,  # noqa: F401
 )

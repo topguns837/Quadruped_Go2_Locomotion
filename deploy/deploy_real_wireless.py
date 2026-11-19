@@ -203,7 +203,7 @@ def main() -> int:
     log.start_flusher(1.0)
 
     cfg = dr.load_config(args.config, args.network_interface or "udp-relay", args.link_lost_after,
-                         args.hold_kp, args.policy_path)
+                         args.hold_kp, args.policy_path, args.history_length)
     key = rl.load_key(relay_args.relay_key_file)
     sdk_to_isaac, isaac_to_sdk = dr.build_joint_index_maps(cfg)
     default_joint_pos_isaac_order = [cfg.default_joint_pos[name] for name in cfg.isaac_joint_order]
@@ -211,6 +211,10 @@ def main() -> int:
     print(f"[INFO] Loading policy from: {cfg.policy_path}")
     policy = torch.jit.load(cfg.policy_path)
     policy.eval()
+    base_dim, obs_layout = dr.policy_obs_layout(policy, cfg.history_length)
+    include_base_lin_vel = obs_layout["has_lin_vel"]
+    obs_history = dr.ObsHistory(cfg.history_length, dr.frame_term_widths(base_dim, obs_layout))
+    jv_filter = dr.ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
 
     state = dr.LatestRobotState(num_joints=12)
 
@@ -424,7 +428,11 @@ def main() -> int:
                 snap = state.snapshot()
                 cmd = manual_cmd.get()
 
-                obs = dr.build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, cmd, last_action)
+                obs_cmd = dr.command_for_layout(cmd, obs_layout, manual_cmd.get_height())  # see deploy_real
+                frame = dr.build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, obs_cmd,
+                                             last_action, include_base_lin_vel=include_base_lin_vel,
+                                             joint_vel_filter=jv_filter)
+                obs = obs_history.push_and_stack(frame)
                 t_inf = time.perf_counter()
                 with torch.inference_mode():
                     action = policy(obs)[0].tolist()
