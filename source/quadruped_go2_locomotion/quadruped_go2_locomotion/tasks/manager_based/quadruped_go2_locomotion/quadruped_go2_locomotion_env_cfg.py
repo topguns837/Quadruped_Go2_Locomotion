@@ -482,7 +482,7 @@ class RewardsCfg:
     # L1 m/s deficit that was negligible at 0.1 m/s (weight -1.5) or, when raised (-4.5), so large at high speed that the
     # policy fell and overshot 1.6-1.9x. Hard-gated off for a zero linear command. -4.0 picked over -2.0 from 400-iteration
     # calibration: best velocity error (0.91), no falls at 0.5/0.8 m/s, steps from 0.2 m/s (see
-    # low_speed_standing_penalty_plan.md; single seed, so re-check low-speed stepping on later checkpoints).
+    # docs/low_speed_standing_penalty_plan.md; single seed, so re-check low-speed stepping on later checkpoints).
     standing_when_commanded = RewTerm(
         func=mdp.standing_when_commanded, weight=-4.0, params={"command_name": "base_velocity"}
     )

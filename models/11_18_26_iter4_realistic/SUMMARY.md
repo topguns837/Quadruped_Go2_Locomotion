@@ -41,7 +41,7 @@ Use the `confident` profile (gives hold_kp 60, which the startup lift needs — 
 
 Drop `--low_pass` for an unfiltered comparison; raise/lower the cutoff with `--low_pass 8` / `--low_pass 3`.
 
-## For the next training (the real fix, see obs_stacking_notes.md / memory project_go2_buzz_fix)
+## For the next training (the real fix, see docs/obs_stacking_notes.md / memory project_go2_buzz_fix)
 
 The low-pass is a deploy band-aid. The root fix is **observation stacking (H=6)** plus **lowering the joint_vel
 observation noise** (from ±1.5; in sim, less noise reduced the buzz AND improved tracking). Also consider matching

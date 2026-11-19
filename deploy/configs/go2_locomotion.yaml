@@ -13,7 +13,7 @@ policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # JIT export --
   #
   # 47-dim policy (no base_lin_vel) from the DR-curriculum retrain (run go2_kp40_curriculum_ppo/
   # 2026-11-03_22-14-59, 18k iterations total). NOT yet tried on hardware; sim2sim only. Expect a lower stance
-  # and foot skim -- see gait_realism_diagnosis.md. The previous hardware-tested policy is
+  # and foot skim -- see docs/gait_realism_diagnosis.md. The previous hardware-tested policy is
   # models/10_14_26_real_hardware_parity_tested/ (50-dim; swap policy_path back to use it).
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 

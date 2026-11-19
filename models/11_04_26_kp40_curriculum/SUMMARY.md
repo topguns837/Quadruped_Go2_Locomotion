@@ -19,7 +19,7 @@ Status: **sim2sim only. Not yet tried on hardware.**
 
 ## Expected on hardware
 
-Lower, kneeling stance and foot skim/drag (see `gait_realism_diagnosis.md`). Weak yaw. Previous
+Lower, kneeling stance and foot skim/drag (see `docs/gait_realism_diagnosis.md`). Weak yaw. Previous
 hardware-tested policy: `models/10_14_26_real_hardware_parity_tested/` (50-dim).
 
 ## Deploy-time flags for sim parity (on-ground policy loop only)

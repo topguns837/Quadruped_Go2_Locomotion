@@ -1,6 +1,6 @@
 # 9_13_26_round3_pitch_lean_height_weights
 
-**What this is:** the Round 3 reward-engineering experiment (see `go2_round2_reward_engineering_plan.md`
+**What this is:** the Round 3 reward-engineering experiment (see `docs/go2_round2_reward_engineering_plan.md`
 and `patches/round3_weights_and_height.patch`), trained on the corrected Go2 + OpenManipulatorX asset.
 Adds a `base_height` (root world-Z) observation term on top of the vanilla baseline's observation space
 (9 obs terms vs. vanilla's 8 — **not** checkpoint-compatible with vanilla runs), a `gait_diagonal_coordination`
