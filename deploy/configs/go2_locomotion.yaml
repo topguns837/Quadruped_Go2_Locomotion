@@ -18,11 +18,11 @@ policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # JIT export --
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
 network_interface: null  # REQUIRED before first run -- the HOST NIC on the robot's 192.168.123.0/24 network.
-                          # Wired: the cabled NIC, e.g. "enp3s0" (deploy.md Stage 0). Wireless: the desktop
-                          # WiFi interface, e.g. "wlan0"/"wlxXXXX", once it has associated with the robot's
-                          # bridged AP and taken a static 192.168.123.x address (deploy.md Stage 0b;
-                          # deploy/wireless/). The container is network_mode: host, so use the HOST interface
-                          # name. Left null so a real run refuses to start unset (fails loud, not with a
+                          # Wired: the cabled NIC, e.g. "enp3s0" (deploy.md Stage 0). Wireless
+                          # (deploy_real_wireless.py) does not use this at all: it talks to the Jetson relay
+                          # over IP (see the `wireless` profile, deploy/wireless/README.md). The container is
+                          # network_mode: host, so use the HOST interface name. Left null so a real run
+                          # refuses to start unset (fails loud, not with a
                           # silent wrong-interface bind).
 
 link_lost_after: 0.5  # Seconds of LowState silence before the run stops as link-lost (and damps, never

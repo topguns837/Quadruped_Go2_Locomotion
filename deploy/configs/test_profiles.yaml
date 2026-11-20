@@ -100,3 +100,33 @@ iter4_realistic:
   live_dashboard: true
   dashboard_viewer: true
   dashboard_output: /tmp/hardware_dashboard.png
+
+# Wireless run over the modem WiFi (deploy/deploy_real_wireless.py): the iter4_realistic safety limits plus a `relay:`
+# block that replaces the long --relay_* flags. The `relay:` block is read only by deploy_real_wireless.py (wired
+# deploy_real.py ignores it); an explicit CLI flag still overrides every value here. Topology and bring-up:
+# deploy/wireless/README.md and deploy.md Stage 0b.
+#   deploy/deploy_real_wireless.py --deploy_profile wireless --manual_commands
+# link_lost_after / the relay's --silence_damp_s are deliberately NOT set yet: tune them from the measured gaps/RTT.
+wireless:
+  policy_path: models/11_18_26_iter4_realistic/exported/policy.pt
+  max_joint_speed_rad_s: 15.0
+  max_target_dev_deg: 25.0
+  policy_max_target_dev_deg: 45.0
+  abort_err_deg: 55.0
+  calf_tau_abort_nm: 40.9
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  low_pass: 5.0
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+  relay:
+    host: 192.168.50.20            # REPLACE: the Jetson dongle's address on the modem subnet (never 192.168.123.x)
+    key_file: ~/.go2_relay_key     # same file as on the Jetson (relay_jetson.py --init_key)
+    control_port: 9871             # TCP: auth, release, damp (matches relay_link.DEFAULT_CONTROL_PORT)
+    cmd_port: 9870                 # UDP: commands (matches relay_link.DEFAULT_CMD_PORT)
+    cmd_rate_hz: 100.0             # command rate to the relay
+    log_nic: enp233s0              # REPLACE: the desktop NIC on the modem link; its packet/error counters are logged

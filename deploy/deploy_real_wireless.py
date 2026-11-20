@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deploy_real as dr  # noqa: E402
 import impair as imp  # noqa: E402
 import relay_link as rl  # noqa: E402
+import relay_profile  # noqa: E402
 import runlog as rlg  # noqa: E402
 
 
@@ -139,7 +140,17 @@ def parse_all_args() -> tuple[argparse.Namespace, argparse.Namespace]:
     relay_parser.add_argument("--impair_time_scale", type=float, default=1.0, help="Multiply phase durations.")
     relay_parser.add_argument("--impair_scale", type=float, default=1.0, help="Multiply impairment strength.")
     relay_parser.add_argument("--impair_seed", type=int, default=1, help="Seed for the impairment shim.")
+    # A profile's optional `relay:` block (deploy/relay_profile.py) becomes these flags' defaults, so the precedence
+    # stays  explicit CLI flag > profile > built-in default. dr.parse_args() reads the rest of the same profile.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--test_profile", "--deploy_profile", dest="test_profile", default=None)
+    pre.add_argument("--test_profiles_file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                  "configs", "test_profiles.yaml"))
+    pre_args, _ = pre.parse_known_args()
+    if pre_args.test_profile is not None:
+        relay_parser.set_defaults(**relay_profile.load_relay_block(pre_args.test_profiles_file, pre_args.test_profile))
     relay_args, rest = relay_parser.parse_known_args()
+    relay_args.relay_key_file = os.path.expanduser(relay_args.relay_key_file)
     if any(a in ("-h", "--help") for a in rest):
         print(relay_parser.format_help())
         print("Also accepts every deploy_real.py flag. deploy_real.py --help follows:\n")

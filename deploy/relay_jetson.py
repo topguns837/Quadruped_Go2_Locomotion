@@ -725,7 +725,9 @@ def parse_args() -> argparse.Namespace:
                    help="Shut down (writing summary.json) once the first authenticated session ends.")
     p.add_argument("--wifi_iface", type=str, default="wlan0", help="Interface whose signal/packet counters are logged.")
     p.add_argument("--impair_seed", type=int, default=0, help="Seed for the (loopback-only) test impairment shim.")
-    p.add_argument("--kp_max", type=float, default=30.0)
+    p.add_argument("--kp_max", type=float, default=65.0,
+                   help="Reject (and damp on) any command with kp above this. Must admit the stiffest gain the desktop "
+                   "sends: hold_kp 60 in go2_obs_stacking.yaml (policy kp 50); it was 30 for the old kp-25 policy.")
     p.add_argument("--kd_max", type=float, default=5.0)
     return p.parse_args()
 

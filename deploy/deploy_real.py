@@ -1245,6 +1245,8 @@ def load_test_profile(path: str, name: str, valid: set[str]) -> dict:
     profile = data[name]
     if not isinstance(profile, dict):
         raise ValueError(f"test profile '{name}' in {path} must be a mapping of flag name -> value")
+    # An optional `relay:` block belongs to deploy_real_wireless.py (deploy/relay_profile.py); the wired script ignores it.
+    profile = {k: v for k, v in profile.items() if k != "relay"}
     reserved = {"test_profile", "test_profiles_file", "config", "network_interface"}
     bad = [k for k in profile if k not in valid or k in reserved]
     if bad:

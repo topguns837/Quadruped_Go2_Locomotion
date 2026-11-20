@@ -119,7 +119,8 @@ The Ethernet cable stays the default and the only link for `deploy_real.py`. For
 sibling script **`deploy/deploy_real_wireless.py`**: the policy, observation building, slew limit, tether, ramp and
 watchdogs are `deploy_real.py`'s own code (imported, unchanged), but robot I/O goes through a small **relay on the
 Jetson** (`deploy/relay_jetson.py`). The Jetson is on the robot's `192.168.123.0/24` network through its
-untouched `eth0` and speaks DDS to the robot; it speaks authenticated UDP/TCP to the desktop over the lab WiFi.
+untouched `eth0` and speaks DDS to the robot; it speaks authenticated UDP/TCP to the desktop over WiFi (a modem on its own subnet, never 192.168.123.x; topology and
+bring-up rules in `deploy/wireless/README.md`, run settings in the `wireless` profile of `deploy/configs/test_profiles.yaml`).
 
 Why a relay and not WiFi DDS: DDS needs same-subnet multicast and the robot's `123.x` network is wired-only, and
 `unitree_sdk2py` hard-codes its CycloneDDS config (`CYCLONEDDS_URI` is ignored), so a desktop on WiFi cannot join.
@@ -153,8 +154,8 @@ Test ladder (stop at the first failure; real motors only at the last rung):
 3. **WiFi soak:** `deploy/wireless/link_check.sh <desktop lab NIC> 600 <jetson lab IP>` plus a 100 Hz relay run (next rung);
    loss must be 0% with no multi-second silences.
 4. **Over real WiFi, no robot:** on the Jetson run `fake_robot.py` and `relay_jetson.py` **both on `--network_interface
-   lo`** (loopback DDS, never touching `eth0` or the robot), and on the desktop `deploy_real_wireless.py --relay_host
-   <jetson> --skip_release`. Watch the round-trip and gap summary.
+   lo`** (loopback DDS, never touching `eth0` or the robot), and on the desktop `deploy_real_wireless.py --deploy_profile wireless
+   --relay_host <jetson> --skip_release`. Watch the round-trip and gap summary.
 5. **Real robot, hoisted, `deploy/Checklist.md`:** first stop the ROS node that can send sport commands
    (`go2_highroscontrol`, a plain `kill`; a reboot restores it), then run the relay on `eth0` and the desktop script
    without `--skip_release`. The cable stays plugged in as the emergency path.

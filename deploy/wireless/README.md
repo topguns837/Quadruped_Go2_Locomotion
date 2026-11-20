@@ -1,7 +1,35 @@
 # Wireless link for Go2 deployment
 
-**Status (2026-10-29): the Ethernet cable is the only supported link.** A Jetson-hosted WiFi access point was
-tried and retired. This file records why, and what a WiFi link needs if you set one up later.
+**Status (2026-11-20): the supported wireless link is the application-level RELAY over a modem's WiFi**
+(`deploy/relay_jetson.py` on the Jetson + `deploy/deploy_real_wireless.py` on the desktop, see "Jetson USB client +
+relay" below). The Ethernet cable stays the default link for `deploy_real.py` and the emergency path. A Jetson-hosted
+WiFi access point bridged onto `eth0` was tried and retired; the sections after "Hard rules" record why.
+
+## Jetson USB client + relay (the current setup)
+
+```
+ desktop --(Ethernet)--> modem/router --(2.4 GHz WiFi)--> TP-Link USB dongle (Jetson, CLIENT) 
+                                                              |  relay_jetson.py: DDS on eth0 (untouched)
+                                                              +--> robot motion controller 192.168.123.161
+```
+
+- The dongle only gives the *Jetson* a modem-subnet address. It does NOT put the robot's `192.168.123.0/24` motor LAN
+  on WiFi, so DDS never crosses the air: the relay translates DDS <-> signed UDP/TCP at the Jetson (ports 9870/9871).
+- **The modem subnet must not be `192.168.123.0/24`** (collides with the Jetson's `eth0`). Use e.g. `192.168.50.0/24`.
+  `relay_profile.py` refuses a `relay.host` inside `192.168.123.0/24`.
+- 2.4 GHz SSID (the TL-WN722N v2 is 2.4 GHz only). Give the dongle a **stable address** (DHCP reservation on its MAC, or
+  a static IP in its own NetworkManager profile): the desktop's `relay.host` must not change between runs.
+- On the Jetson, the WiFi NetworkManager profile must be bound to the wlan device only
+  (`connection.interface-name <wlan>`) and never edit `eth0`'s profile, IP or routes. After bring-up check that `eth0`
+  is unchanged and `python deploy/lowstate_probe.py --network_interface eth0` still shows ~500 Hz.
+- Settings live in the `wireless` profile of `deploy/configs/test_profiles.yaml` (a `relay:` block: host, key_file,
+  ports, rate, log_nic); a run is `deploy/deploy_real_wireless.py --deploy_profile wireless --manual_commands`. Any
+  explicit flag overrides the profile.
+- Bench first, on the desktop alone with no robot: `deploy/tests/run_t2_loopback.sh` (stack on loopback), then
+  `link_check.sh <dongle iface> 60 <modem ip>` to measure the real radio. Do NOT bind the relay to the dongle IP and
+  the client to the wired NIC on one host and call it a WiFi test: both addresses are local, so the kernel hands the
+  packets over internally and they never reach the radio. Use a network namespace for the dongle, or measure against
+  the modem. Full ladder: `deploy.md` Stage 0b.
 
 ## Hard rules
 
