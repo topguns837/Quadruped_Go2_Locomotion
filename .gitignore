@@ -105,3 +105,7 @@ sim2sim/mujoco/menagerie/
 
 # Wireless relay shared secret (never commit)
 deploy/relay.key
+
+# AP hostapd config holds the wpa_passphrase (never commit)
+deploy/wireless/hostapd.conf
+deploy/wireless/*.secret
