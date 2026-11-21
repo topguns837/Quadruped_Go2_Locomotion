@@ -258,6 +258,7 @@ def build_batched_command(
     cli_dashboard: bool | None = None,
     cli_viewer: bool | None = None,
     cli_dashboard_output: str | None = None,
+    cli_headless: bool = True,
 ) -> list[str]:
     """Assemble the train_batched.sh argv for one phase.
 
@@ -286,7 +287,8 @@ def build_batched_command(
         argv += ["--num_envs", str(num_envs)]
     if seed is not None:
         argv += ["--seed", str(seed)]
-    argv += ["--headless"]
+    if cli_headless:
+        argv += ["--headless"]
     # Live graphs: CLI > profile. train_batched.sh restarts the dashboard each batch; with it off there is nothing
     # for a viewer or an output path to do, so those flags are only emitted while the dashboard is on.
     dashboard = _first_not_none(cli_dashboard, profile.dashboard)
@@ -375,6 +377,10 @@ def parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no_viewer", dest="viewer", action="store_false",
                         help="Force the feh viewer OFF, overriding the profile's `viewer`.")
     parser.add_argument("--dashboard_output", type=str, default=None, help="Override the profile's dashboard PNG path.")
+    parser.add_argument("--gui", action="store_true",
+                        help="Run with the Isaac Sim GUI (omit the default --headless). Heavy -- meant for WATCHING "
+                             "with a small --num_envs, not a full-throughput run; the window relaunches each "
+                             "batch (every batch_iterations). Needs the container's X11 passthrough (docker-compose.yml).")
     parser.add_argument(
         "overrides", nargs="*",
         help="Trailing Hydra key=value overrides applied to EVERY phase (win over the profile's own values).",
@@ -401,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd = build_batched_command(
             profile, i, cli_overrides=args.overrides or None, cli_num_envs=args.num_envs, cli_seed=args.seed,
             cli_dashboard=args.dashboard, cli_viewer=args.viewer, cli_dashboard_output=args.dashboard_output,
+            cli_headless=not args.gui,
         )
         print(f"\n=== phase {i + 1}/{n}: {profile.phases[i].name} ===")
         print(" ".join(cmd))
