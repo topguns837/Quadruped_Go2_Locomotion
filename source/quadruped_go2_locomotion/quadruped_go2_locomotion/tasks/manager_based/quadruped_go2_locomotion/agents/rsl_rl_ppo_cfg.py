@@ -14,7 +14,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 10000
     save_interval = 100
     # New experiment dir: this policy drops base_lin_vel from the actor and STACKS the last HISTORY_LENGTH (=6) frames,
-    # so the actor input is 47*6=282 and the critic 50*6=300. The changed input dim makes it NOT resume-compatible with
+    # so the actor input is 48*6=288 and the critic 51*6=306. The changed input dim makes it NOT resume-compatible with
     # the single-frame iter3/iter4 checkpoints (nor the old 50-dim / kp-25 ones); it must train from scratch.
     experiment_name = "go2_kp50_iter5_hist6"
     empirical_normalization = True

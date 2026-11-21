@@ -64,7 +64,7 @@ from .unitree_go2witharm_cfg import UNITREE_GO2WITHARM_CFG  # isort: skip
 
 # Number of observation frames stacked and fed to the policy/critic each step (see ObservationsCfg). At the 50 Hz
 # control rate (dt 0.005 * decimation 4 = 20 ms/step) this is a 6 * 20 ms = 120 ms window. Changing this changes the
-# actor input dim (47 * HISTORY_LENGTH) and the critic input dim (50 * HISTORY_LENGTH), so a policy trained at one
+# actor input dim (48 * HISTORY_LENGTH) and the critic input dim (51 * HISTORY_LENGTH), so a policy trained at one
 # value is NOT resume-compatible with another, and deploy/deploy_real.py's history_length must be set to match.
 HISTORY_LENGTH = 6
 
@@ -274,7 +274,7 @@ class ObservationsCfg:
             # Observation stacking: feed the policy the last HISTORY_LENGTH frames (not just the newest). A short
             # time window lets the MLP read trends/latency AND implicitly system-identify the randomised dynamics
             # (friction, mass, PD gains, action delay) -- the main sim-to-real benefit. flatten_history_dim gives a
-            # flat (num_envs, 47 * HISTORY_LENGTH) vector, the layout the exported MLP and the deploy/sim2sim mirrors
+            # flat (num_envs, 48 * HISTORY_LENGTH) vector, the layout the exported MLP and the deploy/sim2sim mirrors
             # expect. The deploy ring buffer in deploy/deploy_real.py MUST stack frames in the same order Isaac Lab
             # does (see OBS_HISTORY_NEWEST_LAST there) and pad startup by repeating the first frame.
             self.history_length = HISTORY_LENGTH
@@ -299,7 +299,7 @@ class ObservationsCfg:
             self.concatenate_terms = True
             self.enable_corruption = False
             # Same history as the policy group so the value function sees the matching time window (critic is
-            # privileged and discarded at deploy, so no hardware mirror is needed): (num_envs, 50 * HISTORY_LENGTH).
+            # privileged and discarded at deploy, so no hardware mirror is needed): (num_envs, 51 * HISTORY_LENGTH).
             self.history_length = HISTORY_LENGTH
             self.flatten_history_dim = True
 

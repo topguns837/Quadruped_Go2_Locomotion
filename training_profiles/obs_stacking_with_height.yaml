@@ -1,17 +1,21 @@
-# Training profile: obs_stacking (iter5) -- 6-frame observation history + height command + kp/kd 50/1.0.
+# Training profile: obs_stacking_with_height (iter5) -- 6-frame observation history + height command + kp/kd 50/1.0.
 #
 # The retrain that makes the policy noise-resilient instead of relying on the deploy action low-pass band-aid:
 #   - 6-frame observation history (HISTORY_LENGTH, actor 48x6=288 / critic 51x6=306) -- the main mechanism.
 #   - height is a COMMAND again (6th command dim), scored vs sim ground truth, never observed (deployable).
 #   - hardware-realistic joint_vel noise (0.3, measured floor ~0.06) + a 10 Hz EMA filter on the joint_vel obs,
 #     applied identically in training and deploy, so the policy sees the same filtered signal in sim and on robot.
+#   - yaw (ang_vel_z) reward rebalance: track_ang_vel_z_exp/broad raised 1.6/0.8 -> 3.2/1.6 and the deficit penalty
+#     -0.5 -> -1.0. sim2sim random eval of the kp40 policy (logs/sim2sim_eval_24999/random/report.md) showed yaw RMS
+#     0.195 rad/s vs ~0.049 for lin_xy -- yaw carried ~5x less reward pressure than linear (2.9 vs ~14 units) and
+#     under-rotated on the hardest segments. Re-measure with sim2sim/run_random_eval.sh after training.
 # Phase 1 forms a stable gait under mild disturbance; phase 2 re-ramps difficulty with full realistic magnitudes.
 #
 # This file is a COMPLETE, self-contained snapshot: the top-level `overrides` lists EVERY tunable value (even the
 # ones equal to the Python default), so the whole training config is auditable here without cross-referencing the
 # code. Each phase lists only what it CHANGES from that baseline. Effective config of a phase = baseline + phase.
-#   bash scripts/train_phased.sh --profile iter4_realistic            # real run (headless)
-#   bash scripts/train_phased.sh --profile iter4_realistic --dry_run  # print the per-phase commands only
+#   bash scripts/train_phased.sh --profile obs_stacking_with_height            # real run (headless)
+#   bash scripts/train_phased.sh --profile obs_stacking_with_height --dry_run  # print the per-phase commands only
 #
 # ---------------------------------------------------------------------------------------------------------------
 # FIXED IN CODE -- recorded here for completeness; NOT overridable in a profile (baked into the actuator / network
@@ -24,7 +28,7 @@
 # ---------------------------------------------------------------------------------------------------------------
 
 experiment_name: go2_kp50_iter5_hist6
-run_dir: run_iter5_hist6
+run_dir: run_obs_stacking_with_height
 task: Quadruped-Locomotion-Go2
 num_envs: 2048
 seed: null
@@ -70,10 +74,17 @@ overrides:
   # --- reward weights (RewardsCfg) -- the full set ---
   env.rewards.track_lin_vel_xy_exp.weight: 6.0
   env.rewards.track_lin_vel_xy_broad.weight: 4.0
-  env.rewards.track_ang_vel_z_exp.weight: 1.6   # raised 1.2->1.6: yaw was the weakest axis in iter4
-  env.rewards.track_ang_vel_z_broad.weight: 0.8
+  # Yaw rebalance (iter5): kp40 sim2sim showed ang_z RMS 0.195 vs ~0.049 for lin_xy; yaw carried ~5x less reward
+  # pressure than linear (2.9 vs ~14) and under-rotated. Raise the tight+broad total 2.4->4.8 (~half the linear 10,
+  # above pitch/lean 3.0) and double the under-rotation penalty. Keep the 2:1 tight:broad ratio. Re-measure after.
+  env.rewards.track_ang_vel_z_exp.weight: 3.2    # was 1.6 (and 1.2 before iter4); the tight speed-scaled term
+  env.rewards.track_ang_vel_z_broad.weight: 1.6  # was 0.8; the broad fixed-std term keeping a dense gradient
   env.rewards.standing_when_commanded.weight: -4.0
-  env.rewards.track_ang_vel_deficit.weight: -0.5
+  env.rewards.track_ang_vel_deficit.weight: -1.0  # was -0.5; yaw analogue of standing_when_commanded, targets under-rotation
+  # Optional yaw kernel tightening -- enable only if a first retrain still under-tracks yaw (needs the params.* path
+  # to be Hydra-reachable; verify at launch):
+  # env.rewards.track_ang_vel_z_exp.params.std_floor: 0.08  # was 0.1 (match linear's floor)
+  # env.rewards.track_ang_vel_z_exp.params.rel: 0.4         # was 0.5 (steeper near-zero gradient at speed)
   env.rewards.track_pitch_exp.weight: 3.0
   env.rewards.track_lean_exp.weight: 3.0
   env.rewards.lin_vel_z_l2.weight: -2.0
