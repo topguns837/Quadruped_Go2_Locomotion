@@ -1,4 +1,4 @@
-# Training profile: obs_stacking_with_height (iter5) -- 6-frame observation history + height command + kp/kd 50/1.0.
+# Training profile: obs_stacking_with_height (obs_stacking_with_height) -- 6-frame observation history + height command + kp/kd 50/1.0.
 #
 # The retrain that makes the policy noise-resilient instead of relying on the deploy action low-pass band-aid:
 #   - 6-frame observation history (HISTORY_LENGTH, actor 48x6=288 / critic 51x6=306) -- the main mechanism.
@@ -27,7 +27,7 @@
 #   actor/critic hidden dims = [256,512,128], activation = elu, num_steps_per_env = 24
 # ---------------------------------------------------------------------------------------------------------------
 
-experiment_name: go2_kp50_iter5_hist6
+experiment_name: go2_obs_stacking_with_height
 run_dir: run_obs_stacking_with_height
 task: Quadruped-Locomotion-Go2
 num_envs: 2048
@@ -46,7 +46,7 @@ overrides:
   env.events.push_robot_force.params.max_force: 15.0        # N per axis at full difficulty
   env.events.push_robot_force.params.max_torque: 2.0        # Nm at full difficulty
   env.events.push_robot.params.max_velocity: 0.5            # m/s velocity kick
-  env.events.robot_mass.params.mass_distribution_params: [-2.0, 2.0]          # kg added to base
+  env.events.robot_mass.params.max_abs_kg: 2.0                                # +-kg added to base (randomize_base_mass_curriculum)
   env.events.robot_com.params.max_xyz: [0.06, 0.05, 0.08]                     # m COM offset (x, y, z)
   env.events.actuator_gains.params.stiffness_distribution_params: [0.8, 1.2]  # x nominal kp (widened for kd~1.0)
   env.events.actuator_gains.params.damping_distribution_params: [0.8, 1.2]    # x nominal kd (widened)
@@ -74,7 +74,7 @@ overrides:
   # --- reward weights (RewardsCfg) -- the full set ---
   env.rewards.track_lin_vel_xy_exp.weight: 6.0
   env.rewards.track_lin_vel_xy_broad.weight: 4.0
-  # Yaw rebalance (iter5): kp40 sim2sim showed ang_z RMS 0.195 vs ~0.049 for lin_xy; yaw carried ~5x less reward
+  # Yaw rebalance (obs_stacking_with_height): kp40 sim2sim showed ang_z RMS 0.195 vs ~0.049 for lin_xy; yaw carried ~5x less reward
   # pressure than linear (2.9 vs ~14) and under-rotated. Raise the tight+broad total 2.4->4.8 (~half the linear 10,
   # above pitch/lean 3.0) and double the under-rotation penalty. Keep the 2:1 tight:broad ratio. Re-measure after.
   env.rewards.track_ang_vel_z_exp.weight: 3.2    # was 1.6 (and 1.2 before iter4); the tight speed-scaled term

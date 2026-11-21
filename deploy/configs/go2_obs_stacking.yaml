@@ -1,4 +1,4 @@
-# Real-hardware deployment config for the obs_stacking (iter5) policy: 6-frame history, kp/kd 50/1.0, a 10 Hz
+# Real-hardware deployment config for the obs_stacking (obs_stacking_with_height) policy: 6-frame history, kp/kd 50/1.0, a 10 Hz
 # joint_vel observation EMA filter, and the height command. Use this config with --config for that policy;
 # go2_locomotion.yaml stays the config for the current single-frame kp40 policy.
 #
@@ -9,7 +9,7 @@
 # gains would silently change what each action value means to the robot.
 
 policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # PLACEHOLDER: replace with the
-  # obs_stacking export once trained (logs/rsl_rl/go2_kp50_iter5_hist6/run_iter5_hist6/exported/policy.pt). A 288-dim
+  # obs_stacking export once trained (logs/rsl_rl/go2_obs_stacking_with_height/run_obs_stacking_with_height/exported/policy.pt). A 288-dim
   # (48x6) actor; deploy auto-checks 288 == 48 x history_length(6) via policy_obs_layout.  # JIT export -- takes the raw
   # observation vector and returns actions directly (obs normalization baked in). NOT model_2699.pt (that's
   # the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic class to

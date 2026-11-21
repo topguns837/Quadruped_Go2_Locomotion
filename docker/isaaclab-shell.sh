@@ -57,7 +57,7 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # whichever run is most recently modified.
 # Only used by the weak-GPU watch mode (TRAIN_SEPARATE_DASH=1): a profile-driven run starts its own graphs.
 # Must match that run's experiment folder.
-DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_kp50_iter5_hist6 --output /tmp/dashboard.png"
+DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_obs_stacking_with_height --output /tmp/dashboard.png"
 VIEW_CMD="feh --scale-down --reload 0.5 /tmp/dashboard.png"
 
 # Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate

@@ -16,7 +16,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # New experiment dir: this policy drops base_lin_vel from the actor and STACKS the last HISTORY_LENGTH (=6) frames,
     # so the actor input is 48*6=288 and the critic 51*6=306. The changed input dim makes it NOT resume-compatible with
     # the single-frame iter3/iter4 checkpoints (nor the old 50-dim / kp-25 ones); it must train from scratch.
-    experiment_name = "go2_kp50_iter5_hist6"
+    experiment_name = "go2_obs_stacking_with_height"
     empirical_normalization = True
     # Asymmetric actor-critic: the actor sees only the hardware-available `policy` group (no base_lin_vel);
     # the critic sees the privileged `critic` group (includes base_lin_vel). The critic is discarded at

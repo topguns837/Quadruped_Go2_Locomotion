@@ -259,10 +259,12 @@ class ObservationsCfg:
             # Matched-noise + EMA-filtered joint velocity (noise added BEFORE the filter, so training == deploy;
             # see mdp.diagnostics.JointVelFiltered / mdp.obs_filters). noise handled INSIDE the term, so noise=None
             # here. noise_amp 0.3 is hardware-realistic (measured ~0.06 rad/s floor), NOT the old adversarial 1.5
-            # that trained the buzz in. cutoff_hz None = noise only; the obs_stacking training profile turns the
-            # EMA on (e.g. 10 Hz). Deploy mirrors the filter via DeployConfig.joint_vel_filter_hz.
+            # that trained the buzz in. cutoff_hz 10.0 = the obs_stacking_with_height EMA, matching deploy's
+            # DeployConfig.joint_vel_filter_hz (10 Hz). It is a float, not None: Isaac Lab's Hydra config updater
+            # refuses a None->float type change, so a profile override of this field needs a float default here.
+            # (Set to None only to disable the EMA entirely, which then can't be re-enabled via a Hydra override.)
             func=mdp.JointVelFiltered,
-            params={"noise_amp": 0.3, "cutoff_hz": None},
+            params={"noise_amp": 0.3, "cutoff_hz": 10.0},
             noise=None,
             clip=(-50.0, 50.0),
         )

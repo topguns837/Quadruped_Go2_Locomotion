@@ -108,7 +108,7 @@ class DeployConfig:
     link_lost_after_s: float = 0.5  # LINK_LOST_AFTER_S; defaulted so direct constructors (sim2sim) keep working
     hold_kp: float | None = None  # startup-ramp stiffness; None = same as kp (old single-stiffness behaviour)
     # Number of observation frames the policy expects stacked (ObservationsCfg.HISTORY_LENGTH in training). 1 =
-    # single-frame (every policy before iter5_hist6). Must equal the training value, and obs_dim == base_dim * this.
+    # single-frame (every policy before obs_stacking_with_height). Must equal the training value, and obs_dim == base_dim * this.
     history_length: int = 1
     joint_vel_filter_hz: float | None = None  # EMA low-pass on the joint_vel obs; None = off (current policy)
 
@@ -1215,7 +1215,7 @@ OBS_LAYOUT = {
 def policy_obs_layout(policy, history_length: int = 1) -> tuple[int, dict]:
     """(base_frame_dim, layout) for a policy whose actual input is ``base_frame_dim * history_length``.
 
-    The exported net's first Linear layer input is the STACKED width (e.g. 282 = 47 * 6 for the iter5_hist6
+    The exported net's first Linear layer input is the STACKED width (e.g. 282 = 47 * 6 for the obs_stacking_with_height
     policy). ``history_length`` is passed explicitly (from DeployConfig) rather than inferred by factoring the
     width, which would be ambiguous. We assert the width divides evenly and the per-frame dim is a known layout.
     """
