@@ -35,12 +35,13 @@ if is_weak_gpu; then
     # train.py does not start any graphs itself, so this branch keeps the separate dashboard + viewer panes.
     TRAIN_SEPARATE_DASH=1
 else
-    # Real training is PROFILE-DRIVEN: training_profiles/iter4_realistic.yaml defines the phases, iterations,
-    # batching, disturbances and reward weights as a complete, auditable snapshot. Edit that file, or pass a
-    # different --profile (e.g. aggressive), to change the run; a trailing `key=value` still overrides per-run
-    # and --num_envs/--seed override all phases. See scripts/train_phased.sh / scripts/train_profile.py.
-    # (Was: train.py --num_envs 2048 --max_iterations 18000 --headless; the profile now owns envs/iters/batching.)
-    TRAIN_CMD="bash scripts/train_phased.sh --profile iter4_realistic"
+    # Real training is PROFILE-DRIVEN: training_profiles/obs_stacking_with_height.yaml defines the phases, iterations,
+    # batching, disturbances and reward weights as a complete, auditable snapshot (6-frame observation stack, height
+    # command, kp/kd 50/1.0, 10 Hz joint_vel EMA, yaw rebalance). Edit that file, or pass a different --profile, to
+    # change the run; a trailing `key=value` still overrides per-run and --num_envs/--seed override all phases. It
+    # trains FROM SCRATCH (the 288-dim stacked actor cannot resume a single-frame checkpoint). See
+    # scripts/train_phased.sh / scripts/train_profile.py; append --dry_run to print the per-phase commands only.
+    TRAIN_CMD="bash scripts/train_phased.sh --profile obs_stacking_with_height"
     PLAY_ARGS=""
     # The profile's `dashboard` / `viewer` params make train_batched.sh start the live graphs (and feh) itself at the
     # start of every batch, so no separate dashboard/viewer panes are created for the train window.
@@ -56,7 +57,7 @@ PLAY_CMD="isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Pla
 # whichever run is most recently modified.
 # Only used by the weak-GPU watch mode (TRAIN_SEPARATE_DASH=1): a profile-driven run starts its own graphs.
 # Must match that run's experiment folder.
-DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_kp40_iter4_realistic --output /tmp/dashboard.png"
+DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/rsl_rl/go2_kp50_iter5_hist6 --output /tmp/dashboard.png"
 VIEW_CMD="feh --scale-down --reload 0.5 /tmp/dashboard.png"
 
 # Same live-dashboard setup as training's, but reading play.py's --live_plot output instead (a separate
@@ -93,19 +94,16 @@ PLAY_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/play_dashboard.png"
 # and fails on a missing "FILL_IN_NIC" input file, instead of erroring obviously. A bare placeholder word
 # has no such failure mode. network_mode: host (docker-compose.yml) is what makes binding a specific host
 # NIC from inside this container possible at all.
-# --test_profile confident: gives the startup ramp hold_kp=60 + lift_calf_tether_deg=25 (hold_kp 40 stalls the lift
-# to default pose) plus the wider policy-loop tether/slew. --low_pass (5 Hz EMA on the action) suppresses the ~25 Hz
-# every-tick buzz (the policy amplifying joint-velocity sensor noise); validated in sim2sim. The explicit
-# --max_target_dev_deg overrides the profile's ramp tether per-value. Drop --low_pass for an unfiltered run; swap to
-# --test_profile cautionary (slower slew) for the first touch of an unproven policy.
-# Profiles live in deploy/configs/test_profiles.yaml and can also set policy_path and low_pass, so a single
-# `--deploy_profile <name>` (alias of --test_profile) can pick the policy AND its safety limits; any explicit flag
-# here still overrides the profile. Add `--policy_path models/<dir>/exported/policy.pt` to try another policy.
-# --deploy_profile iter4_realistic (deploy/configs/test_profiles.yaml) now carries everything this line used to spell out
-# (the confident limits, --max_target_dev_deg 25, --low_pass, the policy path) PLUS the live graphs: live_dashboard /
-# dashboard_viewer make deploy_real.py start the dashboard and feh itself, so there is no separate dashboard or
-# viewer pane for the hardware window any more. Edit the profile, or override one value with a flag here.
-HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --network_interface enp2s0 --manual_commands --deploy_profile iter4_realistic --dry_run"
+# --config go2_obs_stacking.yaml selects the obs_stacking deploy recipe (history_length=6, kp/kd 50/1.0,
+# joint_vel_filter_hz=10) -- its policy_path must first be repointed at the trained obs_stacking export.
+# --test_profile confident gives the startup ramp hold_kp=60 + lift_calf_tether_deg=25 (hold_kp 40 stalls the lift to
+# default pose) plus the wider policy-loop tether/slew; the explicit --max_target_dev_deg overrides the profile's ramp
+# tether per-value. NO --low_pass: the H=6 stacked policy with the 10 Hz joint_vel EMA is the principled fix for the
+# ~25 Hz buzz, so the deploy action low-pass band-aid is no longer the default (re-add --low_pass only if a buzz still
+# shows up). Swap to --test_profile cautionary (slower slew) for the first touch of an unproven policy.
+# --live_plot --live_dashboard make deploy_real.py start the dashboard and feh itself, so there is no separate
+# dashboard or viewer pane for the hardware window.
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --config deploy/configs/go2_obs_stacking.yaml --network_interface enp2s0 --manual_commands --live_plot --live_dashboard --test_profile confident --max_target_dev_deg 25 --dry_run"
 
 # Tier-1 read-only pre-flight check (deploy/preflight_check.py) -- structurally incapable of publishing
 # anything (no ChannelPublisher/LowCmd_ import in that file at all), so it's safe to run alongside
@@ -123,7 +121,9 @@ PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.p
 # MuJoCo sim2sim (sim2sim/sim2sim_mujoco.py, see sim2sim/README.md): runs an exported policy in MuJoCo with the
 # same slider and dashboard as play/hardware. Isaac Sim's bundled Python directly, no Kit, same as HARDWARE_CMD.
 # The Menagerie Go2 model is fetched on first use (gitignored, not baked into the image).
-SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --manual_commands --live_plot"
+# --config go2_obs_stacking.yaml so sim2sim matches the stacked policy: history_length=6 and kp50/kd1.0 come from the
+# config (no need for an explicit --history_length). Its policy_path must point at the trained obs_stacking export.
+SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --config deploy/configs/go2_obs_stacking.yaml --manual_commands --live_plot"
 SIM2SIM_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/sim2sim_dashboard --output /tmp/sim2sim_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
 SIM2SIM_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/sim2sim_dashboard.png"
 
