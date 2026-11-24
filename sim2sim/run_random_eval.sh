@@ -16,7 +16,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-CKPT=""; SEEDS="0 1 2"; SEGMENTS=20; SEGMENT_S=4; SCALE=1.0; OUT=""; POLICY=""; SETTLE=1.0
+CONFIG=""; CKPT=""; SEEDS="0 1 2"; SEGMENTS=20; SEGMENT_S=4; SCALE=1.0; OUT=""; POLICY=""; SETTLE=1.0
 GUI=0; SKIP_ISAAC=0; SKIP_MUJOCO=0
 ISAACLAB_SH="${ISAACLAB_SH:-/workspace/isaaclab/isaaclab.sh}"
 PYTHON_SH="${PYTHON_SH:-/workspace/isaaclab/_isaac_sim/python.sh}"
@@ -32,6 +32,7 @@ while [ $# -gt 0 ]; do
     --scale) SCALE="$2"; shift 2 ;;
     --out_dir) OUT="$2"; shift 2 ;;
     --policy) POLICY="$2"; shift 2 ;;
+    --config) CONFIG="$2"; shift 2 ;;     # deploy config for MuJoCo (gains, history_length, joint_vel filter)
     --settle_s) SETTLE="$2"; shift 2 ;;
     --gui) GUI=1; shift ;;              # show the Isaac window instead of running headless
     --skip_isaac) SKIP_ISAAC=1; shift ;;
@@ -65,7 +66,7 @@ for S in $SEEDS; do
   if [ "$SKIP_MUJOCO" -eq 0 ]; then
     [ -f "$POLICY" ] || die "exported policy not found: $POLICY (run the Isaac step first, or pass --policy)"
     echo "[eval] seed $S: MuJoCo"
-    "$PYTHON_SH" sim2sim/sim2sim_mujoco.py --headless --policy "$POLICY" --scenario "$SCEN" \
+    "$PYTHON_SH" sim2sim/sim2sim_mujoco.py --headless ${CONFIG:+--config "$CONFIG"} --policy "$POLICY" --scenario "$SCEN" \
       --trace_out "$OUT/seed${S}_mujoco.npz" > "$OUT/seed${S}_mujoco.log" 2>&1 \
       || die "MuJoCo run failed for seed $S (see $OUT/seed${S}_mujoco.log)"
   fi

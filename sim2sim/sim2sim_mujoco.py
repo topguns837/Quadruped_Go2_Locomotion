@@ -634,6 +634,8 @@ def main():
         state_history: list = []
         obs_history = deploy_real.ObsHistory(  # stacks the last H single frames in Isaac Lab's layout (see deploy_real)
             history_length, deploy_real.frame_term_widths(obs_dim, layout))
+        # joint_vel EMA low-pass, identical to deploy_real / the training obs term (None cutoff = passthrough).
+        jv_filter = deploy_real.ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
         stats: list[SegmentStats] = []
         step = 0
         stop = False
@@ -658,6 +660,7 @@ def main():
                 frame = deploy_real.build_observation(
                     cfg, state_history[0], sdk_to_isaac, default_isaac, manual_cmd, last_action,
                     base_height=base_height_obs, include_base_lin_vel=layout["has_lin_vel"],
+                    joint_vel_filter=jv_filter,
                 )
                 if noise_amp is not None:
                     # additive uniform noise U(-amp, amp) per element, as in training (enable_corruption),
@@ -730,6 +733,7 @@ def main():
                         break
                     robot.reset()
                     last_action = [0.0] * 12
+                    jv_filter.reset()
                     obs_history.reset()  # mirror Isaac Lab clearing the history buffer on episode reset
                     state_history.clear()
 
