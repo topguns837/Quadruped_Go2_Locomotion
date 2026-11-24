@@ -94,16 +94,17 @@ PLAY_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/play_dashboard.png"
 # and fails on a missing "FILL_IN_NIC" input file, instead of erroring obviously. A bare placeholder word
 # has no such failure mode. network_mode: host (docker-compose.yml) is what makes binding a specific host
 # NIC from inside this container possible at all.
-# --config go2_obs_stacking.yaml selects the obs_stacking deploy recipe (history_length=6, kp/kd 50/1.0,
-# joint_vel_filter_hz=10) -- its policy_path must first be repointed at the trained obs_stacking export.
-# --test_profile confident gives the startup ramp hold_kp=60 + lift_calf_tether_deg=25 (hold_kp 40 stalls the lift to
-# default pose) plus the wider policy-loop tether/slew; the explicit --max_target_dev_deg overrides the profile's ramp
-# tether per-value. NO --low_pass: the H=6 stacked policy with the 10 Hz joint_vel EMA is the principled fix for the
-# ~25 Hz buzz, so the deploy action low-pass band-aid is no longer the default (re-add --low_pass only if a buzz still
-# shows up). Swap to --test_profile cautionary (slower slew) for the first touch of an unproven policy.
+# Two orthogonal profiles: --deploy_profile go2_obs_stacking = deploy/profiles/go2_obs_stacking.yaml, the WHOLE policy
+# recipe (history_length=6 observation stack, kp/kd 50/1.0, joint_vel_filter_hz=10, policy_path = the trained
+# obs_stacking export; use go2_locomotion for the single-frame kp40 policy, history_length=1). --safety_profile
+# confident (deploy/configs/safety_profiles.yaml) gives the startup ramp hold_kp=60 + lift_calf_tether_deg=25 (hold_kp 40 stalls the
+# lift to default pose) plus the wider policy-loop tether/slew; the explicit --max_target_dev_deg overrides the
+# profile's ramp tether per-value. NO --low_pass: the H=6 stacked policy with the 10 Hz joint_vel EMA is the principled
+# fix for the ~25 Hz buzz, so the deploy action low-pass band-aid is no longer the default (re-add --low_pass only if a
+# buzz still shows up). Swap to --safety_profile cautionary (slower slew) for the first touch of an unproven policy.
 # --live_plot --live_dashboard make deploy_real.py start the dashboard and feh itself, so there is no separate
 # dashboard or viewer pane for the hardware window.
-HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --config deploy/configs/go2_obs_stacking.yaml --network_interface enp2s0 --manual_commands --live_plot --live_dashboard --test_profile confident --max_target_dev_deg 25 --dry_run"
+HARDWARE_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/deploy_real.py --deploy_profile go2_obs_stacking --network_interface enp2s0 --manual_commands --live_plot --live_dashboard --safety_profile confident --max_target_dev_deg 25 --dry_run"
 
 # Tier-1 read-only pre-flight check (deploy/preflight_check.py) -- structurally incapable of publishing
 # anything (no ChannelPublisher/LowCmd_ import in that file at all), so it's safe to run alongside
@@ -121,9 +122,9 @@ PREFLIGHT_CMD="/workspace/isaaclab/_isaac_sim/python.sh deploy/preflight_check.p
 # MuJoCo sim2sim (sim2sim/sim2sim_mujoco.py, see sim2sim/README.md): runs an exported policy in MuJoCo with the
 # same slider and dashboard as play/hardware. Isaac Sim's bundled Python directly, no Kit, same as HARDWARE_CMD.
 # The Menagerie Go2 model is fetched on first use (gitignored, not baked into the image).
-# --config go2_obs_stacking.yaml so sim2sim matches the stacked policy: history_length=6 and kp50/kd1.0 come from the
+# --config deploy/profiles/go2_obs_stacking.yaml so sim2sim matches the stacked policy: history_length=6 and kp50/kd1.0 come from the
 # config (no need for an explicit --history_length). Its policy_path must point at the trained obs_stacking export.
-SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --config deploy/configs/go2_obs_stacking.yaml --manual_commands --live_plot"
+SIM2SIM_CMD="./sim2sim/fetch_go2_model.sh && /workspace/isaaclab/_isaac_sim/python.sh sim2sim/sim2sim_mujoco.py --config deploy/profiles/go2_obs_stacking.yaml --manual_commands --live_plot"
 SIM2SIM_DASHBOARD_CMD="isaaclab -p scripts/live_dashboard.py --logdir logs/sim2sim_dashboard --output /tmp/sim2sim_dashboard.png --max-points 500 --exclude-panels 'Mean reward,Mean episode length,Velocity tracking error' --y-range-multiplier 2.0"
 SIM2SIM_VIEW_CMD="feh --scale-down --reload 0.5 /tmp/sim2sim_dashboard.png"
 

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Optional ``relay:`` block of a deploy profile (deploy/configs/test_profiles.yaml) for deploy_real_wireless.py.
+"""Optional ``relay:`` block of a deploy profile (deploy/configs/safety_profiles.yaml) for deploy_real_wireless.py.
 
 Pure YAML + validation, no torch / SDK, so it is unit-testable anywhere. The block's keys map onto the wireless
 script's relay flags; the result is fed to argparse ``set_defaults`` so precedence stays CLI > profile > default.

@@ -24,7 +24,7 @@ try:
 except Exception as e:  # noqa: BLE001 -- torch / SDK not available on this interpreter
     torch, dr, _ERR = None, None, e
 
-REAL_CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "go2_locomotion.yaml")
+REAL_CONFIG = os.path.join(os.path.dirname(__file__), "..", "profiles", "go2_locomotion.yaml")
 SKIP = unittest.skipIf(dr is None or not hasattr(torch, "nn"), f"deploy_real/torch not usable here: {_ERR}")
 
 

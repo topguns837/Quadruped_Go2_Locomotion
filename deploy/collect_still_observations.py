@@ -49,7 +49,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Record real sensor data from a still, standing robot (no commands ever sent)."
     )
-    parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
+    parser.add_argument("--config", type=str, default="deploy/profiles/go2_locomotion.yaml")
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument("--duration_s", type=float, default=10.0, help="Recording length in seconds.")
     parser.add_argument(

@@ -22,8 +22,8 @@ WiFi access point bridged onto `eth0` was tried and retired; the sections after 
 - On the Jetson, the WiFi NetworkManager profile must be bound to the wlan device only
   (`connection.interface-name <wlan>`) and never edit `eth0`'s profile, IP or routes. After bring-up check that `eth0`
   is unchanged and `python deploy/lowstate_probe.py --network_interface eth0` still shows ~500 Hz.
-- Settings live in the `wireless` profile of `deploy/configs/test_profiles.yaml` (a `relay:` block: host, key_file,
-  ports, rate, log_nic); a run is `deploy/deploy_real_wireless.py --deploy_profile wireless --manual_commands`. Any
+- Settings live in the `wireless` profile of `deploy/configs/safety_profiles.yaml` (a `relay:` block: host, key_file,
+  ports, rate, log_nic); a run is `deploy/deploy_real_wireless.py --safety_profile wireless --manual_commands`. Any
   explicit flag overrides the profile.
 - Bench first, on the desktop alone with no robot: `deploy/tests/run_t2_loopback.sh` (stack on loopback), then
   `link_check.sh <dongle iface> 60 <modem ip>` to measure the real radio. Do NOT bind the relay to the dongle IP and
@@ -70,7 +70,7 @@ be the Jetson, and nothing is installed on the robot.
    ```
 3. For a wireless run, unplug the desktop's cable so only WiFi is on `123.x`. With both connected, replies
    can take either path and `ping -I <wifi>` tests become unreliable. Replug it for emergency access.
-4. Point deploy at the WiFi interface: `network_interface` in `deploy/configs/go2_locomotion.yaml`, or
+4. Point deploy at the WiFi interface: `network_interface` in `deploy/profiles/go2_locomotion.yaml`, or
    `--network_interface <wifi>`. No code change is needed.
 
 Bring it up in order, and stop at the first rung that fails (`deploy/Checklist.md` still governs real

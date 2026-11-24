@@ -15,6 +15,10 @@ policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # JIT export --
   # 2026-11-03_22-14-59, 18k iterations total). NOT yet tried on hardware; sim2sim only. Expect a lower stance
   # and foot skim -- see docs/gait_realism_diagnosis.md. The previous hardware-tested policy is
   # models/10_14_26_real_hardware_parity_tested/ (50-dim; swap policy_path back to use it).
+history_length: 1  # observation stack depth: 1 = single frame (every policy before obs_stacking_with_height). Must equal the
+                   # policy's training HISTORY_LENGTH; policy_obs_layout rejects a mismatch at startup.
+joint_vel_filter_hz: null  # no joint_vel EMA for this policy (it was not trained with the filter).
+
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
 network_interface: null  # REQUIRED before first run -- the HOST NIC on the robot's 192.168.123.0/24 network.

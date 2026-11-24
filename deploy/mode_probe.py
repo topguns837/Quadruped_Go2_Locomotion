@@ -33,7 +33,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Read-only motion-service / motor / controller probe.")
-    parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
+    parser.add_argument("--config", type=str, default="deploy/profiles/go2_locomotion.yaml")
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument(
         "--watch_s", type=float, default=15.0,

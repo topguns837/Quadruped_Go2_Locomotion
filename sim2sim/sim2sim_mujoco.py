@@ -393,7 +393,7 @@ def close_viewer(viewer, viewer_threads: set[threading.Thread], timeout_s: float
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run an exported Go2 policy in MuJoCo (sim2sim).")
-    parser.add_argument("--config", default=os.path.join(_REPO_ROOT, "deploy", "configs", "go2_locomotion.yaml"))
+    parser.add_argument("--config", default=os.path.join(_REPO_ROOT, "deploy", "profiles", "go2_locomotion.yaml"))
     parser.add_argument("--policy", default=None, help="Exported policy.pt (default: policy_path in --config).")
     parser.add_argument(
         "--height_source",

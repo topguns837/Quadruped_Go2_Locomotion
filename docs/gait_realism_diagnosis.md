@@ -23,7 +23,7 @@ Confirmed by `git diff 8d26178 44bb1b9` on `quadruped_go2_locomotion_env_cfg.py`
 - **PhysX hard joint-speed clamp removed** in the earlier commit `e1ad833`
   (`PHYSX_JOINT_SPEED_LIMIT = 500`, `unitree_go2witharm_cfg.py:30`) — real-hardware parity.
 - **kp/kd raised 25/0.5 → 40/0.8** (`unitree_go2witharm_cfg.py:95-100,110-111`) so the stance can be held
-  passively; deploy gains in `deploy/configs/go2_locomotion.yaml` must match.
+  passively; deploy gains in `deploy/profiles/go2_locomotion.yaml` must match.
 - Added the mass/COM/push **DR curriculum** (`mdp/events.py`, `mdp/curriculums.py`).
 
 ## Evidence: the reward balance the policy actually optimized
@@ -87,7 +87,7 @@ Per-term `Episode_Reward/*` from the run's tfevents, mean over the last 30% of t
 ### 2a. Does MuJoCo reproduce Isaac? (parity check — why the two claims have different confidence)
 
 Verified against the trained run's own dump (`…/2026-11-02_14-39-14/params/env.yaml`),
-`unitree_go2witharm_cfg.py`, `deploy/configs/go2_locomotion.yaml`, `sim2sim/go2_model.py` and
+`unitree_go2witharm_cfg.py`, `deploy/profiles/go2_locomotion.yaml`, `sim2sim/go2_model.py` and
 `sim2sim/sim2sim_mujoco.py`.
 
 **Matches exactly (so the actuator/robot the policy drives is the same in both):** PD gains kp40/kd0.8;
@@ -145,7 +145,7 @@ clearance and stance height within limits together:
 3. **Height reconciliation:** read `base_height_l2_pitch` (`mdp/rewards.py:82`) against the sim2sim per-segment
    height column.
 4. **MuJoCo↔Isaac parity:** cross-read `params/env.yaml`, `unitree_go2witharm_cfg.py`,
-   `deploy/configs/go2_locomotion.yaml`, `sim2sim/go2_model.py`, `sim2sim/sim2sim_mujoco.py` (see §2a).
+   `deploy/profiles/go2_locomotion.yaml`, `sim2sim/go2_model.py`, `sim2sim/sim2sim_mujoco.py` (see §2a).
 5. **Behaviour cross-check:** `sim2sim/sim2sim_mujoco.py --headless --scenario sim2sim/scenarios/basic.yaml
    --policy …/2026-11-03_22-14-59/exported/policy.pt` shows the low stance (0.05–0.12 m, MuJoCo) and 0 falls.
    For the Isaac-true stance height, `scripts/rsl_rl/play.py --trace_out …` then read the root-height channel;

@@ -63,7 +63,7 @@ class _Buf:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify joint index maps end to end (no hardware).")
-    parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
+    parser.add_argument("--config", type=str, default="deploy/profiles/go2_locomotion.yaml")
     args = parser.parse_args()
 
     cfg = dr.load_config(args.config, "lo")

@@ -94,7 +94,7 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
             armature=JOINT_ARMATURE,
             # kp/kd raised 25/0.5 -> 40/0.8 (2026-10-30), then 40/0.8 -> 50/1.0 (obs-stacking retrain): matches
             # the Glowing-Torch Go2 reference deploy's stand gain and, more importantly, the higher kd directly
-            # damps the ~25 Hz hardware buzz. The deploy kp/kd (deploy/configs/go2_locomotion.yaml) MUST match
+            # damps the ~25 Hz hardware buzz. The deploy kp/kd (deploy/profiles/go2_locomotion.yaml) MUST match
             # these for the policy in use, since the action->torque mapping is learned at this stiffness; the
             # actuator_gains EventCfg DR band is widened (x0.8-1.2) so a kd~1.0 deploy stays in-distribution.
             # Policies trained at 40/0.8 (and 25) are NOT valid at these gains.

@@ -190,7 +190,7 @@ class Relay:
         here = os.path.dirname(os.path.abspath(__file__))
         files = [os.path.join(here, f) for f in (
             "relay_jetson.py", "relay_link.py", "deploy_real.py", "impair.py", "runlog.py", "fake_robot.py",
-            os.path.join("configs", "go2_locomotion.yaml"))]
+            os.path.join("profiles", "go2_locomotion.yaml"))]
         meta = rlg.base_meta("relay", getattr(self.args, "run_id", ""), argv, files)
         meta["args"] = {k: v for k, v in vars(self.args).items()}
         meta["config"] = {"kp": self.cfg.kp, "kd": self.cfg.kd, "link_lost_after_s": self.cfg.link_lost_after_s,
@@ -699,7 +699,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--key_file", type=str, default=os.path.expanduser("~/.go2_relay_key"))
     p.add_argument("--init_key", type=str, default=None, metavar="PATH",
                    help="Create a new random key at PATH (mode 600) and exit; copy it to the desktop.")
-    p.add_argument("--config", type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "go2_locomotion.yaml"))
+    p.add_argument("--config", type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles", "go2_locomotion.yaml"))
     p.add_argument("--bind", type=str, default="0.0.0.0")
     p.add_argument("--control_port", type=int, default=rl.DEFAULT_CONTROL_PORT)
     p.add_argument("--cmd_port", type=int, default=rl.DEFAULT_CMD_PORT)

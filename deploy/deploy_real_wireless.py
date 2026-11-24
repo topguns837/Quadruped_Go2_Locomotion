@@ -143,12 +143,12 @@ def parse_all_args() -> tuple[argparse.Namespace, argparse.Namespace]:
     # A profile's optional `relay:` block (deploy/relay_profile.py) becomes these flags' defaults, so the precedence
     # stays  explicit CLI flag > profile > built-in default. dr.parse_args() reads the rest of the same profile.
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--test_profile", "--deploy_profile", dest="test_profile", default=None)
-    pre.add_argument("--test_profiles_file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                                  "configs", "test_profiles.yaml"))
+    pre.add_argument("--safety_profile", "--test_profile", dest="safety_profile", default=None)
+    pre.add_argument("--safety_profiles_file", "--test_profiles_file", dest="safety_profiles_file",
+                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "safety_profiles.yaml"))
     pre_args, _ = pre.parse_known_args()
-    if pre_args.test_profile is not None:
-        relay_parser.set_defaults(**relay_profile.load_relay_block(pre_args.test_profiles_file, pre_args.test_profile))
+    if pre_args.safety_profile is not None:
+        relay_parser.set_defaults(**relay_profile.load_relay_block(pre_args.safety_profiles_file, pre_args.safety_profile))
     relay_args, rest = relay_parser.parse_known_args()
     relay_args.relay_key_file = os.path.expanduser(relay_args.relay_key_file)
     if any(a in ("-h", "--help") for a in rest):
@@ -246,7 +246,7 @@ def main() -> int:
     meta = rlg.base_meta("desktop", relay_args.run_id, sys.argv, [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), f) for f in (
             "deploy_real_wireless.py", "relay_link.py", "deploy_real.py", "impair.py", "runlog.py", "relay_jetson.py",
-            os.path.join("configs", "go2_locomotion.yaml"))] + [cfg.policy_path])
+            os.path.join("profiles", "go2_locomotion.yaml"))] + [cfg.policy_path])
     meta.update({
         "relay_args": vars(relay_args), "deploy_args": {k: v for k, v in vars(args).items()},
         "config": {"kp": cfg.kp, "kd": cfg.kd, "link_lost_after_s": cfg.link_lost_after_s, "control_dt": cfg.control_dt,

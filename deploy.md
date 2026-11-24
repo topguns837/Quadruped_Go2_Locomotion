@@ -23,7 +23,7 @@ pipeline is proven safe and correct — it changes nothing about the control log
 Everything else in this doc's staged plan (physical safety setup, the `deploy/` code itself, the SDK/CRC/
 Dockerfile work) is done and committed. What's left, in rough priority order:
 
-1. **`isaac_joint_order` in `deploy/configs/go2_locomotion.yaml` is still the placeholder guess**
+1. **`isaac_joint_order` in `deploy/profiles/go2_locomotion.yaml` is still the placeholder guess**
    (alphabetical `FL/FR/RL/RR × hip/thigh/calf`) — `deploy/dump_joint_order.py` has never actually been run.
    Pure sim task, no robot needed, do this first (see Stage 2).
 2. **Manual single-joint-wiggle confirmation not yet done** — the first real `preflight_check.py` run (Stage
@@ -120,7 +120,7 @@ sibling script **`deploy/deploy_real_wireless.py`**: the policy, observation bui
 watchdogs are `deploy_real.py`'s own code (imported, unchanged), but robot I/O goes through a small **relay on the
 Jetson** (`deploy/relay_jetson.py`). The Jetson is on the robot's `192.168.123.0/24` network through its
 untouched `eth0` and speaks DDS to the robot; it speaks authenticated UDP/TCP to the desktop over WiFi (a modem on its own subnet, never 192.168.123.x; topology and
-bring-up rules in `deploy/wireless/README.md`, run settings in the `wireless` profile of `deploy/configs/test_profiles.yaml`).
+bring-up rules in `deploy/wireless/README.md`, run settings in the `wireless` profile of `deploy/configs/safety_profiles.yaml`).
 
 Why a relay and not WiFi DDS: DDS needs same-subnet multicast and the robot's `123.x` network is wired-only, and
 `unitree_sdk2py` hard-codes its CycloneDDS config (`CYCLONEDDS_URI` is ignored), so a desktop on WiFi cannot join.
@@ -154,7 +154,7 @@ Test ladder (stop at the first failure; real motors only at the last rung):
 3. **WiFi soak:** `deploy/wireless/link_check.sh <desktop lab NIC> 600 <jetson lab IP>` plus a 100 Hz relay run (next rung);
    loss must be 0% with no multi-second silences.
 4. **Over real WiFi, no robot:** on the Jetson run `fake_robot.py` and `relay_jetson.py` **both on `--network_interface
-   lo`** (loopback DDS, never touching `eth0` or the robot), and on the desktop `deploy_real_wireless.py --deploy_profile wireless
+   lo`** (loopback DDS, never touching `eth0` or the robot), and on the desktop `deploy_real_wireless.py --safety_profile wireless
    --relay_host <jetson> --skip_release`. Watch the round-trip and gap summary.
 5. **Real robot, hoisted, `deploy/Checklist.md`:** first stop the ROS node that can send sport commands
    (`go2_highroscontrol`, a plain `kill`; a reboot restores it), then run the relay on `eth0` and the desktop script
@@ -181,7 +181,7 @@ python deploy/tools/analyze_soak.py logs/relay_runs/<RUN>      # report.md, repo
 tooling. Pass rules are at the top of `deploy/tools/analyze_soak.py`.
 
 ### Stage 1 — `deploy/` directory — **done, and now checked against the real SDK, not just documentation**
-- `deploy/configs/go2_locomotion.yaml` — joint order/index mapping (both `isaac_joint_order` and
+- `deploy/profiles/go2_locomotion.yaml` — joint order/index mapping (both `isaac_joint_order` and
   `sdk_joint_order`, remapped via `build_joint_index_maps`), PD gains (`kp=25.0`, `kd=0.5`, copied from
   `unitree_go2witharm_cfg.py`'s actual training-time actuator config, not generic hardware defaults),
   `action_scale=0.25`, `default_joint_pos` per joint, `control_dt=0.02`, `policy_path` (points at the
@@ -308,7 +308,7 @@ Once retrained, the new policy will be 50-dim (5-dim command, no `base_height` o
 `base_pos_z` bullet above) and `deploy_real.py`'s `DeployConfig` no longer has a `has_height_obs` field, so
 there is nothing left to infer from the filename any more.
 
-Set `policy_path` in `deploy/configs/go2_locomotion.yaml` to whichever `exported/policy.pt` you're using —
+Set `policy_path` in `deploy/profiles/go2_locomotion.yaml` to whichever `exported/policy.pt` you're using —
 **not** the raw `model_<N>.pt` checkpoint (that's the full RSL-RL training state, not a standalone inference
 module; see the config's own comment).
 
@@ -318,7 +318,7 @@ module; see the config's own comment).
 # GPU-safe: check nvidia-smi first, don't run this while another sim session has the GPU.
 isaaclab -p deploy/dump_joint_order.py --task=Quadruped-Locomotion-Go2-Play --num_envs 1 --headless
 ```
-Copy the printed order into `isaac_joint_order` in `deploy/configs/go2_locomotion.yaml`, replacing the
+Copy the printed order into `isaac_joint_order` in `deploy/profiles/go2_locomotion.yaml`, replacing the
 current placeholder guess. `sdk_joint_order` is already filled in correctly (confirmed against Unitree's own
 SDK source this session) and shouldn't need touching unless Unitree changes their convention.
 
@@ -359,7 +359,7 @@ at all), so it's incapable of moving the robot, not just configured not to.
 
 1. Ethernet cable from your dev machine to the robot; power the robot on.
 2. Identify your NIC: `ifconfig` (look for the interface that came up when you plugged in).
-3. Edit `deploy/configs/go2_locomotion.yaml`'s `network_interface`, or pass `--network_interface` on the
+3. Edit `deploy/profiles/go2_locomotion.yaml`'s `network_interface`, or pass `--network_interface` on the
    command line (the CLI flag overrides the config file).
 4. Run it:
    ```bash

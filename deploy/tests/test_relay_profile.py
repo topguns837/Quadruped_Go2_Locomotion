@@ -24,7 +24,7 @@ try:
 except Exception:  # noqa: BLE001 -- torch / SDK not available on this interpreter
     dr = None
 
-PROFILES = os.path.join(HERE, "..", "configs", "test_profiles.yaml")
+PROFILES = os.path.join(HERE, "..", "configs", "safety_profiles.yaml")
 
 
 def write(text: str) -> str:
@@ -142,13 +142,13 @@ class WiredParserIgnoresRelayBlock(unittest.TestCase):
     def test_wired_loader_tolerates_relay_key(self):
         valid = {"low_pass"}
         p = write("a:\n  low_pass: 5.0\n  relay:\n    host: 10.0.0.2\n")
-        self.assertEqual(dr.load_test_profile(p, "a", valid), {"low_pass": 5.0})
+        self.assertEqual(dr.load_safety_profile(p, "a", valid), {"low_pass": 5.0})
 
     def test_every_shipped_profile_still_loads_through_the_real_parser(self):
         saved = sys.argv
         try:
             for name in ("cautionary", "confident", "no_limits", "iter4_realistic", "wireless"):
-                sys.argv = ["deploy_real.py", "--deploy_profile", name]
+                sys.argv = ["deploy_real.py", "--safety_profile", name]
                 dr.parse_args()
         finally:
             sys.argv = saved

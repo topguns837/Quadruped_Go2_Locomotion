@@ -285,7 +285,7 @@ def launch_live_dashboard(logdir: str, interval: float, startup_timeout: float =
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Read-only Tier-1 pre-flight checks (see deploy.md).")
-    parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
+    parser.add_argument("--config", type=str, default="deploy/profiles/go2_locomotion.yaml")
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between printed snapshots.")
     parser.add_argument(

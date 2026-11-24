@@ -1,5 +1,5 @@
-# Named hardware test/deploy profiles for deploy_real.py / deploy_real_wireless.py:  --test_profile <name>
-# (--deploy_profile is an alias for the same flag.)
+# Named hardware test/deploy profiles for deploy_real.py / deploy_real_wireless.py:  --safety_profile <name>
+# (--test_profile is the deprecated alias of --safety_profile; --deploy_profile now selects the policy recipe in deploy/profiles/.)
 #
 # Edit any value here and it takes effect on the NEXT run (this file is re-read at every launch).
 # Precedence per value:  explicit CLI flag  >  this profile  >  the built-in default in deploy_real.py.
@@ -83,7 +83,7 @@ no_limits:
 # The setup validated on hardware 2026-11-18/19 with models/11_18_26_iter4_realistic: the `confident` limits with the
 # startup-ramp tether widened to 25 deg, the 5 Hz action low-pass (suppresses the ~25 Hz buzz) and the per-calf torque
 # abort at its own rating. Selects the policy too, so ONE name reproduces the whole run:
-#   deploy/deploy_real.py --network_interface <nic> --manual_commands --deploy_profile iter4_realistic
+#   deploy/deploy_real.py --network_interface <nic> --manual_commands --safety_profile iter4_realistic
 iter4_realistic:
   policy_path: models/11_18_26_iter4_realistic/exported/policy.pt
   max_joint_speed_rad_s: 15.0
@@ -105,7 +105,7 @@ iter4_realistic:
 # block that replaces the long --relay_* flags. The `relay:` block is read only by deploy_real_wireless.py (wired
 # deploy_real.py ignores it); an explicit CLI flag still overrides every value here. Topology and bring-up:
 # deploy/wireless/README.md and deploy.md Stage 0b.
-#   deploy/deploy_real_wireless.py --deploy_profile wireless --manual_commands
+#   deploy/deploy_real_wireless.py --safety_profile wireless --manual_commands
 # link_lost_after / the relay's --silence_damp_s are deliberately NOT set yet: tune them from the measured gaps/RTT.
 wireless:
   policy_path: models/11_18_26_iter4_realistic/exported/policy.pt

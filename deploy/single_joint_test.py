@@ -76,7 +76,7 @@ def publish_single(low_cmd, cmd: SingleJointCommand, publisher, crc) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Single-joint LowCmd command-path test (see module docstring).")
-    parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
+    parser.add_argument("--config", type=str, default="deploy/profiles/go2_locomotion.yaml")
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument("--joint", type=str, default="RL_hip_joint", help="Joint name from sdk_joint_order.")
     parser.add_argument("--kp", type=float, default=10.0, help="Unitree's own safe test gain.")

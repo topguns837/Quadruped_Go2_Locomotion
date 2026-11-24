@@ -41,7 +41,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--isaac_trace", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--config", default=os.path.join(s2s._REPO_ROOT, "deploy", "configs", "go2_locomotion.yaml"))
+    parser.add_argument("--config", default=os.path.join(s2s._REPO_ROOT, "deploy", "profiles", "go2_locomotion.yaml"))
     parser.add_argument("--motor_limits", choices=sorted(s2s.MOTOR_LIMITS), default="hardware")
     parser.add_argument("--armature", type=float, default=None, help="Override joint armature (default: sim2sim_mujoco.ARMATURE, 0.01).")
     parser.add_argument("--foot_friction", type=float, default=None, help="Override foot sliding friction.")

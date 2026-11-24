@@ -170,7 +170,7 @@ def load_config(path: str, cli_network_interface: str | None, cli_link_lost_afte
 
 
 # ---------------------------------------------------------------------------------------------------------
-# Joint-order plumbing -- deploy/configs/go2_locomotion.yaml's isaac_joint_order and sdk_joint_order are
+# Joint-order plumbing -- deploy/profiles/go2_locomotion.yaml's isaac_joint_order and sdk_joint_order are
 # both lists of the SAME 12 joint names, just in each side's own order. Every permutation needed (SDK ->
 # Isaac for building observations, Isaac -> SDK for sending commands) is a pure index remap built once at
 # startup, never recomputed per-tick.
@@ -1391,11 +1391,14 @@ HOIST_PAUSE_PROMPT = """
 Press SPACE when the robot is hoisted (or on the ground, if skipping the hoist) to start the startup ramp..."""
 
 
+DEFAULT_PROFILE = os.path.join(os.path.dirname(__file__), "profiles", "go2_locomotion.yaml")
+PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
+
 _RATED_SPEED_CAP = (30.1, 30.1, 15.7)  # hip, thigh, calf rad/s: unitree_go2witharm_cfg.py velocity_limit
 
 
-def load_test_profile(path: str, name: str, valid: set[str]) -> dict:
-    """Load one named block from the test-profiles YAML and validate it against the real flag names.
+def load_safety_profile(path: str, name: str, valid: set[str]) -> dict:
+    """Load one named block from the safety-profiles YAML and validate it against the real flag names.
 
     Returns {flag_dest: value} ready for argparse's set_defaults. Raises on an unknown profile or key so a typo
     fails loudly at startup instead of silently running with a default.
@@ -1403,58 +1406,67 @@ def load_test_profile(path: str, name: str, valid: set[str]) -> dict:
     with open(path) as f:
         data = yaml.safe_load(f) or {}
     if name not in data:
-        raise ValueError(f"test profile '{name}' not found in {path}. Available: {sorted(data)}")
+        raise ValueError(f"safety profile '{name}' not found in {path}. Available: {sorted(data)}")
     profile = data[name]
     if not isinstance(profile, dict):
-        raise ValueError(f"test profile '{name}' in {path} must be a mapping of flag name -> value")
+        raise ValueError(f"safety profile '{name}' in {path} must be a mapping of flag name -> value")
     # An optional `relay:` block belongs to deploy_real_wireless.py (deploy/relay_profile.py); the wired script ignores it.
     profile = {k: v for k, v in profile.items() if k != "relay"}
-    reserved = {"test_profile", "test_profiles_file", "config", "network_interface"}
+    reserved = {"safety_profile", "safety_profiles_file", "deploy_profile", "config", "network_interface"}
     bad = [k for k in profile if k not in valid or k in reserved]
     if bad:
-        raise ValueError(f"test profile '{name}' in {path} has unknown/unsupported key(s) {bad}")
+        raise ValueError(f"safety profile '{name}' in {path} has unknown/unsupported key(s) {bad}")
     cap = profile.get("speed_fault_cap_rad_s")
     if cap is not None:
         ok = isinstance(cap, (list, tuple)) and len(cap) == 3 and all(isinstance(c, (int, float)) and c > 0 for c in cap)
         if not ok:
-            raise ValueError(f"test profile '{name}': speed_fault_cap_rad_s must be 3 positive numbers (hip/thigh/calf)")
+            raise ValueError(f"safety profile '{name}': speed_fault_cap_rad_s must be 3 positive numbers (hip/thigh/calf)")
         profile["speed_fault_cap_rad_s"] = [float(c) for c in cap]
         if any(c > r + 1e-9 for c, r in zip(cap, _RATED_SPEED_CAP)):
-            print(f"[WARN] test profile '{name}': speed_fault_cap_rad_s {cap} is above the rated "
+            print(f"[WARN] safety profile '{name}': speed_fault_cap_rad_s {cap} is above the rated "
                   f"{list(_RATED_SPEED_CAP)}; the measured-speed abort is looser than the motors' rating.")
     steps = profile.get("speed_fault_steps")
     if steps is not None and (not isinstance(steps, int) or steps < 1):
-        raise ValueError(f"test profile '{name}': speed_fault_steps must be an integer >= 1")
+        raise ValueError(f"safety profile '{name}': speed_fault_steps must be an integer >= 1")
     return profile
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Deploy a trained Go2 policy on real hardware.")
     parser.add_argument(
-        "--config", type=str, default=os.path.join(os.path.dirname(__file__), "configs", "go2_locomotion.yaml")
+        "--deploy_profile", type=str, default=None,
+        help="Name of a per-policy deploy profile: deploy/profiles/<name>.yaml (go2_locomotion = single-frame kp40, "
+        "go2_obs_stacking = 6-frame kp50). Selects the WHOLE policy recipe -- policy_path, kp, kd, joint_vel_filter_hz, "
+        "history_length (observation stack depth), joint orders, default pose -- so they always move together. "
+        "Mirrors training's --profile. Mutually exclusive with --config. Orthogonal to --safety_profile.",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help=f"Explicit path to a policy profile YAML (escape hatch; prefer --deploy_profile). "
+        f"Default: {os.path.relpath(DEFAULT_PROFILE, os.path.dirname(os.path.dirname(__file__)))}.",
     )
     parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
     parser.add_argument(
         "--policy_path", type=str, default=None,
-        help="Override the policy exported .pt selected in --config (policy_path). Settable in a deploy profile so "
-        "a profile can pick both the policy and its safety limits. CLI > profile > the config file's value.",
+        help="Override the policy exported .pt chosen by the deploy profile / --config (policy_path). "
+        "CLI > the profile's value.",
     )
     parser.add_argument(
         "--history_length", type=int, default=None,
-        help="Observation frames the policy was trained with (1 = single frame). Overrides the config's "
-        "history_length (default 1). Profile-able, so a deploy profile selects policy_path + history_length together.",
+        help="Observation frames the policy was trained with (1 = single frame). Normally set by the deploy profile "
+        "(history_length); this overrides it. A value that does not match the policy is rejected at startup.",
     )
     parser.add_argument(
-        "--test_profile", "--deploy_profile", type=str, default=None, dest="test_profile",
-        help="Name of a profile in --test_profiles_file (cautionary / confident / no_limits, or your own): fills the "
-        "slew, tether, abort, speed-fault, startup-lift, low_pass and policy_path values from the YAML so they need "
-        "not be passed one by one. --deploy_profile is an alias. The file is re-read every run. An explicit flag on "
-        "the command line still overrides the profile.",
+        "--safety_profile", "--test_profile", type=str, default=None, dest="safety_profile",
+        help="Name of a SAFETY profile in --safety_profiles_file (cautionary / confident / no_limits, or your own): "
+        "fills the slew, tether, abort, speed-fault and startup-lift values from the YAML so they need not be passed "
+        "one by one. Orthogonal to --deploy_profile (which policy). The file is re-read every run. An explicit flag "
+        "on the command line still overrides the profile. (--test_profile is the deprecated old name.)",
     )
     parser.add_argument(
-        "--test_profiles_file", type=str,
-        default=os.path.join(os.path.dirname(__file__), "configs", "test_profiles.yaml"),
-        help="YAML file holding the named test profiles.",
+        "--safety_profiles_file", "--test_profiles_file", type=str, dest="safety_profiles_file",
+        default=os.path.join(os.path.dirname(__file__), "configs", "safety_profiles.yaml"),
+        help="YAML file holding the named safety profiles.",
     )
     parser.add_argument(
         "--link_lost_after",
@@ -1516,7 +1528,7 @@ def parse_args():
     parser.add_argument(
         "--startup_kp_fraction", type=float, default=0.1,
         help="kp during the startup ramp starts at this fraction of the configured kp (see "
-        "deploy/configs/go2_locomotion.yaml) and climbs to the full value alongside the position ramp, "
+        "deploy/profiles/go2_locomotion.yaml) and climbs to the full value alongside the position ramp, "
         "instead of the full kp applying instantly the moment the publish thread starts holding 'current "
         "position'. Added after a real-hardware incident where a jerk happened before the ramp's position "
         "interpolation had even sent its first step -- the remaining suspect was kp snapping to full "
@@ -1645,29 +1657,46 @@ def parse_args():
         "--network_interface lo (deploy/fake_robot.py); refused otherwise, since publishing LowCmd to a real "
         "robot whose sport controller is still active is unsafe.",
     )
-    # Named test profiles (deploy/configs/test_profiles.yaml): read fresh on every launch. They become the argparse
+    # Safety profiles (deploy/configs/safety_profiles.yaml): read fresh on every launch. They become the argparse
     # defaults, so precedence is  explicit CLI flag > profile > built-in default.
     pre, _ = parser.parse_known_args()
+    if any(a == "--test_profile" or a.startswith("--test_profile=") for a in sys.argv[1:]):
+        print("[WARN] --test_profile is deprecated; use --safety_profile (same values).")
     profile: dict | None = None
-    if pre.test_profile is not None:
-        profile = load_test_profile(pre.test_profiles_file, pre.test_profile, valid={a.dest for a in parser._actions})
+    if pre.safety_profile is not None:
+        profile = load_safety_profile(pre.safety_profiles_file, pre.safety_profile,
+                                      valid={a.dest for a in parser._actions})
         parser.set_defaults(**profile)
     args = parser.parse_args()
-    args.test_profile_values = profile
+    args.safety_profile_values = profile
     if args.live_dashboard:
         args.live_plot = True  # the dashboard reads the --live_plot log folder
+    # Policy profile: --deploy_profile NAME -> deploy/profiles/NAME.yaml, or an explicit --config path, or the default.
+    if args.deploy_profile is not None and args.config is not None:
+        parser.error("--deploy_profile and --config both select the policy recipe; pass only one.")
+    if args.deploy_profile is not None:
+        cand = os.path.join(PROFILES_DIR, f"{args.deploy_profile}.yaml")
+        if not os.path.isfile(cand):
+            avail = sorted(os.path.splitext(f)[0] for f in os.listdir(PROFILES_DIR) if f.endswith(".yaml"))
+            parser.error(f"deploy profile '{args.deploy_profile}' not found in {PROFILES_DIR}. Available: {avail}")
+        args.config = cand
+    elif args.config is None:
+        args.config = DEFAULT_PROFILE
     return args
 
 
 def main():
     args = parse_args()
-    if args.test_profile_values is not None:
-        print(f"[INFO] Test profile '{args.test_profile}' ({args.test_profiles_file}); explicit CLI flags override it:")
-        for k, v in args.test_profile_values.items():
+    if args.safety_profile_values is not None:
+        print(f"[INFO] Safety profile '{args.safety_profile}' ({args.safety_profiles_file}); explicit CLI flags override it:")
+        for k, v in args.safety_profile_values.items():
             note = "" if getattr(args, k) == v else f"   (profile {v}, overridden)"
             print(f"         {k} = {getattr(args, k)}{note}")
     cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp, args.policy_path,
                       args.history_length)
+    print(f"[INFO] Deploy profile: {os.path.relpath(args.config)} | safety profile: {args.safety_profile or 'none'}")
+    print(f"[INFO]   policy_path={cfg.policy_path} history_length={cfg.history_length} kp={cfg.kp} kd={cfg.kd} "
+          f"joint_vel_filter_hz={cfg.joint_vel_filter_hz}")
 
     if args.skip_release and cfg.network_interface != "lo":
         raise ValueError(
@@ -1722,9 +1751,10 @@ def main():
             with open(os.path.join(live_plot_dir, "cli_args.txt"), "w") as f:
                 f.write("argv: " + " ".join(sys.argv) + "\n")
                 f.write(f"config: {args.config}\n")
-                if args.test_profile_values is not None:
-                    resolved = {k: getattr(args, k) for k in args.test_profile_values}
-                    f.write(f"test_profile: {args.test_profile} resolved={resolved}\n")
+                f.write(f"deploy_profile: {os.path.relpath(args.config)}\n")
+                if args.safety_profile_values is not None:
+                    resolved = {k: getattr(args, k) for k in args.safety_profile_values}
+                    f.write(f"safety_profile: {args.safety_profile} resolved={resolved}\n")
                 f.write(f"kp={cfg.kp} kd={cfg.kd} hold_kp={cfg.hold_kp} effort_limit={cfg.effort_limit} "
                         f"tau_abort={0.9 * cfg.effort_limit:.2f}Nm\n")
                 f.write(f"max_target_dev_deg={args.max_target_dev_deg} abort_err_deg={args.abort_err_deg} "

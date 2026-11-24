@@ -1,5 +1,5 @@
 # Real-hardware deployment config for the obs_stacking (obs_stacking_with_height) policy: 6-frame history, kp/kd 50/1.0, a 10 Hz
-# joint_vel observation EMA filter, and the height command. Use this config with --config for that policy;
+# joint_vel observation EMA filter, and the height command. Select it with `--deploy_profile go2_obs_stacking` (or --config <this file>);
 # go2_locomotion.yaml stays the config for the current single-frame kp40 policy.
 #
 # Values here (default joint pose, PD gains, action scale) are copied directly from the sim actuator
@@ -8,17 +8,9 @@
 # was calibrated against this exact stiffness/damping/scale combination; using different real-hardware PD
 # gains would silently change what each action value means to the robot.
 
-policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # PLACEHOLDER: replace with the
-  # obs_stacking export once trained (logs/rsl_rl/go2_obs_stacking_with_height/run_obs_stacking_with_height/exported/policy.pt). A 288-dim
-  # (48x6) actor; deploy auto-checks 288 == 48 x history_length(6) via policy_obs_layout.  # JIT export -- takes the raw
-  # observation vector and returns actions directly (obs normalization baked in). NOT model_2699.pt (that's
-  # the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic class to
-  # load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
-  #
-  # 47-dim policy (no base_lin_vel) from the DR-curriculum retrain (run go2_kp40_curriculum_ppo/
-  # 2026-11-03_22-14-59, 18k iterations total). NOT yet tried on hardware; sim2sim only. Expect a lower stance
-  # and foot skim -- see docs/gait_realism_diagnosis.md. The previous hardware-tested policy is
-  # models/10_14_26_real_hardware_parity_tested/ (50-dim; swap policy_path back to use it).
+policy_path: models/11_24_26_obs_stacking_with_height/exported/policy.pt  # JIT export, 288-dim actor (48 x 6 frames);
+  # obs normalization baked in. The layout guard (policy_obs_layout) checks 288 == 48 x history_length. NOT the
+  # training checkpoint model_24999.pt. Sim2sim-evaluated only -- see that model's SUMMARY.md caveats before hardware.
 history_length: 6  # observation frames the policy was trained with (ObservationsCfg.HISTORY_LENGTH). The actor
                    # input is 48 (per frame) x 6 = 288; policy_obs_layout errors if this doesn't match the export.
 joint_vel_filter_hz: 10.0  # EMA low-pass cutoff on the joint_vel observation, matching the training obs filter
