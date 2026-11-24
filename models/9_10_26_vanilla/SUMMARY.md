@@ -1,5 +1,7 @@
 # 9_10_26_vanilla_corrected_arm_mounting
 
+**Training profile:** No training-profile file — this run predates the `training_profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
+
 **What this is:** baseline policy, original reward weights, trained from scratch on the **corrected**
 Go2 + OpenManipulatorX asset (`go2withOpenXstatic.usd`, arm USD offset/orientation fixed — unlike the
 earlier `9_10_26_vanilla_wrong_arm_mounting` run, which used the incorrectly-mounted arm). This is the
@@ -28,3 +30,51 @@ unlikely to change much.
 
 **No known mounting/asset issues** — this is the first vanilla run on the corrected asset, so (unlike the
 two earlier `_wrong_arm_mounting` runs) there's no arm-offset caveat to flag here.
+
+## Metrics
+
+Values are per-policy snapshots; the training reward is the TensorBoard figure recorded above (mean over the last
+200 iterations; full per-term metrics were not retained). Not cross-policy comparable (original reward schema).
+
+### 1. Sim2sim (nominal physics, Isaac vs MuJoCo)
+
+No sim2sim evaluation was retained for this baseline.
+
+| metric | Isaac | MuJoCo |
+|---|---|---|
+| lin_x RMS (m/s) · lin_y RMS (m/s) · ang_z RMS (rad/s) · pitch RMS (rad) · lean RMS (rad) · height RMS (m) · segments with a fall (/60) · peak joint torque (Nm) | n/a — not retained | n/a — not retained |
+
+### 2. Sim2real (hardware)
+
+Not hardware-tested.
+
+| metric | value |
+|---|---|
+| lin_x RMS (m/s) | — |
+| lin_y RMS (m/s) | — |
+| ang_z RMS (rad/s) | — |
+| pitch RMS (rad) | — |
+| lean RMS (rad) | — |
+| height RMS (m) | — |
+| walks? | — (not tested) |
+| buzz | — |
+| control-loop timing | — |
+| notes | — |
+
+### 3. Final training metrics (TensorBoard, mean of last 200 iterations)
+
+| metric | value |
+|---|---|
+| total iterations | 10000 |
+| mean_reward | 335.5 |
+| mean_episode_length | n/a — not retained |
+| difficulty_scale | n/a — not retained |
+| error_vel_xy | n/a — not retained |
+| error_vel_yaw | n/a — not retained |
+| track_lin_vel_xy_exp | n/a — not retained |
+| track_ang_vel_z_exp | n/a — not retained |
+| track_pitch_exp | n/a — not retained |
+| track_lean_exp | n/a — not retained |
+| height_penalty | n/a — not retained |
+| body_contact (term rate) | n/a — not retained |
+| entropy | n/a — not retained |

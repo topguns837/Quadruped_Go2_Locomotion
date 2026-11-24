@@ -1,5 +1,7 @@
 # 10_14_26_real_hardware_parity_tested
 
+**Training profile:** No training-profile file — this run predates the `training_profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
+
 **What this is:** the first checkpoint trained under the real-hardware-parity config (see CLAUDE.md
 "Real-hardware parity (2026-10-13)") -- PhysX's hard joint-speed clamp disabled
 (`PHYSX_JOINT_SPEED_LIMIT=500`, so only the real DC-motor torque-speed curve shapes dynamics, same as the
@@ -55,7 +57,55 @@ extended/unattended real-hardware sessions; not investigated further this sessio
 isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play --num_envs 1 \
   --checkpoint models/10_14_26_real_hardware_parity_tested/model_9999.pt
 ```
-For real hardware, point `deploy/configs/go2_locomotion.yaml`'s `policy_path` at
+For real hardware, point `deploy/profiles/go2_locomotion.yaml`'s `policy_path` at
 `models/10_14_26_real_hardware_parity_tested/exported/policy.pt` and follow `deploy/Checklist.md` in full
 -- do not skip the hoisted phases even though this checkpoint has already been tested, since the checklist
 protects against cable/mapping/release issues independent of which policy is loaded.
+
+## Metrics
+
+Values are per-policy snapshots; training rows are the TensorBoard figures recorded above (full per-term metrics
+were not retained). Not cross-policy comparable where reward weights differ.
+
+### 1. Sim2sim (nominal physics, Isaac vs MuJoCo)
+
+No random-command `run_random_eval.sh` report was retained (only the `eval_velocity_tracking.py` run noted above).
+
+| metric | Isaac | MuJoCo |
+|---|---|---|
+| lin_x RMS (m/s) · lin_y RMS (m/s) · ang_z RMS (rad/s) · pitch RMS (rad) · lean RMS (rad) · height RMS (m) · segments with a fall (/60) · peak joint torque (Nm) | n/a — not retained | n/a — not retained |
+
+### 2. Sim2real (hardware)
+
+Hardware-tested this session (details above); quantitative tracking not captured.
+
+| metric | value |
+|---|---|
+| lin_x RMS (m/s) | — |
+| lin_y RMS (m/s) | — |
+| ang_z RMS (rad/s) | — |
+| pitch RMS (rad) | — |
+| lean RMS (rad) | — |
+| height RMS (m) | — |
+| walks? | standing/low-speed only; operator-confirmed "works good" (no stepping tested) |
+| buzz | none reported |
+| control-loop timing | — |
+| notes | needed `--max_target_dev_deg 25` due to a ~20–26° real-vs-sim stance-pose gap on a few joints; no aborts fired |
+
+### 3. Final training metrics (TensorBoard, final)
+
+| metric | value |
+|---|---|
+| total iterations | 10000 |
+| mean_reward | 613.7 |
+| mean_episode_length | 1932.7 |
+| difficulty_scale | n/a — not retained |
+| error_vel_xy | n/a — not retained |
+| error_vel_yaw | n/a — not retained |
+| track_lin_vel_xy_exp | n/a — not retained |
+| track_ang_vel_z_exp | n/a — not retained |
+| track_pitch_exp | n/a — not retained |
+| track_lean_exp | n/a — not retained |
+| height_penalty | n/a — not retained |
+| body_contact (term rate) | n/a — not retained |
+| entropy | n/a — not retained |

@@ -58,7 +58,7 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
 parser.add_argument(
-    "--mujoco_config", type=str, default="deploy/configs/go2_locomotion.yaml",
+    "--mujoco_config", type=str, default="deploy/profiles/go2_locomotion.yaml",
     help="deploy/ config the MuJoCo side reads joint order/kp/kd/action_scale from (NOT the policy path -- "
     "this script always points MuJoCo at the same exported checkpoint Isaac just loaded).",
 )
@@ -156,7 +156,7 @@ def run_isaac(env, policy, dt: float) -> tuple[dict[str, dict[str, float]], dict
                 errs["pitch"].append((pitch[0] - seg.command[3]).item())
                 errs["lean"].append((lean[0] - seg.command[4]).item())
                 # Isaac's own scene robot joint order already matches cfg.isaac_joint_order -- confirmed via
-                # deploy/dump_joint_order.py, see deploy/configs/go2_locomotion.yaml's isaac_joint_order comment.
+                # deploy/dump_joint_order.py, see deploy/profiles/go2_locomotion.yaml's isaac_joint_order comment.
                 joint_pos_samples.append(robot.data.joint_pos[0].cpu().numpy().copy())
         results[seg.name] = {k: _rms(v) for k, v in errs.items()}
         mean_joint_pos[seg.name] = np.mean(joint_pos_samples, axis=0)

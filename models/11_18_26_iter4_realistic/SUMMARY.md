@@ -2,6 +2,7 @@
 
 Status: **hardware-tested 2026-11-18 — walks; a ~25 Hz buzz was diagnosed and mitigated with a deploy-side action low-pass.**
 
+- Training profile: No training-profile file — this run predates the `training_profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
 - Source run: `logs/rsl_rl/go2_kp40_iter4_realistic/run_iter4_realistic`, `model_24999.pt` (final checkpoint of the
   25k-iteration batched run; phase-2 "realistic" re-ramp from the clean phase-1 `model_9999`).
 - Observation: **47-dim** (no `base_lin_vel`), 5-wide command (lin_x, lin_y, ang_z, pitch, lean), no height,
@@ -11,8 +12,65 @@ Status: **hardware-tested 2026-11-18 — walks; a ~25 Hz buzz was diagnosed and 
   0.025 (slow ramp), posture weights raised (height_penalty -15, stand_still 5.0, fall -750); push and action
   delay scale with the difficulty curriculum. Reached difficulty 1.0 by iter ~21,250 and held.
 - Config dump: `params/env.yaml`, `params/agent.yaml`.
-- Deploy: `deploy/configs/go2_locomotion.yaml` `policy_path` points at `exported/policy.pt`. Deploy detects the
+- Deploy: `deploy/profiles/go2_locomotion.yaml` `policy_path` points at `exported/policy.pt`. Deploy detects the
   47-dim layout and omits `base_lin_vel` automatically; kp/kd/action_scale in that config already match training.
+
+## Metrics
+
+Values are per-policy snapshots; the training-metric table is **not** cross-policy comparable where reward weights
+differ (e.g. the yaw-term weight changed 1.6→3.2 in the later obs-stacking run).
+
+### 1. Sim2sim (nominal physics, Isaac vs MuJoCo)
+
+`bash sim2sim/run_random_eval.sh --checkpoint model_24999.pt` — 3 seeds × 20 segments (60 segments, 240 s/sim),
+pooled RMS. Source: `logs/sim2sim_eval_24999/random/report.md`.
+
+| metric | Isaac | MuJoCo |
+|---|---|---|
+| lin_x RMS (m/s) | 0.049 | 0.051 |
+| lin_y RMS (m/s) | 0.049 | 0.045 |
+| ang_z RMS (rad/s) | 0.195 | 0.222 |
+| pitch RMS (rad) | 0.045 | 0.040 |
+| lean RMS (rad) | 0.032 | 0.026 |
+| height RMS (m) | 0.057 | 0.070 |
+| segments with a fall (/60) | 0 | 0 |
+| peak joint torque (Nm) | 44.8 | 45.4 |
+
+### 2. Sim2real (hardware)
+
+Hardware-tested 2026-11-18 (details in the "Hardware results" section below); quantitative tracking was not
+captured, so the numeric rows stay blank.
+
+| metric | value |
+|---|---|
+| lin_x RMS (m/s) | — |
+| lin_y RMS (m/s) | — |
+| ang_z RMS (rad/s) | — |
+| pitch RMS (rad) | — |
+| lean RMS (rad) | — |
+| height RMS (m) | — |
+| walks? | yes (with the deploy-side action low-pass on) |
+| buzz | ~24.9 Hz (control-Nyquist), worst on dynamic commands; mitigated by `--low_pass` (5 Hz EMA) |
+| control-loop timing | steady ~20.1 ms; startup ramp clean (peak 18.4 Nm) |
+| notes | single-frame policy amplifies joint_vel obs noise; `--low_pass` cut gyro RMS −28%, joint-vel RMS −40% |
+
+### 3. Final training metrics (mean of last 300 iterations)
+
+| metric | value |
+|---|---|
+| total iterations | 25000 |
+| mean_reward | 539.2 |
+| mean_episode_length | 1885.1 |
+| difficulty_scale | 1.0 |
+| error_vel_xy | 0.546 |
+| error_vel_yaw | 1.129 |
+| track_lin_vel_xy_exp | 3.369 |
+| track_ang_vel_z_exp | 0.282 |
+| track_pitch_exp | 2.648 |
+| track_lean_exp | 2.571 |
+| height_penalty | −0.367 |
+| body_contact (term rate) | 0.083 |
+| entropy | 4.682 |
 
 ## Sim results (nominal physics)
 

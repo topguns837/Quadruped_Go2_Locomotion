@@ -36,7 +36,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Offline, safety-code-free replay of a recorded observation log through the exported policy."
     )
-    parser.add_argument("--config", type=str, default="deploy/configs/go2_locomotion.yaml")
+    parser.add_argument("--config", type=str, default="deploy/profiles/go2_locomotion.yaml")
     parser.add_argument("--obs_log", type=str, required=True, help=".npz written by collect_still_observations.py")
     parser.add_argument(
         "--policy_path", type=str, default=None,

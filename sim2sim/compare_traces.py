@@ -64,6 +64,31 @@ def term_slice(obs_dim: int, name: str) -> slice | None:
     return None
 
 
+def newest_frame(obs: np.ndarray) -> np.ndarray:
+    """If the trace stacks a history of frames (stacked width = base * H, e.g. 282 = 47 * 6), return just the
+    NEWEST single frame so the per-term stats stay meaningful. Single-frame traces pass through unchanged.
+
+    Assumes the deploy/Isaac TERM-major layout (deploy_real.OBS_HISTORY_TERM_MAJOR): the stacked vector is
+    [term0's H samples, term1's H samples, ...], each term's samples newest-LAST. The newest frame is the last
+    `w` columns of each term's H*w block, reassembled in term order."""
+    width = obs.shape[1]
+    if width in OBS_LAYOUT:
+        return obs
+    base = h = None
+    for hh in range(2, 13):
+        if width % hh == 0 and (width // hh) in OBS_LAYOUT:
+            base, h = width // hh, hh
+            break
+    if base is None:
+        return obs  # fall through: obs_terms() will raise with a clear message
+    out = np.empty((obs.shape[0], base), dtype=obs.dtype)
+    for _, a, b in obs_terms(base):
+        w = b - a
+        block_start = a * h  # term blocks are consecutive H*w_i; sum of preceding widths is `a`
+        out[:, a:b] = obs[:, block_start + (h - 1) * w: block_start + h * w]  # newest sample of this term
+    return out
+
+
 def load(path: str) -> dict[str, np.ndarray]:
     out = {}
     with np.load(path, allow_pickle=False) as z:
@@ -130,6 +155,11 @@ def main() -> None:
     args = parser.parse_args()
     names = [os.path.basename(p) for p in args.traces]
     traces = [load(p) for p in args.traces]
+    # Reduce stacked-history obs to the newest frame so per-term stats and slices stay single-frame. Keeps the
+    # dedicated trace fields (lin_vel_origin_b, torque, ...) untouched; only the raw obs matrix is narrowed.
+    for t in traces:
+        if "obs" in t:
+            t["obs"] = newest_frame(t["obs"])
     dt = float(traces[0]["dt"]) if "dt" in traces[0] else 0.02
     settle = int(round(args.settle_s / dt))
 

@@ -173,7 +173,7 @@ Giving the calf its real 45.43 Nm, with no other change, breaks it:
 | Round 3, legacy | 5.1 Nm | 128 rad/s^2 | 0.0 rad/s | 0 |
 | **Round 3, hardware** | **12.0 Nm** | **310 rad/s^2** | **93.4 rad/s** | **6** |
 
-Round 3, the policy `deploy/configs/go2_locomotion.yaml` currently points at, **falls over while trying to
+Round 3, the policy `deploy/profiles/go2_locomotion.yaml` currently points at, **falls over while trying to
 stand still**, and its tracking error grows 5 to 15x. Joint acceleration roughly doubles for both policies.
 This matches the hardware incident already recorded in `deploy/Checklist.md` ("targets drifted 70-97 deg from
 the legs, torque hit 32 Nm, robot cut torque, red LED") -- 32 Nm is between the sim's 23.5 and the real

@@ -15,4 +15,17 @@
 # applied to EVERY phase and beats the profile's own value. See `python scripts/train_profile.py --help`.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-exec python3 scripts/train_profile.py "$@"
+
+# train_profile.py needs PyYAML. A host python3 usually has it, but the training container's /usr/bin/python3 does
+# NOT -- PyYAML ships only in Isaac Sim's bundled Python. Pick python3 when it can import yaml, else fall back to the
+# Isaac Python next to ISAACLAB_SH (same env/convention as scripts/train_batched.sh). Override with TRAIN_PROFILE_PYTHON.
+PYTHON="${TRAIN_PROFILE_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    if python3 -c 'import yaml' >/dev/null 2>&1; then
+        PYTHON=python3
+    else
+        ISAAC_PY="$(dirname "${ISAACLAB_SH:-/workspace/isaaclab/isaaclab.sh}")/_isaac_sim/python.sh"
+        [ -x "$ISAAC_PY" ] && PYTHON="$ISAAC_PY" || PYTHON=python3
+    fi
+fi
+exec "$PYTHON" scripts/train_profile.py "$@"

@@ -1,4 +1,6 @@
-# Real-hardware deployment config for the vanilla / experimental Go2 policies.
+# Real-hardware deployment config for the obs_stacking (obs_stacking_with_height) policy: 6-frame history, kp/kd 50/1.0, a 10 Hz
+# joint_vel observation EMA filter, and the height command. Select it with `--deploy_profile go2_obs_stacking` (or --config <this file>);
+# go2_locomotion.yaml stays the config for the current single-frame kp40 policy.
 #
 # Values here (default joint pose, PD gains, action scale) are copied directly from the sim actuator
 # config that trained these policies (unitree_go2witharm_cfg.py's UNITREE_GO2WITHARM_CFG, and
@@ -6,23 +8,23 @@
 # was calibrated against this exact stiffness/damping/scale combination; using different real-hardware PD
 # gains would silently change what each action value means to the robot.
 
-policy_path: models/11_18_26_iter4_realistic/exported/policy.pt  # JIT export -- takes the raw
-  # observation vector and returns actions directly (obs normalization baked in). NOT model_2699.pt (that's
-  # the full RSL-RL training checkpoint -- actor+critic+optimizer state, needs rsl_rl's ActorCritic class to
-  # load, unnecessary weight/dependency for pure inference). See deploy.md's export-format note.
-  #
-  # 47-dim policy (no base_lin_vel) from the DR-curriculum retrain (run go2_kp40_curriculum_ppo/
-  # 2026-11-03_22-14-59, 18k iterations total). NOT yet tried on hardware; sim2sim only. Expect a lower stance
-  # and foot skim -- see docs/gait_realism_diagnosis.md. The previous hardware-tested policy is
-  # models/10_14_26_real_hardware_parity_tested/ (50-dim; swap policy_path back to use it).
+policy_path: models/11_24_26_obs_stacking_with_height/exported/policy.pt  # JIT export, 288-dim actor (48 x 6 frames);
+  # obs normalization baked in. The layout guard (policy_obs_layout) checks 288 == 48 x history_length. NOT the
+  # training checkpoint model_24999.pt. Sim2sim-evaluated only -- see that model's SUMMARY.md caveats before hardware.
+history_length: 6  # observation frames the policy was trained with (ObservationsCfg.HISTORY_LENGTH). The actor
+                   # input is 48 (per frame) x 6 = 288; policy_obs_layout errors if this doesn't match the export.
+joint_vel_filter_hz: 10.0  # EMA low-pass cutoff on the joint_vel observation, matching the training obs filter
+                           # (mdp.JointVelFiltered cutoff_hz). None/omit = off. Keeps the policy's joint_vel input
+                           # the same in sim and on hardware -- the noise-resilience fix, not the action low-pass.
+
 control_dt: 0.02  # 50 Hz -- matches training's decimation(4) * sim.dt(0.005), see quadruped_go2_locomotion_env_cfg.py
 
 network_interface: null  # REQUIRED before first run -- the HOST NIC on the robot's 192.168.123.0/24 network.
-                          # Wired: the cabled NIC, e.g. "enp3s0" (deploy.md Stage 0). Wireless
-                          # (deploy_real_wireless.py) does not use this at all: it talks to the Jetson relay
-                          # over IP (see the `wireless` profile, deploy/wireless/README.md). The container is
-                          # network_mode: host, so use the HOST interface name. Left null so a real run
-                          # refuses to start unset (fails loud, not with a
+                          # Wired: the cabled NIC, e.g. "enp3s0" (deploy.md Stage 0). Wireless: the desktop
+                          # WiFi interface, e.g. "wlan0"/"wlxXXXX", once it has associated with the robot's
+                          # bridged AP and taken a static 192.168.123.x address (deploy.md Stage 0b;
+                          # deploy/wireless/). The container is network_mode: host, so use the HOST interface
+                          # name. Left null so a real run refuses to start unset (fails loud, not with a
                           # silent wrong-interface bind).
 
 link_lost_after: 0.5  # Seconds of LowState silence before the run stops as link-lost (and damps, never
@@ -35,10 +37,10 @@ action_scale: 0.25
 
 # --- per-joint PD gains (from UNITREE_GO2WITHARM_CFG's DCMotorCfg groups) ---
 # kp/kd really are identical across all 12 joints in sim, so there's no per-joint variation to carry over.
-kp: 40.0  # MUST equal the training actuator stiffness (unitree_go2witharm_cfg.py DCMotorCfg.stiffness). Raised
+kp: 50.0  # MUST equal the training actuator stiffness (unitree_go2witharm_cfg.py DCMotorCfg.stiffness). Raised
           # 25 -> 40 (2026-10-30): kp=25 could not hold the stance on hardware (legs sagged at handover). The
           # policy's action->torque mapping is learned at this gain, so deploy and training must match.
-kd: 0.8   # = training damping (unitree_go2witharm_cfg.py DCMotorCfg.damping), raised 0.5 -> 0.8 with kp.
+kd: 1.0   # = training damping (unitree_go2witharm_cfg.py DCMotorCfg.damping), raised 0.5 -> 0.8 with kp.
 
 # hold_kp -- stiffness used ONLY for the startup ramp that raises the robot to the default stance, BEFORE the
 # policy loop takes over. The policy loop itself always runs at `kp` above (its trained gain). kp=25 is the
@@ -47,7 +49,7 @@ kd: 0.8   # = training damping (unitree_go2witharm_cfg.py DCMotorCfg.damping), r
 # legs sag (rear knees first) and the ramp never reaches the stance. A stiffer hold_kp lets the robot actually
 # stand up to default; deploy_real.py then drops kp to `kp` in the same tick the first policy action is applied,
 # so the policy's active hold takes over before the robot can sag. Set to kp to restore the old behaviour.
-hold_kp: 40.0  # = kp now that the policy trains at kp 40 (holds the stance without a stiffer hold). The ramp
+hold_kp: 60.0  # ramp-lift stiffness (>= kp): kp is now 50, so the old 40 would be softer than the policy loop. The
                # still ramps kp 0 -> hold_kp gently; with hold_kp == kp the handover kp-fade is effectively a
                # no-op. Raise above kp only if a retrained policy still sags during the startup lift.
 

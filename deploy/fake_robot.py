@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default="deploy/configs/go2_locomotion.yaml",
+        default="deploy/profiles/go2_locomotion.yaml",
         help="Read default_joint_pos/sdk_joint_order from here so the synthetic LowState looks like a "
         "robot standing at its actual default pose, not all-zeros.",
     )

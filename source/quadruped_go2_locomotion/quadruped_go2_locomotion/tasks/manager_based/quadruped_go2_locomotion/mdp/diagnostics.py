@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.envs import mdp as isaaclab_mdp
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, SceneEntityCfg
+
+from .obs_filters import alpha_from_cutoff
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -120,6 +122,62 @@ def logged_joint_vel_rel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Sce
     value = isaaclab_mdp.joint_vel_rel(env, asset_cfg)
     log_step(env, "obs.joint_vel", value)
     return value
+
+
+class JointVelFiltered(ManagerTermBase):
+    """joint_vel_rel with matched sensor noise added, THEN a first-order EMA low-pass -- the sim-to-real-consistent
+    joint-velocity observation.
+
+    Noise then filter, in THAT order, so training sees exactly what deploy sees: the real robot's joint_vel is noisy
+    and deploy_real.ObsEmaFilter low-passes that noisy signal, so here the noise is added BEFORE the EMA (not by the
+    observation manager afterwards). Set this term's ``noise=None`` in the ObsTerm -- the manager must not add more.
+
+    The real hardware joint_vel noise floor measured ~0.035 rad/s std (uniform-equivalent ~0.06); ``noise_amp`` of
+    ~0.3 is a conservative several-times-that to cover dynamic conditions -- NOT the old adversarial 1.5. With
+    history stacking the policy learns to infer the true velocity from the position history, so it no longer
+    amplifies this (small) noise into the ~25 Hz buzz. ``cutoff_hz=None`` skips the EMA (noise-only).
+
+    Per-env EMA state re-seeds from the next frame after an env reset (no startup transient); mirrors
+    deploy_real.ObsEmaFilter's lazy seeding.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._ema: torch.Tensor | None = None
+        self._seeded: torch.Tensor | None = None
+
+    def reset(self, env_ids=None):
+        if self._seeded is None:
+            return
+        if env_ids is None:
+            self._seeded.zero_()
+        else:
+            self._seeded[env_ids] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        noise_amp: float = 0.3,
+        cutoff_hz: float | None = None,
+    ) -> torch.Tensor:
+        jv = isaaclab_mdp.joint_vel_rel(env, asset_cfg)
+        if noise_amp and noise_amp > 0.0:
+            jv = jv + (torch.rand_like(jv) * 2.0 - 1.0) * noise_amp
+        if cutoff_hz:
+            a = alpha_from_cutoff(cutoff_hz, env.step_dt)
+            if self._ema is None:
+                self._ema = jv.clone()
+                self._seeded = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+            else:
+                self._ema = self._ema + a * (jv - self._ema)
+                unseeded = ~self._seeded  # envs reset since their last filtered frame: re-seed, no transient
+                if bool(unseeded.any()):
+                    self._ema[unseeded] = jv[unseeded]
+                    self._seeded[unseeded] = True
+            jv = self._ema.clone()
+        log_step(env, "obs.joint_vel", jv)
+        return jv
 
 
 def logged_last_action(env: ManagerBasedRLEnv, action_name: str | None = None) -> torch.Tensor:

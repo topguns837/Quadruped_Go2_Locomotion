@@ -39,7 +39,7 @@ parser.add_argument(
     action="store_true",
     default=False,
     help=(
-        "Set an exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean] command via a slider window "
+        "Set an exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command via a slider window "
         "(auto-launched) instead of the policy's usual random commands, without closing the Isaac Sim window."
     ),
 )
@@ -174,6 +174,8 @@ def _manual_command_file_poll_loop(cmd_term, path: str, poll_interval: float = 0
                     data["pitch"],
                     data["lean"],
                 ]
+                if data.get("height") is not None:  # optional: an older slider writes no height
+                    values.append(data["height"])
                 cmd_term.set_manual_command(values)
                 last_mtime = mtime
         except (FileNotFoundError, json.JSONDecodeError, KeyError):

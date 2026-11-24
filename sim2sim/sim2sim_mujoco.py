@@ -127,14 +127,13 @@ def load_sim_config(config_path: str, policy_path: str | None) -> deploy_real.De
     )
 
 
-def load_policy(path: str) -> tuple[torch.jit.ScriptModule, int]:
+def load_policy(path: str, history_length: int = 1) -> tuple[torch.jit.ScriptModule, int]:
+    """Returns (policy, base_frame_dim). The net's input is base_frame_dim * history_length; see
+    deploy_real.policy_obs_layout for the divisibility/known-layout checks (reused here)."""
     policy = torch.jit.load(path, map_location="cpu")
     policy.eval()
-    first_weight = next(p for name, p in policy.named_parameters() if p.dim() == 2)
-    obs_dim = int(first_weight.shape[1])
-    if obs_dim not in OBS_LAYOUT:
-        raise ValueError(f"{path} expects a {obs_dim}-dim observation; known dims are {sorted(OBS_LAYOUT)}.")
-    return policy, obs_dim
+    base_dim, _ = deploy_real.policy_obs_layout(policy, history_length)
+    return policy, base_dim
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -146,7 +145,7 @@ def load_policy(path: str) -> tuple[torch.jit.ScriptModule, int]:
 class Segment:
     name: str
     duration: float
-    command: list[float]  # lin_x, lin_y, ang_z, pitch, lean -- always 5-wide, see OBS_LAYOUT above
+    command: list[float]  # [lin_x, lin_y, ang_z, pitch, lean] or [..., height]: the 6th (height, m) is optional
 
 
 def load_scenario(path: str) -> list[Segment]:
@@ -155,8 +154,8 @@ def load_scenario(path: str) -> list[Segment]:
     segments = []
     for entry in raw["segments"]:
         cmd = [float(v) for v in entry["command"]]
-        if len(cmd) != 5:
-            raise ValueError(f"Segment {entry['name']!r}: command must have 5 values, got {len(cmd)}")
+        if len(cmd) not in (5, 6):
+            raise ValueError(f"Segment {entry['name']!r}: command must have 5 or 6 values (6th = height), got {len(cmd)}")
         segments.append(Segment(entry["name"], float(entry["duration"]), cmd))
     return segments
 
@@ -359,7 +358,7 @@ def print_summary(
 ) -> None:
     print(f"\n[SUMMARY] policy={policy_path} nominal_height={nominal_height:.3f} m")
     print(f"  steady-state RMS error (first {SEGMENT_SETTLE_S:.1f} s of each segment excluded)")
-    print("  height error is actual vs. the fixed nominal_height above -- there is no height COMMAND any more")
+    print("  height error is actual vs. the COMMANDED height (nominal_height when a segment commands none)")
     print("  max_dev = largest mean joint-target offset from default_joint_pos (deg), worst joint in brackets")
     header = f"  {'segment':<16}" + "".join(f"{n:>9}" for n in METRIC_NAMES) + f"{'falls':>7}{'peak_tau':>10}  max_dev"
     print(header)
@@ -394,7 +393,7 @@ def close_viewer(viewer, viewer_threads: set[threading.Thread], timeout_s: float
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run an exported Go2 policy in MuJoCo (sim2sim).")
-    parser.add_argument("--config", default=os.path.join(_REPO_ROOT, "deploy", "configs", "go2_locomotion.yaml"))
+    parser.add_argument("--config", default=os.path.join(_REPO_ROOT, "deploy", "profiles", "go2_locomotion.yaml"))
     parser.add_argument("--policy", default=None, help="Exported policy.pt (default: policy_path in --config).")
     parser.add_argument(
         "--height_source",
@@ -490,6 +489,11 @@ def parse_args():
         "sim-to-real mismatch vs the training kd unless you also retrain.",
     )
     parser.add_argument("--save_xml", default=None, help="Write the compiled MuJoCo model to this XML path and exit.")
+    parser.add_argument(
+        "--history_length", type=int, default=None,
+        help="Number of observation frames the policy stacks (training's HISTORY_LENGTH). Default: read from the "
+        "config's history_length, else 1. Must match the policy, or its input dim won't divide evenly.",
+    )
     return parser.parse_args()
 
 
@@ -507,14 +511,18 @@ def main():
         return
 
     with open(args.config) as f:
-        policy_path = args.policy or yaml.safe_load(f)["policy_path"]
+        raw_cfg = yaml.safe_load(f)
+    policy_path = args.policy or raw_cfg["policy_path"]
     if not os.path.isabs(policy_path):
         policy_path = os.path.join(_REPO_ROOT, policy_path)
-    policy, obs_dim = load_policy(policy_path)
+    # History length: CLI > config's history_length > 1. Must match the policy (load_policy asserts obs_dim divides).
+    history_length = args.history_length if args.history_length is not None else int(raw_cfg.get("history_length", 1))
+    policy, obs_dim = load_policy(policy_path, history_length)
     layout = OBS_LAYOUT[obs_dim]
-    # "legacy" = the old 6-wide-command policies (51/52); the current 5-wide ones (47 without base_lin_vel,
-    # 50 with it) use the new nominal height. Keyed on cmd_width, not obs_dim, so 47 is not misclassified.
-    is_legacy = layout["cmd_width"] == 6
+    # "legacy" = the old policies that carried base_lin_vel and/or a base_height OBSERVATION (51/52). The new
+    # 48-dim height-command policy (cmd_width 6, no lin_vel, no height obs) is NOT legacy: its height is a real
+    # command, defaulting to the new nominal. 47/50 have no height command at all.
+    is_legacy = layout["has_lin_vel"] or layout["has_height_obs"]
     nominal_height = NOMINAL_HEIGHT_M["legacy" if is_legacy else "new"]
     cfg = load_sim_config(args.config, policy_path)
     # PD-gain overrides for the kd damping sweep (default: keep the config's values). Raising kd above the
@@ -555,7 +563,7 @@ def main():
     default_isaac = robot.default_isaac.tolist()
     height_source_note = f" (obs source: {args.height_source})" if layout["has_height_obs"] else ""
     print(
-        f"[INFO] policy={policy_path} obs_dim={obs_dim} cmd_width={layout['cmd_width']} "
+        f"[INFO] policy={policy_path} obs_dim={obs_dim}x{history_length}(stacked) cmd_width={layout['cmd_width']} "
         f"has_height_obs={layout['has_height_obs']}{height_source_note} nominal_height={nominal_height:.3f} m "
         f"mass={float(np.sum(model.body_mass)):.2f} kg dt={model.opt.timestep} decimation={DECIMATION} "
         f"kp={cfg.kp} kd={cfg.kd} "
@@ -624,6 +632,10 @@ def main():
         action_sent = np.zeros(12)  # EMA state for --action_lpf_hz (the smoothed action that forms the target)
         target_history: list[np.ndarray] = [robot.default_isaac.copy()] * (args.action_delay + 1)
         state_history: list = []
+        obs_history = deploy_real.ObsHistory(  # stacks the last H single frames in Isaac Lab's layout (see deploy_real)
+            history_length, deploy_real.frame_term_widths(obs_dim, layout))
+        # joint_vel EMA low-pass, identical to deploy_real / the training obs term (None cutoff = passthrough).
+        jv_filter = deploy_real.ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
         stats: list[SegmentStats] = []
         step = 0
         stop = False
@@ -635,24 +647,27 @@ def main():
             for k in range(round(seg.duration / dt)):
                 tick_start = time.monotonic()
                 cmd = manual_buf.get() if manual_buf else list(seg.command)
-                # Pad to 6-wide with the legacy nominal height for an older (51/52-dim) policy: there is no
-                # height command any more (see OBS_LAYOUT/module docstring above), so this is never read from
-                # the slider or scenario, only appended here to match what those policies' velocity_commands
-                # observation term was trained to expect.
-                manual_cmd = cmd + [nominal_height] if layout["cmd_width"] == 6 else cmd
+                # Commanded stance height: the scenario/slider's 6th value if given, else this policy's nominal.
+                # For a 6-wide policy build_observation receives it as the 6th command; a 5-wide policy ignores it.
+                commanded_height = cmd[5] if len(cmd) == 6 else nominal_height
+                manual_cmd = deploy_real.command_for_layout(cmd, layout, commanded_height)
                 base_height_obs = None
                 if layout["has_height_obs"]:
                     base_height_obs = robot.base_height if args.height_source == "true" else nominal_height
                 state_history.append(robot.to_robot_state())
                 if len(state_history) > args.obs_delay + 1:
                     state_history.pop(0)
-                obs = deploy_real.build_observation(
+                frame = deploy_real.build_observation(
                     cfg, state_history[0], sdk_to_isaac, default_isaac, manual_cmd, last_action,
                     base_height=base_height_obs, include_base_lin_vel=layout["has_lin_vel"],
+                    joint_vel_filter=jv_filter,
                 )
                 if noise_amp is not None:
-                    # additive uniform noise U(-amp, amp) per element, as in training (enable_corruption)
-                    obs = obs + (torch.rand(obs.shape, generator=noise_rng) * 2.0 - 1.0) * noise_amp
+                    # additive uniform noise U(-amp, amp) per element, as in training (enable_corruption),
+                    # applied PER FRAME before stacking -- Isaac Lab's ObservationManager corrupts each frame as it
+                    # is pushed into the history, so the noise must go on the single frame, not the stacked vector.
+                    frame = frame + (torch.rand(frame.shape, generator=noise_rng) * 2.0 - 1.0) * noise_amp
+                obs = obs_history.push_and_stack(frame)  # (1, base_dim) -> (1, base_dim * history_length)
                 with torch.inference_mode():
                     action = policy(obs)[0].numpy()
                 # deploy-side output low-pass: the MOTOR target uses the filtered action; last_action fed back to
@@ -694,7 +709,7 @@ def main():
                             "ang_z": ang_vel_z - cmd[2],
                             "pitch": pitch - cmd[3],
                             "lean": lean - cmd[4],
-                            "height": robot.base_height - nominal_height,
+                            "height": robot.base_height - commanded_height,
                         }
                     )
                     seg_stats.add_target(target)
@@ -703,7 +718,7 @@ def main():
                     # directly (deploy_real's version no longer carries height tags at all -- real hardware
                     # has no height measurement to plot -- but sim2sim, unlike real hardware, CAN measure it).
                     deploy_real.log_live_plot(writer, step, cmd, lin_vel, ang_vel_z, pitch, lean)
-                    writer.add_scalar("Metrics/base_velocity/cmd_height", nominal_height, step)
+                    writer.add_scalar("Metrics/base_velocity/cmd_height", commanded_height, step)
                     writer.add_scalar("Metrics/base_velocity/actual_height", robot.base_height, step)
                 step += 1
 
@@ -718,6 +733,9 @@ def main():
                         break
                     robot.reset()
                     last_action = [0.0] * 12
+                    jv_filter.reset()
+                    obs_history.reset()  # mirror Isaac Lab clearing the history buffer on episode reset
+                    state_history.clear()
 
                 if viewer is not None:
                     if not viewer.is_running():

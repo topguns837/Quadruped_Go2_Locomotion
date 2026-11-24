@@ -92,12 +92,14 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
             velocity_limit=30.1,
             velocity_limit_sim=PHYSX_JOINT_SPEED_LIMIT,
             armature=JOINT_ARMATURE,
-            # kp/kd raised 25/0.5 -> 40/0.8 (2026-10-30): the soft 25 could not passively hold the stance on
-            # real hardware, so the legs sagged at policy handover. 40 holds the default stance with far less
-            # sag. The deploy kp/kd (deploy/configs/go2_locomotion.yaml) MUST match these, since the policy's
-            # action->torque mapping is learned at this stiffness. Policies trained at 25 are not valid here.
-            stiffness=40.0,
-            damping=0.8,
+            # kp/kd raised 25/0.5 -> 40/0.8 (2026-10-30), then 40/0.8 -> 50/1.0 (obs-stacking retrain): matches
+            # the Glowing-Torch Go2 reference deploy's stand gain and, more importantly, the higher kd directly
+            # damps the ~25 Hz hardware buzz. The deploy kp/kd (deploy/profiles/go2_locomotion.yaml) MUST match
+            # these for the policy in use, since the action->torque mapping is learned at this stiffness; the
+            # actuator_gains EventCfg DR band is widened (x0.8-1.2) so a kd~1.0 deploy stays in-distribution.
+            # Policies trained at 40/0.8 (and 25) are NOT valid at these gains.
+            stiffness=50.0,
+            damping=1.0,
             friction=0.0,
         ),
         "calves": DCMotorCfg(
@@ -107,8 +109,8 @@ UNITREE_GO2WITHARM_CFG = ArticulationCfg(
             velocity_limit=15.70,
             velocity_limit_sim=PHYSX_JOINT_SPEED_LIMIT,
             armature=JOINT_ARMATURE,
-            stiffness=40.0,  # see the hip_thigh note above; kept identical across groups as in training
-            damping=0.8,
+            stiffness=50.0,  # see the hip_thigh note above; kept identical across groups as in training
+            damping=1.0,
             friction=0.0,
         ),
     },

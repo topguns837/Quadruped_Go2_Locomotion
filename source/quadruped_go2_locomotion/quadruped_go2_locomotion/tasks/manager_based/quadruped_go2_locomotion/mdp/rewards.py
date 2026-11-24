@@ -15,6 +15,7 @@ from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import wrap_to_pi
 
 from . import diagnostics
+from .height_command import adaptive_height_target
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -83,7 +84,7 @@ def track_lean_exp(
 def base_height_l1_pitch(
     env: ManagerBasedRLEnv,
     command_name: str,
-    target_height: float,
+    target_height: float | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pitch_sensitivity: float = 0.25,
     lean_sensitivity: float = 0.08,
@@ -97,11 +98,12 @@ def base_height_l1_pitch(
     (foot-strike, pitch change) spike and destabilise. L1 has a constant gradient: a 5 cm droop always costs
     ``0.05 * |weight|``, a 10 cm droop ``0.10 * |weight|``, with no transient blow-up. See the iter-3 plan.
 
-    There is no height COMMAND any more (see mdp.commands.UniformVelocityCommandWithPitch's docstring for
-    why: no reliable height measurement exists on real hardware). `target_height` is a fixed constant
-    instead of being read from the command buffer. The adaptive pitch/lean offset is kept: it still reads
-    the current commanded pitch/lean (components [3]/[4], unaffected by the height removal) so the robot
-    isn't penalized for naturally sitting slightly lower/higher while pitching or leaning.
+    The target is the COMMANDED height (command component [5], see mdp.height_command) scored against the
+    simulator's ground-truth base height ``root_pos_w[:, 2]``. Actual height is never an observation -- the real
+    robot cannot measure it -- so the policy only ever sees the command and must infer the achieved height from
+    proprioception. `target_height` is only a fallback for a legacy 5-wide command buffer with no height
+    component. The adaptive pitch/lean offset is kept: it reads the commanded pitch/lean (components [3]/[4]) so
+    the robot isn't penalized for naturally sitting slightly lower/higher while pitching or leaning.
 
     `max_penalty` is defence in depth: `root_pos_w[:, 2]` has no physical bound (unlike `joint_pos`), so an
     unclamped absolute error can reach hundreds if a robot ever leaves the terrain and free-falls (observed:
@@ -111,8 +113,9 @@ def base_height_l1_pitch(
 
     Args:
         command_name: Name of the command to read the current pitch/lean from.
-        target_height: Fixed default stance height (m) the robot is held near. Should match the default
-            joint pose's natural standing height so this reward doesn't fight joint_deviation_l1.
+        target_height: Fallback stance height (m), used ONLY when the command has no height component. Should
+            match the default joint pose's natural standing height so this reward doesn't fight
+            joint_deviation_l1.
         pitch_sensitivity: How much target height increases per radian of commanded pitch.
             A value of 0.15 means ~15cm higher target per radian of pitch.
         lean_sensitivity: How much target height increases per radian of commanded lean.
@@ -122,12 +125,10 @@ def base_height_l1_pitch(
 
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    # Get commanded pitch and lean for adaptive offset
+    # Commanded height plus the pitch/lean allowance (mdp.height_command; raises rather than defaulting to 0 m if
+    # the command has no height and no fallback was configured)
     cmd = env.command_manager.get_command(command_name)
-    cmd_pitch = cmd[:, 3]
-    cmd_lean = cmd[:, 4]
-    # Compute adaptive target height: fixed target height + offset from commanded angles
-    adaptive_target = target_height + pitch_sensitivity * torch.abs(cmd_pitch) + lean_sensitivity * torch.abs(cmd_lean)
+    adaptive_target = adaptive_height_target(cmd, pitch_sensitivity, lean_sensitivity, fallback_height=target_height)
     # L1 penalty (absolute height error) from adaptive target, clamped -- see max_penalty above
     penalty = torch.clamp(torch.abs(asset.data.root_pos_w[:, 2] - adaptive_target), max=max_penalty)
     diagnostics.log_step(env, "reward.base_height_l1_pitch", penalty)

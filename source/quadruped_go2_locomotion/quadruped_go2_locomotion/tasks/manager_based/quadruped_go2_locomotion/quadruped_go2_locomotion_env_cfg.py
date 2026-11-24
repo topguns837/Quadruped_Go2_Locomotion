@@ -62,6 +62,13 @@ from . import mdp
 from .unitree_go2witharm_cfg import UNITREE_GO2WITHARM_CFG  # isort: skip
 
 
+# Number of observation frames stacked and fed to the policy/critic each step (see ObservationsCfg). At the 50 Hz
+# control rate (dt 0.005 * decimation 4 = 20 ms/step) this is a 6 * 20 ms = 120 ms window. Changing this changes the
+# actor input dim (48 * HISTORY_LENGTH) and the critic input dim (51 * HISTORY_LENGTH), so a policy trained at one
+# value is NOT resume-compatible with another, and deploy/deploy_real.py's history_length must be set to match.
+HISTORY_LENGTH = 6
+
+
 ##
 # Scene definition
 ##
@@ -195,6 +202,9 @@ class CommandsCfg:
             heading=(-math.pi, math.pi),
             ang_pos_x=(-0.3, 0.3),
             ang_pos_y=(-0.6, 0.6),
+            # Height command (m). Default stance is 0.337; upward range is limited by leg extension (a Go2's thigh
+            # and calf are ~0.21 m each, so ~0.40 m is fully straight and singular), hence asymmetric.
+            height=(0.28, 0.38),
         ),
     )
 
@@ -246,8 +256,16 @@ class ObservationsCfg:
         )
         joint_pos = ObsTerm(func=mdp.logged_joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel = ObsTerm(
-            func=mdp.logged_joint_vel_rel,
-            noise=Unoise(n_min=-1.5, n_max=1.5),
+            # Matched-noise + EMA-filtered joint velocity (noise added BEFORE the filter, so training == deploy;
+            # see mdp.diagnostics.JointVelFiltered / mdp.obs_filters). noise handled INSIDE the term, so noise=None
+            # here. noise_amp 0.3 is hardware-realistic (measured ~0.06 rad/s floor), NOT the old adversarial 1.5
+            # that trained the buzz in. cutoff_hz 10.0 = the obs_stacking_with_height EMA, matching deploy's
+            # DeployConfig.joint_vel_filter_hz (10 Hz). It is a float, not None: Isaac Lab's Hydra config updater
+            # refuses a None->float type change, so a profile override of this field needs a float default here.
+            # (Set to None only to disable the EMA entirely, which then can't be re-enabled via a Hydra override.)
+            func=mdp.JointVelFiltered,
+            params={"noise_amp": 0.3, "cutoff_hz": 10.0},
+            noise=None,
             clip=(-50.0, 50.0),
         )
         actions = ObsTerm(func=mdp.logged_last_action)
@@ -255,6 +273,14 @@ class ObservationsCfg:
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
+            # Observation stacking: feed the policy the last HISTORY_LENGTH frames (not just the newest). A short
+            # time window lets the MLP read trends/latency AND implicitly system-identify the randomised dynamics
+            # (friction, mass, PD gains, action delay) -- the main sim-to-real benefit. flatten_history_dim gives a
+            # flat (num_envs, 48 * HISTORY_LENGTH) vector, the layout the exported MLP and the deploy/sim2sim mirrors
+            # expect. The deploy ring buffer in deploy/deploy_real.py MUST stack frames in the same order Isaac Lab
+            # does (see OBS_HISTORY_NEWEST_LAST there) and pad startup by repeating the first frame.
+            self.history_length = HISTORY_LENGTH
+            self.flatten_history_dim = True
 
     @configclass
     class CriticCfg(ObsGroup):
@@ -274,6 +300,10 @@ class ObservationsCfg:
         def __post_init__(self):
             self.concatenate_terms = True
             self.enable_corruption = False
+            # Same history as the policy group so the value function sees the matching time window (critic is
+            # privileged and discarded at deploy, so no hardware mirror is needed): (num_envs, 51 * HISTORY_LENGTH).
+            self.history_length = HISTORY_LENGTH
+            self.flatten_history_dim = True
 
     # observation groups
     policy: PolicyCfg = PolicyCfg()
@@ -338,8 +368,10 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "stiffness_distribution_params": (0.9, 1.1),
-            "damping_distribution_params": (0.9, 1.1),
+            # Widened 0.9-1.1 -> 0.8-1.2 (obs-stacking retrain, kp/kd now 50/1.0): a wider PD-gain band keeps a
+            # real-robot kd that differs from nominal (and the deploy kd~1.0) inside the training distribution.
+            "stiffness_distribution_params": (0.8, 1.2),
+            "damping_distribution_params": (0.8, 1.2),
             "operation": "scale",
         },
     )
@@ -580,8 +612,9 @@ class RewardsCfg:
     # agree instead of fighting. pitch_sensitivity lowered from -0.5 (which drove the target to an
     # unreachable 0.037m at the +-0.6 rad pitch limit) to -0.1, allowing ~6cm of crouch at full pitch instead
     # of 30cm -- the base barely moves vertically under pitch anyway, since the hips are +-0.193m fore/aft of
-    # center. There is no height COMMAND any more (see mdp.commands' module docstring): no reliable height
-    # measurement exists on real hardware, so this fixed target is the only height regulation left.
+    # center. Height is a COMMAND again (component [5], ranges.height): the target below is only the legacy
+    # fallback for a 5-wide command. The reward scores the commanded height against sim ground truth; the policy
+    # never observes actual height (no hardware sensor), so this stays deployable. See mdp/height_command.py.
     height_penalty = RewTerm(
         func=mdp.base_height_l1_pitch,
         # iter3: L2 -> L1 and -4.0 -> -8.0. The quadratic was flat near small errors (a ~10 cm droop logged only
@@ -592,7 +625,7 @@ class RewardsCfg:
         weight=-15.0,
         params={
             "command_name": "base_velocity",
-            "target_height": 0.337,
+            "target_height": 0.337,  # fallback only; the commanded height (cmd[:, 5]) is the real target
             "pitch_sensitivity": -0.1,
             "lean_sensitivity": 0.0,
         },
@@ -779,6 +812,8 @@ class QuadrupedLocomotionEnvCfg_PLAY(QuadrupedLocomotionEnvCfg):
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
+        # JointVelFiltered carries its own noise (not manager corruption), so zero it explicitly for play/sim2sim
+        self.observations.policy.joint_vel.params["noise_amp"] = 0.0
         # nominal physics for play and for sim2sim comparisons: no pushes, no action latency, no startup randomisation
         # (armature stays at its nominal JOINT_ARMATURE); friction back to the single nominal 0.8 / 0.6 pair.
         self.events.physics_material.params["static_friction_range"] = (0.8, 0.8)

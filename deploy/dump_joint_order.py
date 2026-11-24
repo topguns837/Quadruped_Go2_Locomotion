@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """One-off helper: prints the real Isaac Lab articulation joint order for the Go2+arm asset, so
-deploy/configs/go2_locomotion.yaml's `isaac_joint_order` can be filled in with ground truth instead of a
+deploy/profiles/go2_locomotion.yaml's `isaac_joint_order` can be filled in with ground truth instead of a
 guess. No robot needed -- this only needs the sim (Isaac Lab's own articulation loading), same GPU-safety
 rules as any other sim launch in this repo apply (check `nvidia-smi` first, don't run this while a
 training/play session is already using the GPU).
@@ -49,7 +49,7 @@ def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env = gym.make(args_cli.task, cfg=env_cfg)
     robot = env.unwrapped.scene["robot"]
-    print("\n[INFO] Isaac Lab articulation joint order (this is what deploy/configs/go2_locomotion.yaml's "
+    print("\n[INFO] Isaac Lab articulation joint order (this is what deploy/profiles/go2_locomotion.yaml's "
           "isaac_joint_order must match, in this exact order):")
     for i, name in enumerate(robot.joint_names):
         print(f"  {i:2d}: {name}")

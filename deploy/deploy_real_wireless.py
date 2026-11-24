@@ -143,12 +143,12 @@ def parse_all_args() -> tuple[argparse.Namespace, argparse.Namespace]:
     # A profile's optional `relay:` block (deploy/relay_profile.py) becomes these flags' defaults, so the precedence
     # stays  explicit CLI flag > profile > built-in default. dr.parse_args() reads the rest of the same profile.
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--test_profile", "--deploy_profile", dest="test_profile", default=None)
-    pre.add_argument("--test_profiles_file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                                  "configs", "test_profiles.yaml"))
+    pre.add_argument("--safety_profile", "--test_profile", dest="safety_profile", default=None)
+    pre.add_argument("--safety_profiles_file", "--test_profiles_file", dest="safety_profiles_file",
+                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "safety_profiles.yaml"))
     pre_args, _ = pre.parse_known_args()
-    if pre_args.test_profile is not None:
-        relay_parser.set_defaults(**relay_profile.load_relay_block(pre_args.test_profiles_file, pre_args.test_profile))
+    if pre_args.safety_profile is not None:
+        relay_parser.set_defaults(**relay_profile.load_relay_block(pre_args.safety_profiles_file, pre_args.safety_profile))
     relay_args, rest = relay_parser.parse_known_args()
     relay_args.relay_key_file = os.path.expanduser(relay_args.relay_key_file)
     if any(a in ("-h", "--help") for a in rest):
@@ -203,7 +203,7 @@ def main() -> int:
     log.start_flusher(1.0)
 
     cfg = dr.load_config(args.config, args.network_interface or "udp-relay", args.link_lost_after,
-                         args.hold_kp, args.policy_path)
+                         args.hold_kp, args.policy_path, args.history_length)
     key = rl.load_key(relay_args.relay_key_file)
     sdk_to_isaac, isaac_to_sdk = dr.build_joint_index_maps(cfg)
     default_joint_pos_isaac_order = [cfg.default_joint_pos[name] for name in cfg.isaac_joint_order]
@@ -211,6 +211,10 @@ def main() -> int:
     print(f"[INFO] Loading policy from: {cfg.policy_path}")
     policy = torch.jit.load(cfg.policy_path)
     policy.eval()
+    base_dim, obs_layout = dr.policy_obs_layout(policy, cfg.history_length)
+    include_base_lin_vel = obs_layout["has_lin_vel"]
+    obs_history = dr.ObsHistory(cfg.history_length, dr.frame_term_widths(base_dim, obs_layout))
+    jv_filter = dr.ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
 
     state = dr.LatestRobotState(num_joints=12)
 
@@ -242,7 +246,7 @@ def main() -> int:
     meta = rlg.base_meta("desktop", relay_args.run_id, sys.argv, [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), f) for f in (
             "deploy_real_wireless.py", "relay_link.py", "deploy_real.py", "impair.py", "runlog.py", "relay_jetson.py",
-            os.path.join("configs", "go2_locomotion.yaml"))] + [cfg.policy_path])
+            os.path.join("profiles", "go2_locomotion.yaml"))] + [cfg.policy_path])
     meta.update({
         "relay_args": vars(relay_args), "deploy_args": {k: v for k, v in vars(args).items()},
         "config": {"kp": cfg.kp, "kd": cfg.kd, "link_lost_after_s": cfg.link_lost_after_s, "control_dt": cfg.control_dt,
@@ -424,7 +428,11 @@ def main() -> int:
                 snap = state.snapshot()
                 cmd = manual_cmd.get()
 
-                obs = dr.build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, cmd, last_action)
+                obs_cmd = dr.command_for_layout(cmd, obs_layout, manual_cmd.get_height())  # see deploy_real
+                frame = dr.build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, obs_cmd,
+                                             last_action, include_base_lin_vel=include_base_lin_vel,
+                                             joint_vel_filter=jv_filter)
+                obs = obs_history.push_and_stack(frame)
                 t_inf = time.perf_counter()
                 with torch.inference_mode():
                     action = policy(obs)[0].tolist()

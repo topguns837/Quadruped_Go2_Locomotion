@@ -23,24 +23,31 @@ import os
 import tkinter as tk
 
 # (label, key, min, max, initial, units) -- one slider per command component, in the exact order
-# play.py's poll loop expects: [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean]. Ranges match
-# CommandsCfg.ranges in quadruped_go2_locomotion_env_cfg.py (verified directly against that file, not
-# CLAUDE.md, whose pitch/lean ranges are swapped relative to the actual code).
+# play.py's poll loop expects: [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height]. Ranges match
+# CommandsCfg.ranges in quadruped_go2_locomotion_env_cfg.py (scripts/tests/test_manual_command_slider.py checks them
+# against that file).
 #
-# No height slider: height is not a command component any more. The robot is held near a fixed default
-# stance height by RewardsCfg.height_penalty (there's no reliable way to measure height on real hardware,
-# so it was never something an operator could usefully command either). See mdp/commands.py's module
-# docstring for the full rationale.
+# Height is the COMMANDED stance height (m). Policies with a 5-wide command ignore it; height-command policies take
+# it as their sixth command component. 0.337 m is the default stance (CommandsCfg.nominal_height); the range
+# 0.28-0.38 is what the policy is trained over (see mdp/height_command.py).
+NOMINAL_HEIGHT = 0.337
 SLIDERS = [
     ("lin_vel_x", "lin_vel_x (m/s)", -1.0, 1.0, 0.0),
     ("lin_vel_y", "lin_vel_y (m/s)", -1.0, 1.0, 0.0),
     ("ang_vel_z", "ang_vel_z (rad/s)", -1.0, 1.0, 0.0),
     ("pitch", "pitch (rad)", -0.6, 0.6, 0.0),
     ("lean", "lean (rad)", -0.3, 0.3, 0.0),
+    ("height", "height (m)", 0.28, 0.38, NOMINAL_HEIGHT),
 ]
 
 
-def build_command_dict(lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean) -> dict:
+def neutral_values() -> dict:
+    """Every slider at its starting value: zero motion/pitch/lean at the nominal stance height. NOT all zeros --
+    0 m is outside the height slider's range, and Tk would clamp the slider while the file still said 0."""
+    return {key: initial for key, _label, _lo, _hi, initial in SLIDERS}
+
+
+def build_command_dict(lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height=NOMINAL_HEIGHT) -> dict:
     """Pure function (no Tkinter/file I/O) so it's directly unit-testable."""
     return {
         "lin_vel_x": lin_vel_x,
@@ -48,6 +55,7 @@ def build_command_dict(lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean) -> dict:
         "ang_vel_z": ang_vel_z,
         "pitch": pitch,
         "lean": lean,
+        "height": height,
     }
 
 
@@ -68,7 +76,7 @@ def main():
     root = tk.Tk()
     root.title("Manual command")
 
-    values = {key: initial for key, _label, _lo, _hi, initial in SLIDERS}
+    values = neutral_values()
     scales: dict[str, tk.Scale] = {}
 
     def on_change(key, value):
@@ -81,7 +89,7 @@ def main():
             root,
             from_=lo,
             to=hi,
-            resolution=0.01,
+            resolution=0.005 if key == "height" else 0.01,
             orient=tk.HORIZONTAL,
             length=300,
             command=lambda v, key=key: on_change(key, v),
@@ -91,11 +99,11 @@ def main():
         scales[key] = scale
 
     def zero_all():
-        """Snaps every slider back to 0 and writes the zeroed command immediately -- a single click to get
-        back to a standing-still command without having to drag each slider back by hand."""
-        for key in values:
-            values[key] = 0.0
-            scales[key].set(0.0)
+        """Snaps every slider back to neutral (zero motion, nominal stance height) and writes it immediately -- a
+        single click to get back to a standing-still command without dragging each slider back by hand."""
+        for key, neutral in neutral_values().items():
+            values[key] = neutral
+            scales[key].set(neutral)
         write_command_file(args.command_file, build_command_dict(**values))
 
     tk.Button(

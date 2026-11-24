@@ -25,34 +25,42 @@ from isaaclab.utils import configclass
 from isaaclab.envs.mdp.commands.velocity_command import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg as _UVCCfg
 
+from .height_command import sample_target_height
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
 # Step 1: Define the command class first (no forward reference issues)
 class UniformVelocityCommandWithPitch(UniformVelocityCommand):
-    """Command generator that extends UniformVelocityCommand with target pitch and lean.
+    """Command generator that extends UniformVelocityCommand with target pitch, lean and base height.
 
-    The command buffer has shape (num_envs, 5) with components:
-    [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean]
+    The command buffer has shape (num_envs, 6) with components:
+    [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean, target_height]
 
-    Body height is NOT part of this command (and never has an observation term, see
-    quadruped_go2_locomotion_env_cfg.py's ObservationsCfg): there is no reliable way to measure it on real
-    hardware, so the robot is instead held near a fixed default stance height purely via `height_penalty`
-    (mdp.rewards.base_height_l2_pitch), which sim can measure directly from root_pos_w. See that reward's
-    `target_height` param, not this command, for the height target.
+    Height is a command and a reward target, never an observation of the ACTUAL height: the policy sees the
+    commanded height (known on the robot, like the velocity command) and is rewarded against the simulator's
+    ground-truth ``root_pos_w[:, 2]`` (mdp.rewards.base_height_l1_pitch). It is therefore open-loop on hardware --
+    the real robot has no reliable base-height measurement, so the policy must infer the achieved height from
+    proprioception. See mdp/height_command.py.
+
+    Unlike the other components, height is NOT zeroed for standing envs (a standing robot still has a stance
+    height to hold). Note the parent's _update_command zeroes the WHOLE row of a standing env, so height is
+    re-assigned from its own buffer afterwards, exactly as pitch/lean are.
     """
 
     def __init__(self, cfg, env: "ManagerBasedEnv"):
         super().__init__(cfg, env)
-        # Extend command buffer from (N, 3) to (N, 5)
-        new_cmd = torch.zeros(self.num_envs, 5, device=self.device)
+        # Extend command buffer from (N, 3) to (N, 6): [vx, vy, wz, pitch, lean, height]
+        new_cmd = torch.zeros(self.num_envs, 6, device=self.device)
         new_cmd[:, :3] = self.vel_command_b
+        new_cmd[:, 5] = self.cfg.nominal_height
         del self.vel_command_b
         self.vel_command_b = new_cmd
         # Target pitch buffer
         self.target_pitch = torch.zeros(self.num_envs, device=self.device)
         self.target_lean  = torch.zeros(self.num_envs, device=self.device)
+        self.target_height = torch.full((self.num_envs,), float(self.cfg.nominal_height), device=self.device)
         # Commanded-value metrics: logged/printed the same way as the
         # inherited error_vel_xy/error_vel_yaw metrics (Metrics/base_velocity/*
         # in the RSL-RL console table and TensorBoard), so the raw command
@@ -62,9 +70,8 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_pitch"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["cmd_lean"] = torch.zeros(self.num_envs, device=self.device)
-        # cmd_height has no command to read any more (height is reward-only, see the class docstring); kept
-        # so live_dashboard.py's existing "Height: commanded vs actual" panel still works unchanged.
-        # _update_metrics below fills it from self.cfg.nominal_height, a fixed display value.
+        # cmd_height is the commanded height (vel_command_b[:, 5]); the "Height: commanded vs actual" dashboard
+        # panel in live_dashboard.py reads it next to actual_height.
         self.metrics["cmd_height"] = torch.zeros(self.num_envs, device=self.device)
         # Achieved-velocity metrics: lets a viewer plot commanded vs. actual on the same chart
         # instead of only seeing the tracking-error magnitude (error_vel_xy/error_vel_yaw).
@@ -82,9 +89,9 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
 
     @property
     def command(self) -> torch.Tensor:
-        """The desired base velocity command in the base frame. Shape is (num_envs, 5).
+        """The desired base command. Shape is (num_envs, 6).
 
-        Components: [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean]
+        Components: [lin_vel_x, lin_vel_y, ang_vel_z, target_pitch, target_lean, target_height]
         """
         return self.vel_command_b
 
@@ -117,6 +124,10 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
             self.target_lean[env_ids] = q.uniform_(*pos_range)
         else:
             self.target_lean[env_ids] = 0.0
+        # Sample height target (metres). Standing envs get one too: see the class docstring.
+        self.target_height[env_ids] = sample_target_height(
+            len(env_ids), self.cfg.ranges.height, self.cfg.nominal_height, self.device
+        )
 
         # Reset our own cmd_*/actual_* metrics here, not just at episode end. CommandManager.reset() (the
         # base framework) only zeros self.metrics on a full episode reset, not on this mid-episode resample
@@ -145,11 +156,18 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.manual_override = True
 
     def set_manual_command(self, values: list[float]):
-        """Set the exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean] command for every env."""
+        """Set the exact [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height] command for every env.
+
+        A 5-value list (no height) keeps the nominal stance height, so older callers still work.
+        """
+        if len(values) == 5:
+            values = [*values, float(self.cfg.nominal_height)]
+        if len(values) != 6:
+            raise ValueError(f"manual command needs 5 or 6 values, got {len(values)}")
         self.manual_command = torch.tensor(values, device=self.device, dtype=torch.float32)
 
     def _update_command(self):
-        """Post-processes the velocity and pitch commands."""
+        """Post-processes the velocity, pitch, lean and height commands."""
         if self.manual_override:
             self.vel_command_b[:] = self.manual_command
             return
@@ -160,9 +178,11 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
         self.target_pitch[standing_env_ids] = 0.0
         self.target_lean[standing_env_ids] = 0.0
-        # Copy pitch and lean targets into the command buffer
+        # Copy pitch, lean and height targets into the command buffer. Height is re-assigned for EVERY env,
+        # standing included, because the parent just zeroed the whole row of each standing env.
         self.vel_command_b[:, 3] = self.target_pitch
         self.vel_command_b[:, 4] = self.target_lean
+        self.vel_command_b[:, 5] = self.target_height
 
     def _update_metrics(self):
         """Extends the base tracking-error metrics with the raw commanded values themselves."""
@@ -174,9 +194,7 @@ class UniformVelocityCommandWithPitch(UniformVelocityCommand):
         self.metrics["cmd_ang_vel_z"] += self.vel_command_b[:, 2] / max_command_step
         self.metrics["cmd_pitch"] += self.vel_command_b[:, 3] / max_command_step
         self.metrics["cmd_lean"] += self.vel_command_b[:, 4] / max_command_step
-        # Not read from vel_command_b: height has no command component any more (see the class docstring).
-        # self.cfg.nominal_height is a fixed display value for the dashboard panel only.
-        self.metrics["cmd_height"] += self.cfg.nominal_height / max_command_step
+        self.metrics["cmd_height"] += self.vel_command_b[:, 5] / max_command_step
         # Achieved velocity, same base frame as vel_command_b, so directly comparable to the cmd_* values.
         self.metrics["actual_lin_vel_x"] += self.robot.data.root_lin_vel_b[:, 0] / max_command_step
         self.metrics["actual_lin_vel_y"] += self.robot.data.root_lin_vel_b[:, 1] / max_command_step
@@ -280,10 +298,12 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
     - Angular velocity around z-axis (rad/s)
     - Target pitch angle (rad)
     - Target lean angle (rad)
+    - Target base height (m)
 
     The robot should lean forward/backward while walking toward the sampled pitch angle.
 
-    Body height is NOT commanded here -- see UniformVelocityCommandWithPitch's class docstring for why.
+    Height is commanded and rewarded against simulator ground truth but never observed as an ACTUAL value --
+    see UniformVelocityCommandWithPitch's class docstring.
     """
 
     class_type: ClassVar = UniformVelocityCommandWithPitch
@@ -299,12 +319,9 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
     resampled ~ U(-low_speed_max, low_speed_max) for the selected envs."""
 
     nominal_height: float = 0.337
-    """Display-only height reference for the cmd_height metric (Metrics/base_velocity/cmd_height). Not a
-    command: it has no entry in `vel_command_b` and is never observed. The real height target lives in
-    RewardsCfg.height_penalty's `target_height` param (mdp.rewards.base_height_l2_pitch) -- this value is not
-    read from there programmatically (command and reward configs are independent dataclasses), so if you
-    change one, change both. Keeping this here, rather than leaving cmd_height at 0, is what keeps the
-    existing "Height: commanded vs actual" dashboard panel (live_dashboard.py) meaningful."""
+    """The default-stance base height (m). Used as the height command when `ranges.height` is None, as the initial
+    value of the command buffer, and as the height filled in for a manual command given without one. 0.337 is the
+    height the default joint pose produces."""
 
     @configclass
     class Ranges:
@@ -327,6 +344,11 @@ class UniformVelocityCommandCfgWithPitch(_UVCCfg):
 
         ang_pos_x: tuple[float, float] | None = None
         """Range for the target lean angle (in rad). Defaults to None. """
+
+        height: tuple[float, float] | None = None
+        """Range for the target base height (in m). None keeps every env at `nominal_height` (no height command
+        variation). Keep the upper end well below fully-extended legs (~0.40 m for a Go2: thigh and calf are each
+        ~0.21 m), where the knee is kinematically singular."""
 
     ranges: Ranges = Ranges()  # type: ignore
 
