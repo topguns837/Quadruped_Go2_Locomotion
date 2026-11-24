@@ -1,5 +1,7 @@
 # 9_13_26_round3_pitch_lean_height_weights
 
+**Training profile:** No training-profile file — this run predates the `training_profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
+
 **What this is:** the Round 3 reward-engineering experiment (see `docs/go2_round2_reward_engineering_plan.md`
 and `patches/round3_weights_and_height.patch`), trained on the corrected Go2 + OpenManipulatorX asset.
 Adds a `base_height` (root world-Z) observation term on top of the vanilla baseline's observation space
@@ -62,3 +64,52 @@ an unrelated reason: they were trained against a 23.5 Nm calf limit the real Go2
 a 1.9169:1 knee reduction, 45.43 Nm) and a 2.0 kg imu/radar phantom mass that has since been fixed -- see
 `sim2sim/README.md` for the measurements. The patch, and this run, are kept only as a historical record of
 the Round 3 reward-weight experiment; do not apply the patch or resume from this checkpoint.
+
+## Metrics
+
+Values are per-policy snapshots; training rows are the TensorBoard figures recorded above (full per-term metrics
+were not retained). Not cross-policy comparable (Round 3 reward schema + a `base_height` observation this repo has
+since dropped).
+
+### 1. Sim2sim (nominal physics, Isaac vs MuJoCo)
+
+No sim2sim evaluation was retained for this run.
+
+| metric | Isaac | MuJoCo |
+|---|---|---|
+| lin_x RMS (m/s) · lin_y RMS (m/s) · ang_z RMS (rad/s) · pitch RMS (rad) · lean RMS (rad) · height RMS (m) · segments with a fall (/60) · peak joint torque (Nm) | n/a — not retained | n/a — not retained |
+
+### 2. Sim2real (hardware)
+
+Not hardware-tested (kept as a historical reward-experiment record; do not resume — see note above).
+
+| metric | value |
+|---|---|
+| lin_x RMS (m/s) | — |
+| lin_y RMS (m/s) | — |
+| ang_z RMS (rad/s) | — |
+| pitch RMS (rad) | — |
+| lean RMS (rad) | — |
+| height RMS (m) | — |
+| walks? | — (not tested) |
+| buzz | — |
+| control-loop timing | — |
+| notes | — |
+
+### 3. Final training metrics (TensorBoard, final)
+
+| metric | value |
+|---|---|
+| total iterations | 18000 |
+| mean_reward | 636.6 |
+| mean_episode_length | 1914 |
+| difficulty_scale | n/a — not retained |
+| error_vel_xy | n/a — not retained |
+| error_vel_yaw | n/a — not retained |
+| track_lin_vel_xy_exp | n/a — not retained |
+| track_ang_vel_z_exp | n/a — not retained |
+| track_pitch_exp | n/a — not retained |
+| track_lean_exp | n/a — not retained |
+| height_penalty | n/a — not retained |
+| body_contact (term rate) | n/a — not retained |
+| entropy | n/a — not retained |
