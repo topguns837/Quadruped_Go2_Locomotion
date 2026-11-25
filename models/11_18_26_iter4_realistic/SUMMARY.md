@@ -38,21 +38,42 @@ pooled RMS. Source: `logs/sim2sim_eval_24999/random/report.md`.
 
 ### 2. Sim2real (hardware)
 
-Hardware-tested 2026-11-18 (details in the "Hardware results" section below); quantitative tracking was not
-captured, so the numeric rows stay blank.
+Three `--deploy_profile iter4_realistic` runs, 2026-11-23, `logs/hardware_dashboard/2026-11-23_{13-37-59,13-44-32,14-00-31}`
+(`cli_args.txt` + `events.out.tfevents.*` + `policy_trace.npz` in each). Metrics below computed directly from those
+files (RMS over the full run; torque/joint-vel/autocorr over ticks at the settled trained gain kp=40, excluding the
+startup-ramp handover at kp up to 59).
 
-| metric | value |
-|---|---|
-| lin_x RMS (m/s) | — |
-| lin_y RMS (m/s) | — |
-| ang_z RMS (rad/s) | — |
-| pitch RMS (rad) | — |
-| lean RMS (rad) | — |
-| height RMS (m) | — |
-| walks? | yes (with the deploy-side action low-pass on) |
-| buzz | ~24.9 Hz (control-Nyquist), worst on dynamic commands; mitigated by `--low_pass` (5 Hz EMA) |
-| control-loop timing | steady ~20.1 ms; startup ramp clean (peak 18.4 Nm) |
-| notes | single-frame policy amplifies joint_vel obs noise; `--low_pass` cut gyro RMS −28%, joint-vel RMS −40% |
+| metric | 13:37 (59 s) | 13:44 (126 s) | 14:00 (115 s) | sim2sim MuJoCo (model_24999) |
+|---|---|---|---|---|
+| lin_x RMS (m/s) | 0.122† | 0.131† | 0.131† | 0.051 |
+| lin_y RMS (m/s) | 0.078† | 0.109† | 0.111† | 0.045 |
+| ang_z RMS (rad/s) | 0.160 | 0.164 | 0.182 | 0.222 |
+| pitch RMS (rad) | 0.041 | 0.064 | 0.040 | 0.040 |
+| lean RMS (rad) | 0.024 | 0.028 | 0.028 | 0.026 |
+| height RMS (m) | n/a (no height input/estimate on this policy) | | | 0.070 |
+| peak \|tau_est\| (Nm) | 22.9 | 24.7 | 22.7 | 45.4 (calf limit, not a fault) |
+| mean \|tau_est\| (Nm) | 4.50 | 4.52 | 4.60 | — |
+| joint_vel RMS (rad/s) | 0.48 | 0.65 | 0.62 | — |
+| gyro RMS (rad/s) | 0.141 | 0.200 | 0.173 | — |
+| sent-target lag-1 autocorr | +0.99 | +0.99 | +0.99 | — |
+| tether / slew-clip ticks | 0 / 0 | 0 / 0 | 0 / 0 | — |
+| falls / aborts | 0 | 0 | 0 | 0 |
+
+† **Not a tracking error — do not read as sim2real velocity transfer.** `deploy_real.py` only subscribes to
+`rt/sportmodestate` when the policy's observation includes `base_lin_vel` (`include_base_lin_vel`); this 47-dim
+policy doesn't, so the subscription is never opened and `LatestRobotState.sportmode_velocity` stays at its
+initializer, `(0.0, 0.0, 0.0)`, for the whole run (confirmed directly: `actual_lin_vel_x/y` in all three
+`events.out.tfevents.*` files are exactly 0.000000 at every step). The "RMS" above is therefore just `RMS(cmd - 0)
+= RMS(cmd)`, i.e. a measure of how large the commands were, not of tracking. **There is currently no linear-velocity
+ground truth on hardware for this policy** — ang_z/pitch/lean above are real (IMU-derived), lin_x/lin_y are not.
+To get a real number, either log (not feed) `rt/sportmodestate` regardless of `include_base_lin_vel`, or use an
+external reference (mocap/vision).
+
+Other results: walks on all three runs; **zero** faults, aborts, tether engagements or slew-rate clips; peak torque
+well inside the 40.9 Nm calf / 21.15 Nm global abort. The 5 Hz low-pass keeps the sent-target lag-1 autocorrelation
+at +0.99 (smooth) vs the −0.70 reported unfiltered on 2026-11-18, consistent with the buzz mitigation holding here too.
+Loop ran at a mean ~22–23 ms/tick (vs the 20 ms / 50 Hz design point) on this laptop's CPU; did not destabilize
+anything but is slower than the 2026-11-18 run's steady 20.1 ms.
 
 ### 3. Final training metrics (mean of last 300 iterations)
 
