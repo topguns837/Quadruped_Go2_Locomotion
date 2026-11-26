@@ -1,0 +1,31 @@
+[package]
+
+# Semantic Versioning is used: https://semver.org/
+version = "1.1.0"
+
+# Description
+category = "isaaclab"
+readme  = "README.md"
+
+title = "Quadruped Locomotion"
+author = "Udula Ranasinghe, Gavin Kane, Arjun K Haridas"
+maintainer = "Arjun K Haridas"
+description="Training Unitree Go2 locomotion policies with RSL-RL PPO in Isaac Lab"
+repository = "https://github.com/topguns837/Quadruped_Go2_Locomotion"
+keywords = ["extension", "template", "isaaclab"]
+
+[dependencies]
+"omni.kit.uiapp" = {}
+# NOTE: Add additional dependencies here
+
+[[python.module]]
+name = "quadruped_go2_locomotion"
+
+[isaaclab_settings]
+# TODO: Uncomment and list any apt dependencies here.
+#       If none, leave it commented out.
+# apt_deps = ["example_package"]
+# TODO: Uncomment and provide path to a ros_ws
+#       with rosdeps to be installed. If none,
+#       leave it commented out.
+# ros_ws = "path/from/extension_root/to/ros_ws"

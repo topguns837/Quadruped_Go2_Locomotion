@@ -1,0 +1,133 @@
+# Training profile: iter4 "realistic" -- the current default, two-phase (the double-phased run).
+#
+# Reproduces logs/rsl_rl/go2_kp40_iter4_realistic/run_iter4_realistic (the 25k-iteration run that produced
+# models/11_18_26_iter4_realistic). Phase 1 forms a stable gait under mild disturbance; phase 2 re-ramps the
+# difficulty curriculum with realistic sim-to-real disturbance magnitudes and the hardened posture weights.
+#
+# This file is a COMPLETE, self-contained snapshot: the top-level `overrides` lists EVERY tunable value (even the
+# ones equal to the Python default), so the whole training config is auditable here without cross-referencing the
+# code. Each phase lists only what it CHANGES from that baseline. Effective config of a phase = baseline + phase.
+#   bash src/training/train.sh --profile iter4_realistic            # real run (headless)
+#   bash src/training/train.sh --profile iter4_realistic --dry_run  # print the per-phase commands only
+#
+# ---------------------------------------------------------------------------------------------------------------
+# FIXED IN CODE -- recorded here for completeness; NOT overridable in a profile (baked into the actuator / network
+# at class-definition time, or changing them would desync deploy or break resume):
+#   kp = 40.0, kd = 0.8                      (robot_cfg.py DCMotorCfg; deploy must match)
+#   JOINT_ARMATURE (nominal) = 0.01          (the DR band below scales THIS)
+#   PHYSX_JOINT_SPEED_LIMIT = 500            (hard joint-speed clamp disabled for hardware parity)
+#   observation history_length = 1           (single frame; obs stacking is a separate future retrain)
+#   actor/critic hidden dims = [256,512,128], activation = elu, num_steps_per_env = 24
+# ---------------------------------------------------------------------------------------------------------------
+
+# How many training phases this profile runs. It must equal the number of entries under `phases:` below
+# (1 = a single-phase run; a profile with `num_phases: 4` needs four phase entries). `train.sh --num_phases K`
+# runs only the first K of them.
+num_phases: 2
+
+experiment_name: go2_kp40_iter4_realistic
+run_dir: run_iter4_realistic
+task: Quadruped-Locomotion-Go2
+num_envs: 2048
+seed: null
+
+# Live graphs while training: train_batched.sh (re)starts src/common/live_dashboard.py at the start of every batch and
+# opens feh on its PNG -- no separate tmux dashboard / viewer panes needed. CLI: --no_dashboard, --no_viewer,
+# --dashboard_output PATH override these per run.
+dashboard: true                       # run the live dashboard (writes a PNG every ~0.5 s)
+viewer: true                          # open a feh window on that PNG (needs DISPLAY + feh; else skipped)
+dashboard_output: /tmp/dashboard.png  # PNG the dashboard writes and feh shows
+
+# Complete baseline (the iter4-realistic values); applied to every phase, a phase's own value wins.
+overrides:
+  # --- disturbances / domain randomisation (EventCfg); magnitudes curriculum-scaled by env.difficulty_scale ---
+  env.events.push_robot_force.params.max_force: 15.0        # N per axis at full difficulty
+  env.events.push_robot_force.params.max_torque: 2.0        # Nm at full difficulty
+  env.events.push_robot.params.max_velocity: 0.5            # m/s velocity kick
+  env.events.robot_mass.params.mass_distribution_params: [-2.0, 2.0]          # kg added to base
+  env.events.robot_com.params.max_xyz: [0.06, 0.05, 0.08]                     # m COM offset (x, y, z)
+  env.events.actuator_gains.params.stiffness_distribution_params: [0.9, 1.1]  # x nominal kp (scale)
+  env.events.actuator_gains.params.damping_distribution_params: [0.9, 1.1]    # x nominal kd (scale)
+  env.events.joint_armature.params.armature_distribution_params: [0.75, 1.5]  # x nominal JOINT_ARMATURE
+  env.events.joint_friction.params.friction_distribution_params: [0.0, 0.1]   # Nm absolute
+  env.events.physics_material.params.static_friction_range: [0.5, 1.2]
+  env.events.physics_material.params.dynamic_friction_range: [0.4, 1.0]
+
+  # --- difficulty curriculum (CurriculumCfg.difficulty) ---
+  env.curriculum.difficulty.params.step: 0.025
+  env.curriculum.difficulty.params.up_thresh: 0.8
+  env.curriculum.difficulty.params.down_thresh: 0.4
+  env.curriculum.difficulty.params.dwell_steps: 6000
+  env.curriculum.difficulty.params.settle_steps: 2000
+  env.curriculum.difficulty.params.min_episodes: 500
+
+  # --- reward weights (RewardsCfg) -- the full set ---
+  env.rewards.track_lin_vel_xy_exp.weight: 6.0
+  env.rewards.track_lin_vel_xy_broad.weight: 4.0
+  env.rewards.track_ang_vel_z_exp.weight: 1.2
+  env.rewards.track_ang_vel_z_broad.weight: 0.8
+  env.rewards.standing_when_commanded.weight: -4.0
+  env.rewards.track_ang_vel_deficit.weight: -0.5
+  env.rewards.track_pitch_exp.weight: 3.0
+  env.rewards.track_lean_exp.weight: 3.0
+  env.rewards.lin_vel_z_l2.weight: -2.0
+  env.rewards.ang_vel_xy_l2.weight: -0.05
+  env.rewards.dof_torques_l2.weight: -3.0e-5
+  env.rewards.dof_acc_l2.weight: -5.0e-7
+  env.rewards.action_rate_l2.weight: -0.03
+  env.rewards.dof_vel_l2.weight: -1.0e-4
+  env.rewards.action_jerk_l2.weight: -0.03
+  env.rewards.joint_torque_rate_l2.weight: -1.0e-3
+  env.rewards.is_alive.weight: 2.0
+  env.rewards.termination_penalty.weight: -750.0
+  env.rewards.undesired_contacts.weight: -1.0
+  env.rewards.undesired_contacts_arm.weight: -1.0
+  env.rewards.height_penalty.weight: -15.0
+  env.rewards.hip_crossing.weight: -0.5
+  env.rewards.foot_sliding.weight: -1.0
+  env.rewards.gait_coordination.weight: 1.0
+  env.rewards.stand_still.weight: 5.0
+  env.rewards.foot_lift.weight: 0.5
+  env.rewards.dof_pos_limits.weight: -1.0
+  env.rewards.joint_deviation.weight: -0.005
+
+  # --- commands (CommandsCfg.base_velocity) ---
+  env.commands.base_velocity.rel_standing_envs: 0.2
+  env.commands.base_velocity.resampling_time_range: [10.0, 10.0]
+  env.commands.base_velocity.rel_low_speed_envs: 0.35
+  env.commands.base_velocity.low_speed_max: 0.3
+  env.commands.base_velocity.ranges.lin_vel_x: [-1.0, 1.0]
+  env.commands.base_velocity.ranges.lin_vel_y: [-1.0, 1.0]
+  env.commands.base_velocity.ranges.ang_vel_z: [-1.0, 1.0]
+  env.commands.base_velocity.ranges.ang_pos_x: [-0.3, 0.3]   # lean
+  env.commands.base_velocity.ranges.ang_pos_y: [-0.6, 0.6]   # pitch
+
+  # --- agent / PPO (rsl_rl_ppo_cfg) ---
+  agent.algorithm.learning_rate: 1.0e-3
+  agent.algorithm.gamma: 0.99
+  agent.algorithm.lam: 0.95
+  agent.algorithm.entropy_coef: 0.0075
+  agent.algorithm.clip_param: 0.2
+  agent.algorithm.value_loss_coef: 0.5
+  agent.algorithm.desired_kl: 0.01
+  agent.algorithm.num_learning_epochs: 5
+  agent.algorithm.num_mini_batches: 4
+  agent.save_interval: 100
+
+phases:
+  # Phase 1 -- clean warm-up (the model_9999 phase): disturbances mild so a stable trot forms first.
+  - name: clean
+    iterations: 10000
+    batched: true
+    batch_iterations: 2000
+    overrides:
+      env.events.push_robot_force.params.max_force: 5.0
+      env.events.push_robot_force.params.max_torque: 1.0
+      env.curriculum.difficulty.params.step: 0.05
+
+  # Phase 2 -- realistic: uses the baseline above unchanged (full magnitudes, slow step, hardened posture).
+  - name: realistic
+    iterations: 15000
+    batched: true
+    batch_iterations: 2000
+    overrides: {}

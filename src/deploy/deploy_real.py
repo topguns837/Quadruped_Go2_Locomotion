@@ -1,0 +1,2156 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Real-hardware deployment: runs an exported Go2 policy on a physical Unitree Go2 over the SDK (DDS),
+reusing this repo's existing manual-command slider and live-dashboard tooling unchanged.
+
+Interpreter: run this with Isaac Sim's bundled Python directly (NOT `isaaclab -p`, which launches the full
+Kit app -- unnecessary here, this script never touches pxr/Omniverse/SimulationApp):
+    /workspace/isaaclab/_isaac_sim/python.sh src/deploy/deploy_real.py --network_interface enp3s0 --dry_run
+
+That interpreter already has torch/tensorboard (confirmed importable without launching Kit, same as this
+session's TensorBoard log-reading checks). The Unitree SDK itself is NOT on PyPI (confirmed directly) --
+install from source, plus its own native-library dependency (see docker/Dockerfile's build block for the
+exact commands this was verified with, including the numpy<2 repin the SDK's install otherwise breaks):
+    /workspace/isaaclab/_isaac_sim/python.sh -m pip install "git+https://github.com/unitreerobotics/unitree_sdk2_python.git"
+
+See src/deploy/README.md for the full staged rollout (hoisted dry-run before anything else, joint-mapping
+verification via src/deploy/dump_joint_order.py, etc.) -- this file implements the control loop, not the
+safety procedure around running it.
+
+Frequency note: the policy is stepped at exactly `control_dt` (50 Hz, matching training's
+decimation*sim.dt), independent of however fast the robot's own LowState publishes (typically much
+faster). The LowState subscriber callback only ever overwrites a "latest state" snapshot. Publishing is
+itself two-rate, confirmed against unitree_sdk2py's own reference example
+(example/go2/low_level/go2_stand_example.py): the 50 Hz main loop only updates a shared target buffer
+(`LowCmdTarget`); a separate ~500 Hz `RecurrentThread` (`publish_low_cmd`) continuously re-publishes
+whatever the latest target is, giving the robot's communication watchdog a steady heartbeat independent of
+inference timing -- see `LatestRobotState`/`LowCmdTarget`/`publish_low_cmd` and the main loop below.
+
+Before any LowCmd is meaningful, the robot's onboard sport-mode controller must release control
+(`release_motion_control`) -- confirmed required via the same reference example (SportClient +
+MotionSwitcherClient, looping StandDown()+ReleaseMode() until CheckMode() reports no active mode) and
+independently corroborated by docs.quadruped.de's Go2 "Low-Level Control" page.
+
+Height is not part of the command or observation at all any more: there is no reliable way to measure base
+height on real hardware (SportModeState's availability once sport mode is released was never confirmed),
+and the training-side fix is to hold the robot near a fixed default stance height purely via a reward
+(RewardsCfg.height_penalty), never to observe or command it. See mdp/commands.py's module docstring.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import contextlib
+import json
+import math
+import os
+import select
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from dataclasses import dataclass
+from datetime import datetime
+
+import torch
+import yaml
+
+import dashboard_launch
+
+try:
+    from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+    from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
+    from unitree_sdk2py.go2.sport.sport_client import SportClient
+    from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
+    from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_, LowState_, SportModeState_
+    from unitree_sdk2py.utils.crc import CRC
+    from unitree_sdk2py.utils.thread import RecurrentThread
+
+    _UNITREE_SDK_AVAILABLE = True
+except ImportError:
+    # Import-time failure is tolerated (not raised) so --help, config-loading, and --dry_run's non-hardware
+    # parts (obs assembly, timing, slider/dashboard wiring) can still be exercised/tested without the SDK
+    # installed -- e.g. on a dev machine that isn't yet connected to a robot. main() checks this flag and
+    # refuses to proceed to actual DDS init if it's False.
+    _UNITREE_SDK_AVAILABLE = False
+
+# Confirmed directly against unitree_sdk2py's own reference example
+# (example/go2/low_level/go2_stand_example.py + unitree_legged_const.py, fetched and read this session) --
+# not shipped as importable constants in the installed package itself, only as a standalone file alongside
+# that example, so defined here instead of imported.
+_LOWCMD_HEAD = (0xFE, 0xEF)
+_LOWLEVEL = 0xFF  # LowCmd.level_flag -- tells the robot to obey LowCmd instead of its onboard controller
+_MOTOR_MODE_PMSM = 0x01  # LowCmd.motor_cmd[i].mode -- required on every motor, set once at init
+
+# ---------------------------------------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class DeployConfig:
+    policy_path: str
+    control_dt: float
+    network_interface: str | None
+    action_scale: float
+    kp: float
+    kd: float
+    effort_limit: float
+    isaac_joint_order: list[str]
+    sdk_joint_order: list[str]
+    default_joint_pos: dict[str, float]
+    link_lost_after_s: float = 0.5  # LINK_LOST_AFTER_S; defaulted so direct constructors (sim2sim) keep working
+    hold_kp: float | None = None  # startup-ramp stiffness; None = same as kp (old single-stiffness behaviour)
+    # Number of observation frames the policy expects stacked (ObservationsCfg.HISTORY_LENGTH in training). 1 =
+    # single-frame (every policy before obs_stacking_with_height). Must equal the training value, and obs_dim == base_dim * this.
+    history_length: int = 1
+    joint_vel_filter_hz: float | None = None  # EMA low-pass on the joint_vel obs; None = off (current policy)
+
+    def __post_init__(self) -> None:
+        if self.hold_kp is None:
+            self.hold_kp = self.kp
+
+
+def load_config(path: str, cli_network_interface: str | None, cli_link_lost_after: float | None = None,
+                cli_hold_kp: float | None = None, cli_policy_path: str | None = None,
+                cli_history_length: int | None = None) -> DeployConfig:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    # policy_path: CLI / profile (--policy_path) > config file. Lets a deploy profile select the policy without a
+    # separate config file, the one thing the config YAML otherwise pins per policy.
+    policy_path = cli_policy_path or raw["policy_path"]
+    network_interface = cli_network_interface or raw["network_interface"]
+    if not network_interface:
+        raise ValueError(
+            "network_interface is not set -- pass --network_interface or set it in the config file. "
+            "Refusing to guess a NIC for DDS traffic to the robot."
+        )
+    # Link-loss threshold: CLI > config `link_lost_after` > the module default (0.5 s). Exposed because a
+    # wireless link's jitter may need a different margin than the wired default was chosen for.
+    if cli_link_lost_after is not None:
+        link_lost_after_s = cli_link_lost_after
+    else:
+        link_lost_after_s = float(raw.get("link_lost_after", LINK_LOST_AFTER_S))
+    # history_length: CLI / profile (--history_length) > config `history_length` > 1 (single frame, the default so
+    # the current single-frame policy deploys unchanged). Must equal the policy's training history; a mismatch is
+    # caught by policy_obs_layout against the net's input width.
+    history_length = int(cli_history_length if cli_history_length is not None else raw.get("history_length", 1))
+    if history_length < 1:
+        raise ValueError(f"history_length must be >= 1, got {history_length}")
+    kp = float(raw["kp"])
+    # hold_kp: stiffness for the startup ramp only (the policy loop runs at kp). CLI > config > kp (old
+    # behaviour). See the config comment and ramp_to_default_pose() -- kp is too soft to raise the robot's
+    # weight off the ground before the policy is live.
+    if cli_hold_kp is not None:
+        hold_kp = cli_hold_kp
+    else:
+        hold_kp = float(raw.get("hold_kp", kp))
+    return DeployConfig(
+        policy_path=policy_path,
+        control_dt=float(raw["control_dt"]),
+        network_interface=network_interface,
+        link_lost_after_s=link_lost_after_s,
+        action_scale=float(raw["action_scale"]),
+        kp=kp,
+        kd=float(raw["kd"]),
+        hold_kp=hold_kp,
+        effort_limit=float(raw["effort_limit"]),
+        isaac_joint_order=list(raw["isaac_joint_order"]),
+        sdk_joint_order=list(raw["sdk_joint_order"]),
+        default_joint_pos=dict(raw["default_joint_pos"]),
+        history_length=history_length,
+        joint_vel_filter_hz=raw.get("joint_vel_filter_hz"),
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Joint-order plumbing -- src/deploy/profiles/go2_locomotion.yaml's isaac_joint_order and sdk_joint_order are
+# both lists of the SAME 12 joint names, just in each side's own order. Every permutation needed (SDK ->
+# Isaac for building observations, Isaac -> SDK for sending commands) is a pure index remap built once at
+# startup, never recomputed per-tick.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def build_joint_index_maps(cfg: DeployConfig) -> tuple[list[int], list[int]]:
+    """Returns (sdk_to_isaac, isaac_to_sdk), both indexed by ISAAC slot i, both giving the SDK motor index of the
+    joint sitting in Isaac slot i: sdk_to_isaac[i] is the motor whose reading goes into Isaac slot i (gather),
+    isaac_to_sdk[i] is the motor that Isaac slot i's command is written to (scatter). They are numerically the
+    same list -- "which motor is this joint" does not depend on direction -- and are built from matching joint
+    *names*, never by assuming a numeric relationship between the two orders.
+
+    HISTORY (real bug, found on hardware day 1): isaac_to_sdk used to be built as the mathematical INVERSE
+    permutation (indexed by SDK slot, giving an Isaac index) while publish_low_cmd iterated it as if indexed
+    by Isaac slot. Both lists were valid permutations, so a permutation check passed, but 8 of 12 joints were
+    sent the WRONG joint's target (e.g. the FL_hip motor received RL_thigh's ~57 deg target). The explicit
+    cross-check at the bottom now fails loudly if the lists ever stop naming the right motor."""
+    if set(cfg.isaac_joint_order) != set(cfg.sdk_joint_order):
+        raise ValueError(
+            "isaac_joint_order and sdk_joint_order in the config don't contain the same joint names -- "
+            f"isaac has {set(cfg.isaac_joint_order) - set(cfg.sdk_joint_order)} extra, "
+            f"sdk has {set(cfg.sdk_joint_order) - set(cfg.isaac_joint_order)} extra."
+        )
+    sdk_index_of = {name: i for i, name in enumerate(cfg.sdk_joint_order)}
+    sdk_to_isaac = [sdk_index_of[name] for name in cfg.isaac_joint_order]
+    isaac_to_sdk = [sdk_index_of[name] for name in cfg.isaac_joint_order]
+    for i, name in enumerate(cfg.isaac_joint_order):
+        if cfg.sdk_joint_order[sdk_to_isaac[i]] != name or cfg.sdk_joint_order[isaac_to_sdk[i]] != name:
+            raise ValueError(
+                f"Joint index map is wrong for Isaac slot {i} ({name!r}): it points at SDK motor "
+                f"{isaac_to_sdk[i]} ({cfg.sdk_joint_order[isaac_to_sdk[i]]!r}). Refusing to continue -- "
+                "commands would be sent to the wrong motor."
+            )
+    return sdk_to_isaac, isaac_to_sdk
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Robot state -- written only by the DDS callback, read only by the main loop. A lock guards the handful of
+# plain-float/list fields; there's no tensor math inside the callback itself (kept deliberately trivial, per
+# the frequency-matching design: the callback's only job is "remember the latest message").
+# ---------------------------------------------------------------------------------------------------------
+
+
+class LatestRobotState:
+    def __init__(self, num_joints: int):
+        self._lock = threading.Lock()
+        self.joint_pos = [0.0] * num_joints  # SDK order
+        self.joint_vel = [0.0] * num_joints  # SDK order
+        self.tau_est = [0.0] * num_joints  # SDK order, Nm -- the robot's own estimate of torque it is applying
+        self.wireless_remote = bytes(40)  # raw handheld-controller state carried in LowState (see decode_controller_buttons)
+        self.quat_wxyz = (1.0, 0.0, 0.0, 0.0)  # IMU orientation, body-to-world
+        self.gyro = (0.0, 0.0, 0.0)  # body-frame angular velocity, rad/s
+        # NOTE: SportModeState's real-hardware availability after ReleaseMode() is unconfirmed (see
+        # src/deploy/README.md Stage 3), so this may go stale/frozen once the robot is actually in the state the
+        # policy needs it in. Left wired up since there's no evidence yet it specifically fails, but
+        # flagged here so it isn't silently trusted if it turns out not to work either. (Height, the other
+        # quantity this same uncertainty applied to, is no longer tracked at all -- see mdp/commands.py's
+        # module docstring: there is no height command or observation any more, only a training-side
+        # reward toward a fixed default stance height, so there is nothing left to read here for it.)
+        self.sportmode_velocity = (0.0, 0.0, 0.0)  # body-frame linear velocity estimate, m/s
+        self.ready = False  # False until at least one LowState message has been received
+        self.last_update = None  # time.monotonic() of the most recent LowState message
+        # LowState inter-arrival jitter tracking. On a wired link gaps are ~2 ms (500 Hz); over WiFi they
+        # can spike, and a spike past the link-loss threshold safely stops the run -- so these stats let the
+        # operator see how close WiFi jitter is getting to that threshold. _gaps_s is capped to bound memory
+        # on long runs (500k samples ~= 1000 s at 500 Hz); past that only max/last keep updating.
+        self.foot_force = [0, 0, 0, 0]  # Go2 foot contact sensors (raw units), in SDK foot order FR, FL, RR, RL
+        self.last_gap_s = 0.0
+        self.max_gap_s = 0.0
+        self._gaps_s: list[float] = []
+        self._gaps_capped = False
+
+    def age_s(self) -> float:
+        """Seconds since the last LowState message (inf if none yet). Used by the link-loss guard."""
+        if self.last_update is None:
+            return float("inf")
+        return time.monotonic() - self.last_update
+
+    def gap_stats(self) -> dict:
+        """Summary of LowState inter-arrival gaps seen so far (seconds): sample count, max, and 95th
+        percentile, plus whether the sample buffer was capped. For judging WiFi link health against the
+        link-loss threshold."""
+        with self._lock:
+            gaps = sorted(self._gaps_s)
+            capped = self._gaps_capped
+            max_s = self.max_gap_s
+        if not gaps:
+            return {"count": 0, "max_s": max_s, "p95_s": 0.0, "capped": capped}
+        p95 = gaps[min(len(gaps) - 1, int(0.95 * len(gaps)))]
+        return {"count": len(gaps), "max_s": max_s, "p95_s": p95, "capped": capped}
+
+    def update_from_low_state(self, msg) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if self.last_update is not None:
+                gap = now - self.last_update
+                self.last_gap_s = gap
+                if gap > self.max_gap_s:
+                    self.max_gap_s = gap
+                if len(self._gaps_s) < 500_000:
+                    self._gaps_s.append(gap)
+                else:
+                    self._gaps_capped = True
+            self.last_update = now
+            self.joint_pos = [ms.q for ms in msg.motor_state[: len(self.joint_pos)]]
+            self.joint_vel = [ms.dq for ms in msg.motor_state[: len(self.joint_vel)]]
+            self.tau_est = [ms.tau_est for ms in msg.motor_state[: len(self.tau_est)]]
+            self.wireless_remote = bytes(msg.wireless_remote)
+            self.quat_wxyz = tuple(msg.imu_state.quaternion)
+            self.gyro = tuple(msg.imu_state.gyroscope)
+            try:
+                self.foot_force = [int(v) for v in msg.foot_force]
+            except (AttributeError, TypeError):
+                pass
+            self.ready = True
+
+    def update_from_sportmode_state(self, msg) -> None:
+        with self._lock:
+            self.sportmode_velocity = tuple(msg.velocity)
+
+    def snapshot(self) -> LatestRobotState:
+        """Returns a shallow copy safe to read from without holding the lock for the whole control tick."""
+        with self._lock:
+            snap = LatestRobotState(len(self.joint_pos))
+            snap.joint_pos = list(self.joint_pos)
+            snap.joint_vel = list(self.joint_vel)
+            snap.tau_est = list(self.tau_est)
+            snap.wireless_remote = self.wireless_remote
+            snap.quat_wxyz = self.quat_wxyz
+            snap.gyro = self.gyro
+            snap.foot_force = list(self.foot_force)
+            snap.sportmode_velocity = self.sportmode_velocity
+            snap.ready = self.ready
+            snap.last_update = self.last_update
+            return snap
+
+
+def quat_rotate_inverse_wxyz(quat_wxyz: tuple[float, float, float, float], vec: tuple[float, float, float]):
+    """Rotates `vec` (world frame) into the body frame described by `quat_wxyz` (w, x, y, z), matching
+    Isaac Lab's math_utils.quat_rotate_inverse convention (same one projected_gravity's obs term uses)."""
+    w, x, y, z = quat_wxyz
+    vx, vy, vz = vec
+    # v' = q^-1 * v * q, expanded closed-form (standard quaternion-vector rotation, inverse via conjugate
+    # since q is unit-norm).
+    qvec = (x, y, z)
+    uv = (
+        qvec[1] * vz - qvec[2] * vy,
+        qvec[2] * vx - qvec[0] * vz,
+        qvec[0] * vy - qvec[1] * vx,
+    )
+    uuv = (
+        qvec[1] * uv[2] - qvec[2] * uv[1],
+        qvec[2] * uv[0] - qvec[0] * uv[2],
+        qvec[0] * uv[1] - qvec[1] * uv[0],
+    )
+    return (
+        vx + 2.0 * (-w * uv[0] + uuv[0]),
+        vy + 2.0 * (-w * uv[1] + uuv[1]),
+        vz + 2.0 * (-w * uv[2] + uuv[2]),
+    )
+
+
+def quat_to_pitch_lean(quat_wxyz: tuple[float, float, float, float]) -> tuple[float, float]:
+    """Extracts (lean/roll, pitch) from a body quaternion -- same XYZ-Euler convention this repo's
+    mdp/commands.py uses (math_utils.euler_xyz_from_quat returns (lean, pitch, yaw))."""
+    w, x, y, z = quat_wxyz
+    # roll (x-axis rotation)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(torch.tensor(sinr_cosp), torch.tensor(cosr_cosp)).item()
+    # pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = max(-1.0, min(1.0, sinp))
+    pitch = torch.asin(torch.tensor(sinp)).item()
+    return roll, pitch
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Manual command slider -- identical protocol to src/play/play.py's --manual_commands (same JSON
+# schema, same poll interval, same subprocess launch). No CommandManager exists here, so the poll thread
+# writes straight into a plain list guarded by a lock instead of calling a command term's setter.
+# ---------------------------------------------------------------------------------------------------------
+
+
+DEFAULT_HEIGHT_M = 0.337  # the default joint pose's stance height (CommandsCfg.nominal_height)
+# Range the height command is trained over (CommandsCfg ranges.height in env_cfg.py).
+# Commands outside it are clamped here so a stray slider value can never ask the policy for a stance it was never
+# taught (tests/test_obs_history.py checks this equals the env cfg).
+HEIGHT_COMMAND_RANGE_M = (0.28, 0.38)
+
+
+class ManualCommandBuffer:
+    """Latest manual command. get() stays the 5 velocity/pitch/lean values (what 47-dim policies take); the
+    commanded stance height is kept separately and appended per layout by command_for_layout()."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._values = [0.0, 0.0, 0.0, 0.0, 0.0]  # lin_x, lin_y, ang_z, pitch, lean
+        self._height = DEFAULT_HEIGHT_M
+
+    def set(self, values: list[float], height: float | None = None) -> None:
+        with self._lock:
+            self._values = list(values)
+            if height is not None:  # an old slider (no height key) leaves the last height alone
+                self._height = float(height)
+
+    def get(self) -> list[float]:
+        with self._lock:
+            return list(self._values)
+
+    def get_height(self) -> float:
+        with self._lock:
+            return self._height
+
+
+def parse_command_json(data: dict) -> tuple[list[float], float | None]:
+    """The slider's JSON -> ([lin_x, lin_y, ang_z, pitch, lean], height or None). `height` is optional so a slider
+    written before the height command existed still works; the other five keys are required (KeyError)."""
+    values = [data["lin_vel_x"], data["lin_vel_y"], data["ang_vel_z"], data["pitch"], data["lean"]]
+    height = data.get("height")
+    return values, (None if height is None else float(height))
+
+
+def command_for_layout(cmd: list[float], layout: dict, height: float = DEFAULT_HEIGHT_M) -> list[float]:
+    """The command floats a policy with this layout expects (``layout['cmd_width']`` of them).
+
+    ``cmd`` is 5 values (lin_x, lin_y, ang_z, pitch, lean) or 6 (with its own height). A 5-wide layout gets the first
+    five. A 6-wide layout gets the commanded height appended -- ``cmd[5]`` if given, else ``height`` -- clamped to
+    HEIGHT_COMMAND_RANGE_M.
+    """
+    if len(cmd) not in (5, 6):
+        raise ValueError(f"command must have 5 or 6 values, got {len(cmd)}")
+    base = list(cmd[:5])
+    if layout["cmd_width"] == 5:
+        return base
+    h = cmd[5] if len(cmd) == 6 else height
+    lo, hi = HEIGHT_COMMAND_RANGE_M
+    return base + [min(max(float(h), lo), hi)]
+
+
+def _manual_command_file_poll_loop(buf: ManualCommandBuffer, path: str, poll_interval: float = 0.1):
+    """Verbatim port of src/play/play.py's _manual_command_file_poll_loop, minus the CommandManager
+    dependency -- see that function's docstring for the tolerated-errors rationale (identical here)."""
+    last_mtime = None
+    while True:
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime != last_mtime:
+                with open(path) as f:
+                    data = json.load(f)
+                values, height = parse_command_json(data)
+                buf.set(values, height)
+                last_mtime = mtime
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+        time.sleep(poll_interval)
+
+
+def launch_slider(command_file: str) -> subprocess.Popen:
+    """Verbatim port of play.py's slider subprocess launch (see that file for the PYTHONPATH/
+    LD_LIBRARY_PATH-stripping rationale -- identical here since this script also runs under Isaac Sim's
+    bundled Python, which would otherwise leak its own 3.11 env into the system python3 child)."""
+    common_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common")
+    slider_script = os.path.join(common_dir, "manual_command_slider.py")
+    slider_env = os.environ.copy()
+    slider_env.pop("PYTHONPATH", None)
+    slider_env.pop("LD_LIBRARY_PATH", None)
+    proc = subprocess.Popen(["/usr/bin/python3", slider_script, "--command_file", command_file], env=slider_env)
+    atexit.register(proc.terminate)
+    return proc
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Mode release -- REQUIRED prerequisite. Without this, the robot's onboard sport-mode controller is still
+# active and will fight/ignore LowCmd -- sending well-formed LowCmd before this step is meaningless.
+#
+# Follows Unitree's OFFICIAL C++ Go2 example (unitree_sdk2/example/go2/go2_stand_example.cpp): loop
+# ReleaseMode() until CheckMode() reports no active mode, 10 s RPC timeout, 5 s between attempts -- and NO
+# StandDown(). That example warns "Make sure the robot is hung up or lying on the ground." The Python
+# example (which an earlier version of this function copied) additionally calls StandDown() every
+# iteration; on a hoisted robot that makes the sport controller drive the legs to a folded pose in the air,
+# the prime suspect for the violent motion seen on first hardware use. StandDown() is therefore opt-in
+# (`stand_down=True`, ground only). After ReleaseMode the motors go limp momentarily (confirmed by the
+# community write-ups), so the robot must be prone on the ground or already hanging -- never standing.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def release_motion_control(
+    timeout_s: float = 10.0,
+    retry_sleep_s: float = 5.0,
+    max_attempts: int = 10,
+    stand_down: bool = False,
+    before_release=None,
+) -> None:
+    """`before_release`, if given, is called exactly once, right before the first StandDown/ReleaseMode --
+    i.e. only when an onboard mode is actually active. Used for the operator checklist prompt, so a re-run
+    against an already-released robot isn't asked to re-confirm something that isn't about to happen."""
+    sc = None
+    if stand_down:
+        sc = SportClient()
+        sc.SetTimeout(timeout_s)
+        sc.Init()
+    msc = MotionSwitcherClient()
+    msc.SetTimeout(timeout_s)
+    msc.Init()
+
+    for attempt in range(max_attempts):
+        code, result = msc.CheckMode()
+        if code != 0:
+            # A failed/timed-out RPC call is NOT the same as "confirmed no active mode" -- it means we
+            # don't know the robot's state at all, which could still be dangerously active. Treating this
+            # the same as a genuine release (an earlier version of this function did) would let the control
+            # loop proceed against a robot we never actually confirmed released. Retry instead; only the
+            # final `raise` below is reachable if every attempt fails this way.
+            print(f"[WARN] CheckMode() call failed (code={code}) -- cannot confirm robot state "
+                  f"(attempt {attempt + 1}/{max_attempts}), retrying...")
+            time.sleep(1.0)
+            continue
+        if not result or not result.get("name"):
+            print("[INFO] Onboard motion-control mode released -- LowCmd is now authoritative.")
+            return
+        print(f"[INFO] Releasing onboard mode {result.get('name')!r} (attempt {attempt + 1}/{max_attempts})...")
+        if before_release is not None:
+            before_release()
+            before_release = None
+        if sc is not None:
+            sc.StandDown()
+        release_code, _ = msc.ReleaseMode()
+        if release_code != 0:
+            print(f"[WARN] ReleaseMode() returned code={release_code}.")
+        time.sleep(retry_sleep_s)
+
+    raise RuntimeError(
+        f"Failed to release the robot's onboard motion-control mode after {max_attempts} attempts -- "
+        "check the robot's state manually (e.g. via the app) before proceeding. Sending LowCmd while the "
+        "onboard controller is still active is not safe."
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------
+# LowCmd construction -- header/level_flag/per-motor mode are set ONCE here (confirmed against the
+# reference's InitLowCmd()/LowCmdWrite() split: those fields never change again after init), matching
+# unitree_legged_const.py's LOWLEVEL/PMSM-mode values. Only q/dq/kp/kd/tau are mutated per publish tick.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def init_low_cmd(cfg: DeployConfig) -> LowCmd_:
+    """kd is fixed here and never changes (0.5 is already a gentle damping-oriented gain, not the mechanism
+    of concern). kp is set here only as the "full" value used for the one-off exit damping command (which
+    immediately overrides it to 0 anyway) -- during normal operation, kp is NOT read from here at all:
+    publish_low_cmd() overwrites it every tick from LowCmdTarget's own dynamic kp (see ramp_to_default_pose
+    and LowCmdTarget's kp ramp-up docstring)."""
+    low_cmd = unitree_go_msg_dds__LowCmd_()
+    low_cmd.head[0] = _LOWCMD_HEAD[0]
+    low_cmd.head[1] = _LOWCMD_HEAD[1]
+    low_cmd.level_flag = _LOWLEVEL
+    for i in range(12):
+        low_cmd.motor_cmd[i].mode = _MOTOR_MODE_PMSM
+        low_cmd.motor_cmd[i].dq = 0.0
+        low_cmd.motor_cmd[i].kp = cfg.kp
+        low_cmd.motor_cmd[i].kd = cfg.kd
+        low_cmd.motor_cmd[i].tau = 0.0
+    # motor_cmd is a fixed 20-slot array (covers arm motors even on a legs-only robot) -- confirmed directly
+    # against unitree_sdk2py's own reference example (go2_stand_example.py's InitLowCmd), which sets mode on
+    # ALL 20 slots, not just the 12 legs. Default-constructed slots 12-19 are left at mode=0 otherwise
+    # (confirmed via unitree_go_msg_dds__LowCmd_()'s own defaults) -- added after real-hardware testing
+    # showed tau_est reading back ~0 on every leg motor despite large position errors and kp=25, i.e. the
+    # robot was not applying torque to ANY commanded LowCmd at all. kp/kd/tau stay 0 here (unlike the 12 leg
+    # slots above) so this introduces no new torque demand on any real motor -- only `mode` changes, matching
+    # the verified reference exactly.
+    for i in range(12, 20):
+        low_cmd.motor_cmd[i].mode = _MOTOR_MODE_PMSM
+        low_cmd.motor_cmd[i].dq = 0.0
+        low_cmd.motor_cmd[i].kp = 0.0
+        low_cmd.motor_cmd[i].kd = 0.0
+        low_cmd.motor_cmd[i].tau = 0.0
+    return low_cmd
+
+
+class LowCmdTarget:
+    """Shared buffer between the 50 Hz policy-inference loop (writer, via `set`/`set_kp`) and the ~500 Hz
+    publish thread (reader, via `get`/`get_kp`) -- see the frequency-matching design in the module
+    docstring and unitree_sdk2py's own reference example, which uses the same split (a RecurrentThread
+    continuously re-publishing whatever the latest target is, decoupled from whatever computes it).
+
+    Holds both the per-tick-varying Isaac-ordered target joint positions AND a dynamic `kp` -- the latter
+    added specifically so `kp` can ramp up from a gentle starting value alongside the position ramp
+    (see ramp_to_default_pose), instead of snapping to full stiffness the instant the publish thread starts
+    (which it used to: `kp` was fixed once in init_low_cmd and never touched again). `kd` is also dynamic,
+    but is not ramped: it is switched between a few fixed phases only (zero-gain heartbeat right after
+    release, heavy damping while the robot is being hoisted, then the configured `cfg.kd`)."""
+
+    def __init__(self, initial_target_isaac_order: list[float], initial_kp: float, initial_kd: float):
+        self._lock = threading.Lock()
+        self._target = list(initial_target_isaac_order)
+        self._kp = initial_kp
+        self._kd = initial_kd
+
+    def set(self, target_isaac_order: list[float]) -> None:
+        with self._lock:
+            self._target = list(target_isaac_order)
+
+    def set_kp(self, kp: float) -> None:
+        with self._lock:
+            self._kp = kp
+
+    def set_kd(self, kd: float) -> None:
+        with self._lock:
+            self._kd = kd
+
+    def get_kd(self) -> float:
+        with self._lock:
+            return self._kd
+
+    def get(self) -> list[float]:
+        with self._lock:
+            return list(self._target)
+
+    def get_kp(self) -> float:
+        with self._lock:
+            return self._kp
+
+
+def publish_low_cmd(low_cmd, target_buf: LowCmdTarget, isaac_to_sdk: list[int], publisher, crc) -> None:
+    """The ~500 Hz RecurrentThread target: reads the latest computed target (position AND kp) and
+    republishes it, regardless of whether the 50 Hz policy loop has produced a new one since the last tick
+    -- this is what gives the robot's communication watchdog a steady heartbeat independent of inference
+    timing. kp is re-applied here every tick (not just once in init_low_cmd) specifically so the gradual
+    kp ramp-up in ramp_to_default_pose actually reaches the robot."""
+    target_isaac_order = target_buf.get()
+    kp = target_buf.get_kp()
+    kd = target_buf.get_kd()
+    for isaac_i, sdk_i in enumerate(isaac_to_sdk):
+        low_cmd.motor_cmd[sdk_i].q = target_isaac_order[isaac_i]
+        low_cmd.motor_cmd[sdk_i].kp = kp
+        low_cmd.motor_cmd[sdk_i].kd = kd
+    low_cmd.crc = crc.Crc(low_cmd)
+    publisher.Write(low_cmd)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Manual step-confirm mode -- opt-in via --steps_per_confirm. Prints every commanded target in degrees and
+# blocks until the space bar is pressed before letting it reach target_buf. Applies uniformly to both
+# ramp_to_default_pose() and the main policy loop (see each call site) -- the two places this file ever
+# decides on a new target. The ~500 Hz publish thread is untouched either way: it keeps re-publishing
+# whatever the last CONFIRMED target was while this blocks, so the robot holds position steadily rather
+# than going quiet (and possibly tripping its own comms-timeout fault) while waiting on a keypress.
+# ---------------------------------------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def cbreak_terminal():
+    """Puts stdin into cbreak mode (single keypresses readable without waiting for Enter) for the duration
+    of the `with` block, restoring the original terminal settings afterward even on exception. Deliberately
+    `tty.setcbreak`, not `tty.setraw`: cbreak leaves ISIG enabled, so Ctrl+C still raises KeyboardInterrupt
+    normally (confirmed this matters -- `setraw` would silently swallow the existing Ctrl+C-based emergency
+    stop, which must keep working while this is active, not just when it isn't)."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def wait_for_space(prompt: str, poll=None, flush: bool = True) -> None:
+    """Prints `prompt`, then blocks until a space bar press. Enters its own cbreak context (nesting inside
+    an outer one is fine) so Ctrl+C keeps working. `poll`, if given, is called ~20x/s while waiting so a
+    safety check (e.g. the controller e-stop) is still live during the wait. Reads with os.read, not
+    sys.stdin.read, so Python's text-layer buffering can't swallow a queued keypress from select(). `flush`
+    discards keys pressed BEFORE this prompt appeared -- required for the safety checklists (a mashed
+    space bar from an earlier step must not auto-confirm "the robot is hoisted"), skipped for per-step
+    gating where pre-queued presses are intentional."""
+    print(prompt, flush=True)
+    fd = sys.stdin.fileno()
+    with cbreak_terminal():
+        if flush:
+            termios.tcflush(fd, termios.TCIFLUSH)
+        while True:
+            if poll is not None:
+                poll()
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                continue
+            ch = os.read(fd, 1)
+            if ch == b"":
+                raise RuntimeError("stdin closed while waiting for a SPACE confirmation.")
+            if ch == b" ":
+                return
+
+
+class StepConfirmGate:
+    """Blocks every `steps_per_confirm`-th call to `.wait()` until a space bar press, then lets that many
+    calls through before blocking again. `steps_per_confirm=1` (the default when this feature is on at all)
+    means every single step waits for its own press. `poll` (see wait_for_space) keeps the controller
+    e-stop live while blocked."""
+
+    def __init__(self, steps_per_confirm: int):
+        self.steps_per_confirm = max(1, steps_per_confirm)
+        self._remaining = 0
+
+    def wait(self, poll=None) -> None:
+        if self._remaining <= 0:
+            wait_for_space(
+                f"[CONFIRM] Press SPACE to send the next {self.steps_per_confirm} command(s)...",
+                poll=poll,
+                flush=False,
+            )
+            self._remaining = self.steps_per_confirm
+        self._remaining -= 1
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Safety monitoring -- controller e-stop and a torque-response watchdog.
+#
+# After release_motion_control() the robot's own sport service (which normally handles the handheld
+# controller's L2+B damping combo) is gone, so the controller can no longer be assumed to stop the robot.
+# The controller's button state is still carried in LowState.wireless_remote, which this process already
+# subscribes to, so it is polled here and treated like Ctrl+C. Bit layout is from unitree_sdk2_python's
+# example/wireless_controller/wireless_controller.py (parse_botton).
+#
+# The watchdog exists because a robot that silently isn't applying torque (observed on real hardware:
+# tau_est ~0 on every joint with 20-50 degrees of position error at kp~25, while the head LED blinked red)
+# looks, from this script's side, exactly like a healthy one -- every print is plausible, nothing moves.
+# ---------------------------------------------------------------------------------------------------------
+
+_CONTROLLER_BYTE2_BUTTONS = ("R1", "L1", "Start", "Select", "R2", "L2", "F1", "F3")
+_CONTROLLER_BYTE3_BUTTONS = ("A", "B", "X", "Y", "Up", "Right", "Down", "Left")
+
+
+class EmergencyStop(Exception):
+    """Raised when the handheld controller's L2+B e-stop combo is detected."""
+
+
+class TorqueResponseFault(RuntimeError):
+    """Raised when the robot demonstrably is not applying torque to our commands."""
+
+
+class TrackingFault(RuntimeError):
+    """Raised when commands and reality have diverged dangerously: persistent large position error, torque
+    near the motors' limit, or a ramp that could not reach its target within the tether."""
+
+
+class JointSpeedFault(TrackingFault):
+    """Raised when the robot's actual measured joint velocity (LowState's dq, not the commanded target)
+    stays above its per-joint-type cap for too long -- the real-hardware analog of Isaac/PhysX's hard
+    `velocity_limit_sim` clamp, which overwrites the simulated joint's physical velocity state directly.
+    Real hardware has no equivalent lever (we can't overwrite physical velocity, only the position target
+    we command), so this reacts to the robot's actual speed instead: a joint moving this fast for several
+    consecutive ticks means something is off (free-swinging, a drop, a runaway command) regardless of
+    whether clamp_step/tether_limit/the torque watchdog have also caught it. Subclasses TrackingFault so
+    it's handled by the same except clause as every other "stop now" condition."""
+
+
+def tether_limit(
+    target_isaac_order: list[float], actual_isaac_order: list[float], max_dev_rad: float | list[float],
+    joint_names: list[str]
+) -> tuple[list[float], list[str]]:
+    """Limits every commanded joint target to within `max_dev_rad` of that joint's ACTUAL position, returning
+    the limited target and the names of joints that were limited.
+
+    Why (real hardware, 2026-10-02): the policy loop's targets ran 70-97 deg away from where the legs actually
+    were (robot partly on a winch, feet loaded unevenly), and at kp=25 that gap is torque = kp * error = 32 Nm,
+    above the ~23.5 Nm effort limit, after which the robot cut torque and went to a red-LED fault. clamp_step
+    only limits change per tick relative to the previous TARGET, so it cannot stop a target that has drifted
+    far from reality. This bounds the PD torque at kp * max_dev (e.g. 25 * 15 deg = 6.5 Nm) no matter what the
+    policy or ramp asks for -- the software effort limit the unused `effort_limit` config value was meant to be."""
+    limited, limited_names = [], []
+    # max_dev_rad may be a scalar or a per-joint list (the calves get a wider leash while lifting, see
+    # SafetyMonitor.set_lift_mode).
+    devs = max_dev_rad if isinstance(max_dev_rad, (list, tuple)) else [max_dev_rad] * len(joint_names)
+    for name, tgt, act, dev in zip(joint_names, target_isaac_order, actual_isaac_order, devs):
+        delta = tgt - act
+        if delta > dev:
+            limited.append(act + dev)
+            limited_names.append(name)
+        elif delta < -dev:
+            limited.append(act - dev)
+            limited_names.append(name)
+        else:
+            limited.append(tgt)
+    return limited, limited_names
+
+
+class LinkLost(Exception):
+    """Raised when LowState stops arriving (cable pulled, robot rebooting/powered off).
+
+    Real incident: a deploy script left running kept streaming full-kp LowCmd at 500 Hz through a cable
+    disconnect; when the link returned, the robot had rebooted into normal sport mode and the stale stream
+    fought it -- violent ~45 Hz chatter. On link loss the script must STOP publishing and exit, never wait
+    for the link to come back."""
+
+
+def handover_kp(tick: int, n_ticks: int, hold_kp: float, kp: float) -> float:
+    """kp for policy tick `tick` (0-based) while fading from the stiff ramp hold to the policy's gain over
+    `n_ticks` ticks. Real run: dropping 60 -> 25 on one tick let the robot sag ~40 deg in 0.5 s before the
+    policy could take the load; a short fade gives it ticks to catch up. n_ticks <= 0 means an immediate drop."""
+    if n_ticks <= 0 or tick >= n_ticks - 1:
+        return kp
+    return hold_kp + (kp - hold_kp) * (tick + 1) / n_ticks
+
+
+CALF_RATED_NM = 45.43  # Go2 calf peak torque (hip/thigh 23.7); see robot_cfg.py and the config comment
+
+LINK_LOST_AFTER_S = 0.5  # LowState normally arrives at ~500 Hz; half a second of silence is a dead link
+
+
+def decode_controller_buttons(wireless_remote: bytes) -> dict[str, bool]:
+    if len(wireless_remote) < 4:
+        return {}
+    byte2, byte3 = wireless_remote[2], wireless_remote[3]
+    buttons = {name: bool((byte2 >> bit) & 1) for bit, name in enumerate(_CONTROLLER_BYTE2_BUTTONS)}
+    buttons.update({name: bool((byte3 >> bit) & 1) for bit, name in enumerate(_CONTROLLER_BYTE3_BUTTONS)})
+    return buttons
+
+
+def estop_pressed(wireless_remote: bytes) -> bool:
+    buttons = decode_controller_buttons(wireless_remote)
+    return buttons.get("L2", False) and buttons.get("B", False)
+
+
+class TorqueResponseWatchdog:
+    """Raises TorqueResponseFault after `consecutive_steps` consecutive updates where stiffness is at least
+    `kp_fraction_threshold` of full, the commanded-vs-actual error exceeds `err_threshold_rad`, yet the
+    robot reports less than `tau_threshold_nm` of torque on every joint (a stiff PD loop with that much error
+    should be producing several Nm). Any update that doesn't meet all three resets the count."""
+
+    def __init__(
+        self,
+        consecutive_steps: int,
+        kp_fraction_threshold: float = 0.5,
+        err_threshold_rad: float = math.radians(10.0),
+        tau_threshold_nm: float = 0.5,
+    ):
+        self.consecutive_steps = consecutive_steps
+        self.kp_fraction_threshold = kp_fraction_threshold
+        self.err_threshold_rad = err_threshold_rad
+        self.tau_threshold_nm = tau_threshold_nm
+        self._count = 0
+
+    def update(self, kp_fraction: float, max_err_rad: float, max_abs_tau_nm: float) -> None:
+        if (
+            kp_fraction >= self.kp_fraction_threshold
+            and max_err_rad > self.err_threshold_rad
+            and max_abs_tau_nm < self.tau_threshold_nm
+        ):
+            self._count += 1
+            if self._count >= self.consecutive_steps:
+                raise TorqueResponseFault(
+                    f"Robot is not applying torque: for {self._count} consecutive steps at "
+                    f">={self.kp_fraction_threshold:.0%} of full kp, joint error up to "
+                    f"{math.degrees(max_err_rad):.1f} deg but max |tau_est| only {max_abs_tau_nm:.2f} Nm. "
+                    "Check the head LED and the Go app for a fault."
+                )
+        else:
+            self._count = 0
+
+
+class JointSpeedWatchdog:
+    """Raises JointSpeedFault after `consecutive_steps` consecutive updates where any joint's actual
+    measured |velocity| exceeds its per-joint-type cap (hip/thigh/calf, same three-value convention as
+    sim2sim's --joint_speed_cap). Default caps (30.1, 30.1, 15.7 rad/s) are this robot's own
+    DCMotorCfg.velocity_limit values (robot_cfg.py) -- the real motors' rated speed, not an
+    arbitrary number -- so tripping this means the joint is moving faster than its own rated speed, not
+    just "fast for this gait." Any update under every joint's cap resets the count."""
+
+    def __init__(self, consecutive_steps: int, caps_by_type: dict[str, float], joint_names: list[str]):
+        self.consecutive_steps = consecutive_steps
+        self.caps_rad_s = [caps_by_type[name.split("_")[1]] for name in joint_names]
+        self.joint_names = joint_names
+        self._count = 0
+
+    def update(self, actual_vel_isaac_order: list[float]) -> None:
+        over = [
+            (name, v, cap)
+            for name, v, cap in zip(self.joint_names, actual_vel_isaac_order, self.caps_rad_s)
+            if abs(v) > cap
+        ]
+        if over:
+            self._count += 1
+            if self._count >= self.consecutive_steps:
+                worst_name, worst_v, worst_cap = max(over, key=lambda t: abs(t[1]) - t[2])
+                raise JointSpeedFault(
+                    f"Joint {worst_name} measured speed {worst_v:.1f} rad/s stayed above its "
+                    f"{worst_cap:.1f} rad/s cap for {self._count} consecutive steps."
+                )
+        else:
+            self._count = 0
+
+
+class SafetyMonitor:
+    """Per-tick safety checks bundled for ramp_to_default_pose() and the main loop: controller e-stop,
+    tracking telemetry (max position error / max |tau_est|), the torque-response watchdog, and optional
+    TensorBoard scalars. `poll()` is the e-stop-only variant used while blocked waiting for a keypress."""
+
+    def __init__(self, state: LatestRobotState, sdk_to_isaac: list[int], watchdog: TorqueResponseWatchdog,
+                 joint_names: list[str], max_dev_rad: float, abort_err_rad: float, abort_steps: int,
+                 tau_abort_nm: float, speed_watchdog: JointSpeedWatchdog | None = None, writer=None,
+                 link_lost_after_s: float = LINK_LOST_AFTER_S, calf_tau_abort_nm: float | None = None):
+        self.state = state
+        self.sdk_to_isaac = sdk_to_isaac
+        self.watchdog = watchdog
+        self.speed_watchdog = speed_watchdog
+        self.joint_names = joint_names
+        self.max_dev_rad = max_dev_rad
+        self.abort_err_rad = abort_err_rad
+        self.abort_steps = abort_steps
+        self.tau_abort_nm = tau_abort_nm
+        # Persistent per-calf torque abort for the WHOLE run (ramp + policy loop), separate from the transient
+        # lift-mode calf abort. The global tau_abort_nm = 0.9 * effort_limit uses the hip/thigh rating (~23.5 Nm),
+        # but the calves are rated ~45.4 Nm (CALF_RATED_NM); applying the hip/thigh cap to a calf aborts it at
+        # under half its rating. A legitimate hard step or lateral command loads a front calf to ~20 Nm statically
+        # (hardware run 2026-11-19 tripped FL_calf at 21 Nm / 30 deg during a lin_y sidestep while hip/thigh never
+        # exceeded 17 Nm). None keeps the global cap for the calves too.
+        self.calf_tau_abort_nm = calf_tau_abort_nm
+        self.writer = writer
+        self.link_lost_after_s = link_lost_after_s
+        self._tick = 0
+        self._big_err_count = 0
+        self._lift_dev_rad: float | None = None  # calf-only wider tether while lifting off the ground, else None
+        self._lift_calf_tau_abort_nm: float | None = None
+
+    def set_lift_mode(self, calf_dev_rad: float, calf_tau_abort_nm: float) -> None:
+        """Startup lift only: a robot rising from prone needs more rear-calf torque than the 15 deg tether's
+        kp*dev ceiling allows (real run: max |tau| flat at 16.5 Nm = the cap, calves stuck 45 deg short). Widens
+        ONLY the calves' tether and torque abort (calves are rated 45.4 Nm; hip/thigh 23.7 Nm keep the normal
+        leash and the normal abort). end_lift_mode() restores everything before the policy starts."""
+        self._lift_dev_rad = calf_dev_rad
+        self._lift_calf_tau_abort_nm = calf_tau_abort_nm
+
+    def end_lift_mode(self) -> None:
+        self._lift_dev_rad = None
+        self._lift_calf_tau_abort_nm = None
+
+    def _is_calf(self, i: int) -> bool:
+        return self.joint_names[i].endswith("_calf_joint")
+
+    def actual_tau_isaac_order(self) -> list[float]:
+        snap = self.state.snapshot()
+        return [snap.tau_est[sdk_i] for sdk_i in self.sdk_to_isaac]
+
+    def actual_isaac_order(self) -> list[float]:
+        snap = self.state.snapshot()
+        return [snap.joint_pos[sdk_i] for sdk_i in self.sdk_to_isaac]
+
+    def actual_vel_isaac_order(self) -> list[float]:
+        snap = self.state.snapshot()
+        return [snap.joint_vel[sdk_i] for sdk_i in self.sdk_to_isaac]
+
+    def limit_target(self, target_isaac_order: list[float]) -> tuple[list[float], list[str]]:
+        """Tether: see tether_limit. Applied to every target before it reaches the publish buffer."""
+        dev = self.max_dev_rad
+        if self._lift_dev_rad is not None:
+            dev = [self._lift_dev_rad if self._is_calf(i) else self.max_dev_rad for i in range(len(self.joint_names))]
+        return tether_limit(target_isaac_order, self.actual_isaac_order(), dev, self.joint_names)
+
+    def _raise_if_unsafe(self, snap: LatestRobotState) -> None:
+        age = snap.age_s()
+        if age > self.link_lost_after_s:
+            raise LinkLost(
+                f"No LowState for {age:.1f} s > {self.link_lost_after_s:.2f} s link-loss threshold (cable/WiFi "
+                "dropped, or robot rebooting / powered off). Stopping and NOT resuming: a resumed command "
+                "stream could fight a robot that came back in sport mode."
+            )
+        if estop_pressed(snap.wireless_remote):
+            raise EmergencyStop("Controller e-stop (L2+B) pressed.")
+
+    def poll(self) -> None:
+        self._raise_if_unsafe(self.state.snapshot())
+
+    def check(self, held_target_isaac_order: list[float], kp_fraction: float) -> tuple[float, float]:
+        """Returns (max_abs_position_error_rad, max_abs_tau_est_nm) and raises LinkLost / EmergencyStop /
+        TorqueResponseFault when warranted. `held_target_isaac_order` is what is currently being published."""
+        snap = self.state.snapshot()
+        self._raise_if_unsafe(snap)
+        actual = [snap.joint_pos[sdk_i] for sdk_i in self.sdk_to_isaac]
+        max_err = max(abs(t - a) for t, a in zip(held_target_isaac_order, actual))
+        max_tau = max(abs(t) for t in snap.tau_est)
+        self._tick += 1
+        if self.writer is not None:
+            self.writer.add_scalar("Debug/max_pos_error_deg", math.degrees(max_err), self._tick)
+            self.writer.add_scalar("Debug/max_abs_tau_est_nm", max_tau, self._tick)
+            self.writer.add_scalar("Debug/lowstate_gap_ms", self.state.last_gap_s * 1000.0, self._tick)
+        tau_isaac = [snap.tau_est[sdk_i] for sdk_i in self.sdk_to_isaac]
+        for i, t in enumerate(tau_isaac):
+            limit = self.tau_abort_nm
+            if self._is_calf(i):
+                # Lift mode's calf abort (ramp only) takes precedence; otherwise the persistent policy-loop
+                # calf abort, if set. Both are the calf's own (higher) rating, so the calf keeps it throughout.
+                if self._lift_calf_tau_abort_nm is not None:
+                    limit = self._lift_calf_tau_abort_nm
+                elif self.calf_tau_abort_nm is not None:
+                    limit = self.calf_tau_abort_nm
+            if abs(t) >= limit:
+                raise TrackingFault(
+                    f"Joint {self.joint_names[i]} torque {abs(t):.1f} Nm is at/over {limit:.1f} Nm. "
+                    "Stopping before the robot's own protection trips."
+                )
+        abort_err = self.abort_err_rad
+        if self._lift_dev_rad is not None:
+            abort_err = max(abort_err, self._lift_dev_rad + math.radians(10.0))  # tracking error rides the leash
+        if max_err > abort_err:
+            self._big_err_count += 1
+            if self._big_err_count >= self.abort_steps:
+                raise TrackingFault(
+                    f"Commanded vs actual joint error stayed above {math.degrees(self.abort_err_rad):.0f} deg for "
+                    f"{self._big_err_count} consecutive steps (now {math.degrees(max_err):.0f} deg): the robot is "
+                    "not following its targets (contact, winch, or fault)."
+                )
+        else:
+            self._big_err_count = 0
+        self.watchdog.update(kp_fraction, max_err, max_tau)
+        if self.speed_watchdog is not None:
+            self.speed_watchdog.update(self.actual_vel_isaac_order())
+        return max_err, max_tau
+
+
+def format_degrees(isaac_order_values: list[float], joint_names: list[str]) -> str:
+    return "  ".join(f"{name}={math.degrees(v):+.1f}°" for name, v in zip(joint_names, isaac_order_values))
+
+
+def clamp_step(
+    current_isaac_order: list[float], target_isaac_order: list[float], max_delta_rad: float, joint_names: list[str]
+) -> tuple[list[float], list[str]]:
+    """Clamps the per-joint change from `current_isaac_order` (whatever target_buf currently holds) to
+    `target_isaac_order` (what the policy just computed) to at most `max_delta_rad`, returning the clamped
+    target and the names of any joints that were actually clipped.
+
+    Added after a real-hardware incident where the ramp-to-default-pose handoff into the policy loop
+    produced a single, unsmoothed ~5-7 degree jump across multiple legs simultaneously: the ramp only
+    interpolates the transition TO default_joint_pos -- the first policy inference afterward runs with
+    last_action still all-zeros (a genuine reset-like state) and its raw action can legitimately be large,
+    but was being written straight to target_buf in one `set()` call with no interpolation, the same as any
+    later tick. Applying this clamp on every tick (not just the first) is a general safety net against any
+    anomalously large policy output, not a special case for startup alone."""
+    clamped = []
+    clipped_names = []
+    for name, cur, tgt in zip(joint_names, current_isaac_order, target_isaac_order):
+        delta = tgt - cur
+        if delta > max_delta_rad:
+            clamped.append(cur + max_delta_rad)
+            clipped_names.append(name)
+        elif delta < -max_delta_rad:
+            clamped.append(cur - max_delta_rad)
+            clipped_names.append(name)
+        else:
+            clamped.append(tgt)
+    return clamped, clipped_names
+
+
+def ramp_to_default_pose(
+    target_buf: LowCmdTarget,
+    start_isaac_order: list[float],
+    default_isaac_order: list[float],
+    duration_s: float,
+    control_dt: float,
+    isaac_joint_order: list[str],
+    start_kp: float,
+    full_kp: float,
+    gate: StepConfirmGate | None = None,
+    monitor: SafetyMonitor | None = None,
+    settle_s: float = 0.0,
+    settle_tol_rad: float = math.radians(6.0),
+) -> None:
+    """Required safety step, previously MISSING entirely: linearly interpolates the published target from
+    the robot's actual current joint positions to `default_isaac_order` over `duration_s`, instead of
+    jumping straight there. Without this, `LowCmdTarget` starts life already set to `default_isaac_order`
+    the instant the ~500 Hz publish thread begins (see main()) -- at full `kp` stiffness, with zero regard
+    for how far that is from wherever the robot's joints actually are the moment onboard control releases.
+    Confirmed directly to cause a sudden, rough snap-to-pose on first real-hardware use (not hypothetical):
+    the robot's actual pose right after release can differ from the trained default by tens of degrees on
+    some joints (observed up to ~45 degrees during this session's own rig-hung preflight checks), and a
+    PD controller commanded to close that gap instantaneously does exactly what you'd expect. The publish
+    thread is already running throughout this call (started before this is invoked) -- this only ever
+    writes progressively-interpolated values into `target_buf`, same mechanism the policy loop uses after.
+
+    `kp` is ALSO ramped here, from `start_kp` to `full_kp`, synchronized with the same position-ramp alpha
+    (not on its own separate schedule) -- added after a real-hardware incident where, even with the position
+    ramp already in place, a jerk still happened before the ramp's own ticks ever got reported as sent (the
+    *first* gate-confirmed step hadn't even been approved yet). The remaining suspect: `kp` previously
+    jumped straight to full stiffness the instant the publish thread started holding "current position" --
+    on a joint that may not have been fully settled yet (e.g. residual motion from release_motion_control's
+    StandDown(), compounded by a robot not resting normally on the ground), snapping straight to full
+    position-holding stiffness can itself produce a jerk, even though the *position* target was already
+    correct. Keeping kp and position synchronized on the same alpha means early in the ramp (small position
+    error, since start and target are close) stiffness is also at its gentlest, and both tighten together
+    as the ramp progresses -- not two independently-timed transitions that could fight each other.
+
+    `gate`, if given (see StepConfirmGate), prints each interpolated step (position and kp) in degrees/Nm
+    and blocks for a space bar press before it reaches target_buf -- the ramp becomes operator-paced rather
+    than real-time.
+    """
+    num_steps = max(1, int(round(duration_s / control_dt)))
+    print(f"[INFO] Moving smoothly to default pose over {duration_s:.1f}s ({num_steps} steps), kp ramping "
+          f"{start_kp:.1f} -> {full_kp:.1f} alongside it -- do not expect the robot to move yet if it's "
+          f"already close to default_joint_pos.")
+    for step in range(1, num_steps + 1):
+        tick_start = time.perf_counter()
+        alpha = step / num_steps
+        interpolated = [
+            start + (default - start) * alpha
+            for start, default in zip(start_isaac_order, default_isaac_order)
+        ]
+        interpolated_kp = start_kp + (full_kp - start_kp) * alpha
+        if monitor is not None:
+            interpolated, _ = monitor.limit_target(interpolated)  # never lead the actual joints by > tether
+        telemetry = ""
+        if monitor is not None:
+            # Measures the response to the PREVIOUS step's target (still what target_buf holds): in gated
+            # mode the robot has had arbitrarily long to respond, in free-run mode one control tick.
+            max_err, max_tau = monitor.check(target_buf.get(), kp_fraction=target_buf.get_kp() / full_kp)
+            telemetry = f"  | max|err|={math.degrees(max_err):.1f}deg max|tau_est|={max_tau:.2f}Nm"
+        if gate is not None:
+            print(f"[RAMP {step}/{num_steps}] kp={interpolated_kp:.1f}  "
+                  f"{format_degrees(interpolated, isaac_joint_order)}{telemetry}\n")
+            gate.wait(poll=monitor.poll if monitor is not None else None)
+        target_buf.set_kp(interpolated_kp)
+        target_buf.set(interpolated)
+        elapsed = time.perf_counter() - tick_start
+        sleep_time = control_dt - elapsed
+        if sleep_time > 0 and gate is None:
+            time.sleep(sleep_time)
+    target_buf.set_kp(full_kp)
+    final_target = list(default_isaac_order)  # exact, not just alpha=1.0's floating-point approximation
+    # Settle: the ramp's duration is fixed, but a robot lifting itself from the ground is not -- kp climbs over
+    # the ramp, so the legs only start to rise in its last seconds and are still moving when it ends (real run,
+    # prone start: 10 of 12 joints arrived, the rear calves were still rising). Keep holding the default at full
+    # kp, still tethered (torque <= kp * tether), until every joint is within settle_tol_rad of default or the
+    # timeout passes. On timeout the tether guard below is still the backstop, so nothing is loosened.
+    if monitor is not None and settle_s > 0.0 and gate is None:
+        settle_end = time.monotonic() + settle_s
+        last_report = 0.0
+        while True:
+            tick_start = time.perf_counter()
+            monitor.check(target_buf.get(), kp_fraction=1.0)  # e-stop, link, torque, tracking faults still live
+            actual = monitor.actual_isaac_order()
+            resid = [abs(d - a) for d, a in zip(default_isaac_order, actual)]
+            if max(resid) <= settle_tol_rad:
+                print(f"[INFO] Settled: every joint within {math.degrees(settle_tol_rad):.1f} deg of default.")
+                break
+            if time.monotonic() >= settle_end:
+                print(f"[WARN] Settle timeout ({settle_s:.0f}s): worst joint still {math.degrees(max(resid)):.1f} "
+                      f"deg from default; falling through to the tether guard.")
+                break
+            if time.monotonic() - last_report >= 1.0:
+                worst = max(range(len(resid)), key=resid.__getitem__)
+                tau = monitor.actual_tau_isaac_order()[worst]
+                print(f"[SETTLE] worst: {isaac_joint_order[worst]} {math.degrees(resid[worst]):.1f} deg from default, "
+                      f"tau_est {tau:+.1f} Nm")
+                last_report = time.monotonic()
+            tethered, _ = monitor.limit_target(list(default_isaac_order))
+            target_buf.set(tethered)
+            sleep_time = control_dt - (time.perf_counter() - tick_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    if monitor is not None:
+        final_target, limited = monitor.limit_target(final_target)
+        if limited:
+            actual = monitor.actual_isaac_order()
+            detail = ", ".join(
+                f"{n} {math.degrees(abs(default_isaac_order[isaac_joint_order.index(n)] - actual[isaac_joint_order.index(n)])):.0f} deg"
+                for n in limited
+            )
+            raise TrackingFault(
+                f"Ramp finished but {len(limited)} joint(s) are still more than the tether "
+                f"({math.degrees(monitor.max_dev_rad):.0f} deg) from default: {detail}. The robot did "
+                "not follow the ramp (contact, winch, or fault) -- refusing to hand off to the policy."
+            )
+    target_buf.set(final_target)
+    print("[INFO] Default pose reached, full kp reached. Handing off to the policy control loop.")
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Live dashboard logging -- identical tag names to play.py's _log_live_plot, so src/common/live_dashboard.py
+# needs zero changes to render this. `step` increments once per control tick, exactly like play.py's
+# per-physics-step counter.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def log_live_plot(writer, step: int, cmd: list[float], actual_lin_vel: tuple, actual_ang_vel_z: float,
+                   actual_pitch: float, actual_lean: float,
+                   commanded_isaac: list[float] | None = None, actual_isaac: list[float] | None = None,
+                   joint_names: list[str] | None = None) -> None:
+    """No height tags: real hardware has no height measurement to plot (see mdp/commands.py's module
+    docstring). src/sim2sim/sim2sim_mujoco.py, which CAN measure true height, logs its own cmd_height/
+    actual_height tags directly rather than through this function.
+
+    If `commanded_isaac`/`actual_isaac`/`joint_names` are given, logs per-joint commanded vs actual position
+    (degrees) under JointPos/<name>/{cmd,actual} -- the signal that distinguishes "the policy is crouching"
+    from "a joint cannot follow the command" (e.g. the cold-start sag that lands the rear knees on the ground)."""
+    writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_x", cmd[0], step)
+    writer.add_scalar("Metrics/base_velocity/actual_lin_vel_x", actual_lin_vel[0], step)
+    writer.add_scalar("Metrics/base_velocity/cmd_lin_vel_y", cmd[1], step)
+    writer.add_scalar("Metrics/base_velocity/actual_lin_vel_y", actual_lin_vel[1], step)
+    writer.add_scalar("Metrics/base_velocity/cmd_ang_vel_z", cmd[2], step)
+    writer.add_scalar("Metrics/base_velocity/actual_ang_vel_z", actual_ang_vel_z, step)
+    writer.add_scalar("Metrics/base_velocity/cmd_pitch", cmd[3], step)
+    writer.add_scalar("Metrics/base_velocity/actual_pitch", actual_pitch, step)
+    writer.add_scalar("Metrics/base_velocity/cmd_lean", cmd[4], step)
+    writer.add_scalar("Metrics/base_velocity/actual_lean", actual_lean, step)
+    if commanded_isaac is not None and actual_isaac is not None and joint_names is not None:
+        for name, c, a in zip(joint_names, commanded_isaac, actual_isaac):
+            writer.add_scalar(f"JointPos/{name}/cmd", math.degrees(c), step)
+            writer.add_scalar(f"JointPos/{name}/actual", math.degrees(a), step)
+    writer.flush()
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Observation assembly -- must exactly match ObservationsCfg.PolicyCfg's term order in
+# env_cfg.py: base_lin_vel, base_ang_vel, projected_gravity, velocity_commands,
+# joint_pos (rel to default), joint_vel, last_action. No noise is added (play mode already disables
+# observation corruption -- QuadrupedLocomotionEnvCfg_PLAY sets enable_corruption=False -- so hardware
+# inference shouldn't add it either).
+#
+# `base_height` is NOT part of the current observation layout above (there is no reliable way to measure
+# base height on real hardware -- see mdp/commands.py's module docstring -- so newly trained policies never
+# have this term, and this function's own real-hardware call site never passes it). The parameter exists
+# only so src/sim2sim/sim2sim_mujoco.py can still run the OLDER committed policies (models/9_10_26_vanilla,
+# models/9_13_26_*), which DO have a base_height term between projected_gravity and velocity_commands --
+# sim2sim passes a real measured value for those; this is otherwise dead code on the real control loop.
+#
+# Per-policy observation layout, keyed by the exported policy's input dim (read off its first Linear layer by
+# `policy_obs_layout`, never guessed from the file path). `cmd_width` is how many command floats to feed;
+# `has_height_obs` inserts a base_height term; `has_lin_vel` prepends base_lin_vel. sim2sim imports this.
+#   47: current policies -- NO base_lin_vel (dropped: dead on hardware after ReleaseMode), 5-wide command.
+#   50: older 5-wide-command policies WITH base_lin_vel, no height obs.
+#   48: height-command policies -- NO base_lin_vel, 6-wide command [lin_x, lin_y, ang_z, pitch, lean, HEIGHT]. The
+#       height is the COMMANDED stance height (the robot has no way to measure the actual one); it is never an
+#       observation of the achieved height. Trained with history stacking, so the net input is 48 * history_length.
+#   51/52: legacy 6-wide-command policies (51: height command only; 52: + base_height observation).
+OBS_LAYOUT = {
+    47: {"cmd_width": 5, "has_height_obs": False, "has_lin_vel": False},
+    48: {"cmd_width": 6, "has_height_obs": False, "has_lin_vel": False},
+    50: {"cmd_width": 5, "has_height_obs": False, "has_lin_vel": True},
+    51: {"cmd_width": 6, "has_height_obs": False, "has_lin_vel": True},
+    52: {"cmd_width": 6, "has_height_obs": True, "has_lin_vel": True},
+}
+
+
+def policy_obs_layout(policy, history_length: int = 1) -> tuple[int, dict]:
+    """(base_frame_dim, layout) for a policy whose actual input is ``base_frame_dim * history_length``.
+
+    The exported net's first Linear layer input is the STACKED width (e.g. 282 = 47 * 6 for the obs_stacking_with_height
+    policy). ``history_length`` is passed explicitly (from DeployConfig) rather than inferred by factoring the
+    width, which would be ambiguous. We assert the width divides evenly and the per-frame dim is a known layout.
+    """
+    first_weight = next(p for p in policy.parameters() if p.dim() == 2)
+    stacked_dim = int(first_weight.shape[1])
+    if history_length < 1:
+        raise ValueError(f"history_length must be >= 1, got {history_length}")
+    if stacked_dim % history_length != 0:
+        raise ValueError(
+            f"policy input dim {stacked_dim} is not divisible by history_length {history_length}; "
+            "the config's history_length does not match this policy."
+        )
+    base_dim = stacked_dim // history_length
+    if base_dim not in OBS_LAYOUT:
+        raise ValueError(
+            f"policy expects a {stacked_dim}-dim input = {base_dim} per-frame x {history_length} frames, but "
+            f"{base_dim} is not a known per-frame layout {sorted(OBS_LAYOUT)}."
+        )
+    return base_dim, OBS_LAYOUT[base_dim]
+
+
+# --- How the H-frame stack is laid out in the flat vector the policy consumes. MUST equal Isaac Lab's layout ---
+# exactly, or the policy sees scrambled history on hardware. There are two independent choices:
+#
+#   OBS_HISTORY_TERM_MAJOR: Isaac Lab applies a GROUP history_length by pushing it down to each observation TERM
+#     and concatenating the per-term histories (concatenate_terms=True). So the flat layout is TERM-major:
+#         [ang_vel(t-H+1..t), gravity(t-H+1..t), command(t-H+1..t), joint_pos(...), joint_vel(...), last_action(...)]
+#     NOT frame-major ([frame_{t-H+1}, ..., frame_t]). Set False only if the container parity check proves otherwise.
+#   OBS_HISTORY_NEWEST_LAST: within each term's (or the frame's) history, newest sample is LAST
+#     ([x_{t-H+1}, ..., x_t]). Isaac Lab's CircularBuffer orders oldest->newest. Flip if the check shows newest-first.
+#
+# VERIFY BOTH in the container against a real env before trusting a deploy (see the plan's parity check): build the
+# env with history_length=H, capture the flattened policy obs and the raw single frames, and assert this stacker
+# reproduces the env vector bit-for-bit. Only then is a hardware run safe.
+OBS_HISTORY_TERM_MAJOR = True
+OBS_HISTORY_NEWEST_LAST = True
+
+
+def frame_term_widths(base_dim: int, layout: dict) -> list[int]:
+    """Per-term widths within ONE frame, in build_observation's order, for term-major stacking. Sums to base_dim."""
+    widths: list[int] = []
+    if layout["has_lin_vel"]:
+        widths.append(3)  # base_lin_vel
+    widths += [3, 3]  # base_ang_vel, projected_gravity
+    if layout["has_height_obs"]:
+        widths.append(1)  # base_height
+    widths += [layout["cmd_width"], 12, 12, 12]  # command, joint_pos, joint_vel, last_action
+    assert sum(widths) == base_dim, (widths, base_dim)
+    return widths
+
+
+class ObsEmaFilter:
+    """First-order EMA low-pass on an observation vector (list[float]); same one-pole filter the training obs term
+    uses (mdp.obs_filters.alpha_from_cutoff), so the policy sees the same filtered joint_vel in sim and on hardware.
+    cutoff_hz=None disables it (exact passthrough), so a policy trained without the filter is unaffected."""
+
+    def __init__(self, cutoff_hz: float | None, dt: float):
+        self.alpha = None if cutoff_hz is None else (1.0 - math.exp(-2.0 * math.pi * cutoff_hz * dt))
+        self._y: list[float] | None = None
+
+    def reset(self) -> None:
+        self._y = None
+
+    def filter(self, x: list[float]) -> list[float]:
+        if self.alpha is None:
+            return list(x)
+        if self._y is None:  # first sample seeds the filter (no startup transient)
+            self._y = list(x)
+        else:
+            self._y = [y + self.alpha * (xi - y) for y, xi in zip(self._y, x)]
+        return list(self._y)
+
+
+class ObsHistory:
+    """Per-step ring buffer that turns single base_dim frames into the stacked vector the policy expects.
+
+    Mirrors Isaac Lab's group history: on the first push (or after reset()) the buffer is PADDED by repeating that
+    first frame H times (Isaac Lab fills a freshly reset CircularBuffer with the current obs), so the stack is
+    full-width from tick 0. The flat layout follows OBS_HISTORY_TERM_MAJOR / OBS_HISTORY_NEWEST_LAST.
+
+    term_widths: per-term widths within one frame (from frame_term_widths). Required for term-major; for
+    history_length==1 the two layouts are identical, so it may be omitted.
+    """
+
+    def __init__(self, history_length: int, term_widths: list[int] | None = None):
+        self.history_length = int(history_length)
+        self.term_widths = term_widths
+        self._buf: list[torch.Tensor] | None = None
+
+    def reset(self) -> None:
+        self._buf = None
+
+    def push_and_stack(self, frame: torch.Tensor) -> torch.Tensor:
+        """frame: (1, base_dim) -> (1, base_dim * history_length)."""
+        if self._buf is None:
+            self._buf = [frame.clone() for _ in range(self.history_length)]  # startup padding = repeat first frame
+        else:
+            self._buf.append(frame)
+            self._buf.pop(0)  # keep the newest H frames, oldest at index 0
+        ordered = self._buf if OBS_HISTORY_NEWEST_LAST else list(reversed(self._buf))
+        if self.history_length == 1 or not OBS_HISTORY_TERM_MAJOR:
+            return torch.cat(ordered, dim=1)  # frame-major (or trivial single frame)
+        # term-major: for each term, concatenate that term's slice across all frames, then concatenate terms
+        if self.term_widths is None:
+            raise ValueError("term-major stacking needs term_widths (pass frame_term_widths(base_dim, layout)).")
+        cols, a = [], 0
+        for w in self.term_widths:
+            cols.extend(f[:, a:a + w] for f in ordered)
+            a += w
+        return torch.cat(cols, dim=1)
+# ---------------------------------------------------------------------------------------------------------
+
+
+def build_observation(
+    cfg: DeployConfig,
+    state: LatestRobotState,
+    sdk_to_isaac: list[int],
+    default_joint_pos_isaac_order: list[float],
+    manual_cmd: list[float],
+    last_action: list[float],
+    base_height: float | None = None,
+    include_base_lin_vel: bool = True,
+    joint_vel_filter: ObsEmaFilter | None = None,
+) -> torch.Tensor:
+    gravity_b = quat_rotate_inverse_wxyz(state.quat_wxyz, (0.0, 0.0, -1.0))
+
+    joint_pos_isaac = [state.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
+    joint_vel_isaac = [state.joint_vel[sdk_i] for sdk_i in sdk_to_isaac]
+    if joint_vel_filter is not None:  # EMA low-pass, same filter as the training obs term (noise resilience)
+        joint_vel_isaac = joint_vel_filter.filter(joint_vel_isaac)
+    joint_pos_rel = [q - q0 for q, q0 in zip(joint_pos_isaac, default_joint_pos_isaac_order)]
+
+    parts: list[float] = []
+    if include_base_lin_vel:
+        # base_lin_vel (body frame), 3. Only for policies trained WITH it; dead on hardware after ReleaseMode
+        # (SportModeState stops publishing), which is why current policies drop it -- see OBS_LAYOUT.
+        parts += list(state.sportmode_velocity)
+    parts += list(state.gyro)  # base_ang_vel (body frame), 3
+    parts += list(gravity_b)  # projected_gravity, 3
+    if base_height is not None:
+        parts += [base_height]  # base_height, 1 -- only for older policies, see the note above
+    parts += list(manual_cmd)  # velocity_commands, 5: [lin_x, lin_y, ang_z, pitch, lean]
+    parts += joint_pos_rel  # joint_pos, 12
+    parts += joint_vel_isaac  # joint_vel, 12
+    parts += list(last_action)  # actions (previous), 12
+
+    return torch.tensor(parts, dtype=torch.float32).unsqueeze(0)  # (1, obs_dim)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------------------------------------
+
+
+ZERO_GAIN_HEARTBEAT_S = 1.0  # official examples publish zero-gain frames for ~1 s after release before doing anything
+HOLD_DAMPING_KD = 3.0  # same damping gain as the exit damping command; legs hang limp but heavily damped
+
+PRE_RELEASE_CHECKLIST = """
+[CHECKLIST] The robot's onboard controller is about to be RELEASED (motors go limp for a moment).
+  [ ] Robot is PRONE on the ground (controller L2+A twice) -- not standing, not hoisted.
+  [ ] Hoist rope is slack (tether only). Area around the legs is clear.
+  [ ] Head LED is steady green (not red).
+  [ ] Controller in hand, power button within reach. Ctrl+C here to abort.
+Press SPACE to release the onboard controller..."""
+
+HOIST_PAUSE_PROMPT = """
+[PAUSE] Onboard controller released. Zero-gain heartbeat done; legs are now held DAMPED (kp=0, kd=3).
+  - Check the head LED now. Steady green = good, red = STOP.
+  - To hoist: winch up slowly until the feet are a few cm clear. The legs hang limp.
+  - To TEST THE CONTROLLER E-STOP: press L2+B now. This script should print [ESTOP] and exit. If nothing
+    happens, the controller stop does NOT work after release -- use Ctrl+C / the power button only.
+  - Pressed controller buttons are echoed below as they are seen.
+Press SPACE when the robot is hoisted (or on the ground, if skipping the hoist) to start the startup ramp..."""
+
+
+DEFAULT_PROFILE = os.path.join(os.path.dirname(__file__), "profiles", "go2_locomotion.yaml")
+PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
+
+_RATED_SPEED_CAP = (30.1, 30.1, 15.7)  # hip, thigh, calf rad/s: robot_cfg.py velocity_limit
+
+
+def load_safety_profile(path: str, name: str, valid: set[str]) -> dict:
+    """Load one named block from the safety-profiles YAML and validate it against the real flag names.
+
+    Returns {flag_dest: value} ready for argparse's set_defaults. Raises on an unknown profile or key so a typo
+    fails loudly at startup instead of silently running with a default.
+    """
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if name not in data:
+        raise ValueError(f"safety profile '{name}' not found in {path}. Available: {sorted(data)}")
+    profile = data[name]
+    if not isinstance(profile, dict):
+        raise ValueError(f"safety profile '{name}' in {path} must be a mapping of flag name -> value")
+    # An optional `relay:` block belongs to deploy_real_wireless.py (src/deploy/relay_profile.py); the wired script ignores it.
+    profile = {k: v for k, v in profile.items() if k != "relay"}
+    reserved = {"safety_profile", "safety_profiles_file", "deploy_profile", "config", "network_interface"}
+    bad = [k for k in profile if k not in valid or k in reserved]
+    if bad:
+        raise ValueError(f"safety profile '{name}' in {path} has unknown/unsupported key(s) {bad}")
+    cap = profile.get("speed_fault_cap_rad_s")
+    if cap is not None:
+        ok = isinstance(cap, (list, tuple)) and len(cap) == 3 and all(isinstance(c, (int, float)) and c > 0 for c in cap)
+        if not ok:
+            raise ValueError(f"safety profile '{name}': speed_fault_cap_rad_s must be 3 positive numbers (hip/thigh/calf)")
+        profile["speed_fault_cap_rad_s"] = [float(c) for c in cap]
+        if any(c > r + 1e-9 for c, r in zip(cap, _RATED_SPEED_CAP)):
+            print(f"[WARN] safety profile '{name}': speed_fault_cap_rad_s {cap} is above the rated "
+                  f"{list(_RATED_SPEED_CAP)}; the measured-speed abort is looser than the motors' rating.")
+    steps = profile.get("speed_fault_steps")
+    if steps is not None and (not isinstance(steps, int) or steps < 1):
+        raise ValueError(f"safety profile '{name}': speed_fault_steps must be an integer >= 1")
+    return profile
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Deploy a trained Go2 policy on real hardware.")
+    parser.add_argument(
+        "--deploy_profile", type=str, default=None,
+        help="Name of a per-policy deploy profile: src/deploy/profiles/<name>.yaml (go2_locomotion = single-frame kp40, "
+        "go2_obs_stacking = 6-frame kp50). Selects the WHOLE policy recipe -- policy_path, kp, kd, joint_vel_filter_hz, "
+        "history_length (observation stack depth), joint orders, default pose -- so they always move together. "
+        "Mirrors training's --profile. Mutually exclusive with --config. Orthogonal to --safety_profile.",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help=f"Explicit path to a policy profile YAML (escape hatch; prefer --deploy_profile). "
+        f"Default: {os.path.relpath(DEFAULT_PROFILE, os.path.dirname(os.path.dirname(__file__)))}.",
+    )
+    parser.add_argument("--network_interface", type=str, default=None, help="Overrides the config file's value.")
+    parser.add_argument(
+        "--policy_path", type=str, default=None,
+        help="Override the policy exported .pt chosen by the deploy profile / --config (policy_path). "
+        "CLI > the profile's value.",
+    )
+    parser.add_argument(
+        "--history_length", type=int, default=None,
+        help="Observation frames the policy was trained with (1 = single frame). Normally set by the deploy profile "
+        "(history_length); this overrides it. A value that does not match the policy is rejected at startup.",
+    )
+    parser.add_argument(
+        "--safety_profile", "--test_profile", type=str, default=None, dest="safety_profile",
+        help="Name of a SAFETY profile in --safety_profiles_file (cautionary / confident / no_limits, or your own): "
+        "fills the slew, tether, abort, speed-fault and startup-lift values from the YAML so they need not be passed "
+        "one by one. Orthogonal to --deploy_profile (which policy). The file is re-read every run. An explicit flag "
+        "on the command line still overrides the profile. (--test_profile is the deprecated old name.)",
+    )
+    parser.add_argument(
+        "--safety_profiles_file", "--test_profiles_file", type=str, dest="safety_profiles_file",
+        default=os.path.join(os.path.dirname(__file__), "configs", "safety_profiles.yaml"),
+        help="YAML file holding the named safety profiles.",
+    )
+    parser.add_argument(
+        "--link_lost_after",
+        type=float,
+        default=None,
+        help="Seconds of LowState silence before the run stops as link-lost (overrides config's "
+        "'link_lost_after', default 0.5). Raise cautiously for a jittery WiFi link; a LowState gap this "
+        "long always stops and damps.",
+    )
+    parser.add_argument(
+        "--manual_commands",
+        action="store_true",
+        default=False,
+        help="Launch the same slider window play.py uses, writing to --command_file.",
+    )
+    parser.add_argument("--command_file", type=str, default="/tmp/manual_command.json")
+    parser.add_argument(
+        "--live_plot",
+        action="store_true",
+        default=False,
+        help="Log per-step commanded-vs-actual data to logs/hardware_dashboard/, same tags as play.py's --live_plot.",
+    )
+    # Graphs while deploying: deploy_real starts src/common/live_dashboard.py (+ feh) itself, pointed at this run's own
+    # --live_plot folder, instead of separate tmux dashboard/viewer panes. Explicit underscore pairs so a CLI flag
+    # can turn a profile's setting either way (BooleanOptionalAction would emit --no-live-dashboard).
+    parser.add_argument(
+        "--live_dashboard", dest="live_dashboard", action="store_true", default=False,
+        help="Start the live-graph dashboard (and viewer) for this run. Implies --live_plot. Profile-able.",
+    )
+    parser.add_argument("--no_live_dashboard", dest="live_dashboard", action="store_false", default=False,
+                        help="Force the live dashboard off, overriding a profile's live_dashboard: true.")
+    parser.add_argument(
+        "--dashboard_viewer", dest="dashboard_viewer", action="store_true", default=True,
+        help="Open feh on the dashboard PNG (default on; only used with --live_dashboard). Profile-able.",
+    )
+    parser.add_argument("--no_dashboard_viewer", dest="dashboard_viewer", action="store_false", default=True,
+                        help="Do not open the viewer window (the PNG is still written).")
+    parser.add_argument(
+        "--dashboard_output", type=str, default=dashboard_launch.DEFAULT_OUTPUT,
+        help="PNG the dashboard writes and feh shows (default %(default)s, separate from training's). Profile-able.",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the full control loop (state read, observation assembly, inference, LowCmd construction, "
+            "timing) but never call the DDS publisher's Write() -- prints what would have been sent instead. "
+            "Use this before ever connecting to a powered robot -- see src/deploy/README.md Stage 4."
+        ),
+    )
+    parser.add_argument(
+        "--startup_ramp_s", type=float, default=10.0,
+        help="Seconds to smoothly interpolate from the robot's actual current joint positions AND from a "
+        "gentle starting kp (see --startup_kp_fraction) to default_joint_pos/full kp, instead of jumping "
+        "there instantly. Required safety step -- see ramp_to_default_pose(). Increase for extra caution "
+        "(e.g. if the robot's starting pose is far from default_joint_pos); do not set to 0.",
+    )
+    parser.add_argument(
+        "--startup_kp_fraction", type=float, default=0.1,
+        help="kp during the startup ramp starts at this fraction of the configured kp (see "
+        "src/deploy/profiles/go2_locomotion.yaml) and climbs to the full value alongside the position ramp, "
+        "instead of the full kp applying instantly the moment the publish thread starts holding 'current "
+        "position'. Added after a real-hardware incident where a jerk happened before the ramp's position "
+        "interpolation had even sent its first step -- the remaining suspect was kp snapping to full "
+        "stiffness on a possibly not-yet-settled joint. 0.1 = 10%% of full kp to start; raise for more "
+        "caution, must be > 0 (some holding stiffness from the very first publish is still needed).",
+    )
+    parser.add_argument(
+        "--hold_kp", type=float, default=None,
+        help="Stiffness for the startup ramp ONLY (overrides config's 'hold_kp'); the policy loop always runs "
+        "at the config 'kp'. The training gain kp=25 cannot raise/hold the robot's weight off the ground "
+        "during the cold start, so the legs sag and the ramp never reaches the stance. A stiffer hold_kp "
+        "(~60) lets the robot stand to default; kp is then dropped to the policy's value in the same tick the "
+        "first policy action is applied. Set equal to kp to restore the old single-stiffness behaviour.",
+    )
+    parser.add_argument(
+        "--settle_s", type=float, default=8.0,
+        help="After the startup ramp, keep holding the default pose at hold_kp (still tethered) for up to this "
+        "many seconds until every joint is within --settle_tol_deg of default. A robot lifting itself off the "
+        "ground is still rising when the fixed-length ramp ends; 0 restores the old immediate hand-off check.",
+    )
+    parser.add_argument(
+        "--handover_slew_rad_s", type=float, default=2.618,
+        help="Per-tick slew cap used ONLY while kp is fading from hold_kp to kp at policy handover (see "
+        "--kp_handover_s). Kept conservative (default 2.618 = 3 deg/tick) because a fast target step at the "
+        "still-stiff fade kp makes a large torque spike (the handover jerk / torque-abort seen when "
+        "--max_joint_speed_rad_s was raised globally). Clamped to at most --max_joint_speed_rad_s.",
+    )
+    parser.add_argument(
+        "--kp_handover_s", type=float, default=0.5,
+        help="Fade kp from hold_kp to the policy's kp over this many seconds after the policy starts (0 = drop "
+        "instantly). An instant 60 -> 25 drop let the real robot sag ~40 deg before the policy took the load.",
+    )
+    parser.add_argument("--settle_tol_deg", type=float, default=6.0, help="Settle target, see --settle_s.")
+    parser.add_argument(
+        "--calf_tau_abort_nm", type=float, default=0.9 * CALF_RATED_NM,
+        help="Torque abort for the CALVES in the policy loop (default 0.9 x the calf's 45.4 Nm rating ~ 41 Nm). "
+        "Separate from the global torque abort (0.9 x effort_limit ~ 21 Nm), which is the hip/thigh rating and "
+        "otherwise gets applied to the calves too -- aborting them at under half their rating. A legitimate hard "
+        "step or lateral (lin_y) command loads a front calf to ~20 Nm statically (hardware run 2026-11-19 tripped "
+        "FL_calf at 21 Nm / 30 deg during a sidestep while hip/thigh stayed under 17 Nm). Hips and thighs keep the "
+        "global abort. Set equal to 0.9 x effort_limit to restore the old single-threshold behaviour.",
+    )
+    parser.add_argument(
+        "--lift_calf_tether_deg", type=float, default=None,
+        help="Startup lift only (ramp + settle; off by default): widen the CALF tether to this many degrees and "
+        "raise the calf torque abort to 0.9 x its 45.4 Nm rating. A robot rising from prone needs more rear-calf "
+        "torque than the 15 deg tether's kp*dev cap (60 * 15 deg = 15.7 Nm) -- real run: torque flat at that "
+        "cap, rear calves stuck 40-45 deg short. Max calf torque ~ hold_kp * this (60 * 25 deg = 26 Nm). Hips "
+        "and thighs keep the normal leash and abort, and everything is restored before the policy starts.",
+    )
+    parser.add_argument(
+        "--max_joint_speed_rad_s", type=float, default=2.618,
+        help="Per-tick slew-rate limit on the COMMANDED target, expressed as an equivalent joint speed "
+        "(rad/s), same units as Isaac/sim2sim's velocity_limit/--joint_speed_cap for this robot: no "
+        "joint's commanded target may change faster than this, applied every control tick (not just at "
+        "startup; max_delta_rad = this * control_dt). Added after a real-hardware incident where the "
+        "ramp-to-default-pose handoff into the policy loop sent an unsmoothed multi-degree jump in one "
+        "tick (the ramp only smooths the transition INTO default_joint_pos; the first policy action "
+        "afterward, and any later anomalous action, was previously written straight through with no "
+        "limit). Default 2.618 rad/s (= 3 deg/tick at 50 Hz) is conservative for this testing phase -- "
+        "raise it once continuous full-speed gait is validated and this is confirmed to bind during "
+        "normal walking, not just anomalies. This limits the TARGET's rate of change, not the robot's "
+        "actual physical speed -- see --speed_fault_cap_rad_s for a check on the latter.",
+    )
+    parser.add_argument(
+        "--speed_fault_cap_rad_s", type=float, nargs=3, default=[30.1, 30.1, 15.7], metavar=("HIP", "THIGH", "CALF"),
+        help="Abort if the robot's ACTUAL measured joint velocity (LowState's dq, not the commanded "
+        "target) stays above these per-joint-type caps for --speed_fault_steps consecutive ticks -- the "
+        "real-hardware analog of Isaac/PhysX's hard velocity_limit_sim clamp, which overwrites simulated "
+        "joint velocity directly (a lever real hardware doesn't have). Defaults are this robot's own "
+        "DCMotorCfg.velocity_limit values (robot_cfg.py) -- its rated speed, not an "
+        "arbitrary number.",
+    )
+    parser.add_argument(
+        "--speed_fault_steps", type=int, default=5,
+        help="Consecutive over-cap ticks (see --speed_fault_cap_rad_s) before aborting.",
+    )
+    parser.add_argument(
+        "--steps_per_confirm", type=int, nargs="?", const=1, default=None,
+        help="Manual step-confirm mode: print every commanded target in degrees and block for a SPACE bar "
+        "press before it's sent, for both the startup ramp and the main policy loop -- control is no longer "
+        "real-time while this is set. Pass the bare flag for the default of 1 (confirm every single "
+        "command), or a number to let that many commands through per press (e.g. --steps_per_confirm 10). "
+        "Omit entirely to run freely as before (the default).",
+    )
+    parser.add_argument(
+        "--max_target_dev_deg", type=float, default=15.0,
+        help="Tether: no commanded joint target may be further than this from that joint's ACTUAL position. "
+        "Bounds PD torque at kp*dev (25 * 15 deg = 6.5 Nm). Added after a real run where policy targets drifted "
+        "70-97 deg from the legs, torque hit 32 Nm (> effort limit) and the robot cut torque with a red LED.",
+    )
+    parser.add_argument(
+        "--policy_max_target_dev_deg", type=float, default=None,
+        help="Tether for the POLICY LOOP only, applied after the startup ramp and settle finish. Default (unset): "
+        "the policy loop uses --max_target_dev_deg like the ramp. Set it large (e.g. 1000) to stop the tether "
+        "reshaping the policy's targets (sim has no tether) while the ramp keeps --max_target_dev_deg: the ramp "
+        "needs its tether to wait for legs that lag the target (a robot rising from a crouch or a mat), and "
+        "without it the commanded-vs-actual error grows until --abort_err_deg trips (real run: 30 deg at ~7 s).",
+    )
+    parser.add_argument(
+        "--abort_err_deg", type=float, default=30.0,
+        help="Stop (damping) if commanded-vs-actual error stays above this for 3 consecutive steps.",
+    )
+    parser.add_argument(
+        "--stand_down", action="store_true", default=False,
+        help="Also call SportClient.StandDown() while releasing the onboard controller (the Python SDK "
+        "example does; the official C++ example does not). Only for a robot STANDING ON THE GROUND that you "
+        "want laid down first -- never use it while hoisted (the sport controller will drive the legs to a "
+        "folded pose in the air). Default off: lay the robot prone yourself (controller L2+A twice) instead.",
+    )
+    parser.add_argument(
+        "--low_pass", type=float, nargs="?", const=5.0, default=None, metavar="HZ",
+        help="Low-pass (EMA) the policy ACTION before it becomes the joint target, at this cutoff (Hz). Bare "
+        "--low_pass uses 5 Hz. Off by default. Suppresses the ~25 Hz every-tick 'buzz' (the policy amplifying "
+        "joint-velocity sensor noise); validated in sim2sim (sim2sim_mujoco.py --action_lpf_hz). Applied upstream "
+        "of the slew/tether safety layers; last_action still reflects the actually-sent (clamped) target.",
+    )
+    parser.add_argument(
+        "--no_pause_for_hoist", action="store_true", default=False,
+        help="Skip the pause after release (where the legs are held damped, kp=0/kd=3, so you can hoist the "
+        "robot) and go straight to the startup ramp. Default: pause.",
+    )
+    parser.add_argument(
+        "--skip_release", action="store_true", default=False,
+        help="Testing seam: skip the pre-release checklist and release_motion_control(). Only accepted with "
+        "--network_interface lo (src/deploy/fake_robot.py); refused otherwise, since publishing LowCmd to a real "
+        "robot whose sport controller is still active is unsafe.",
+    )
+    # Safety profiles (src/deploy/configs/safety_profiles.yaml): read fresh on every launch. They become the argparse
+    # defaults, so precedence is  explicit CLI flag > profile > built-in default.
+    pre, _ = parser.parse_known_args()
+    if any(a == "--test_profile" or a.startswith("--test_profile=") for a in sys.argv[1:]):
+        print("[WARN] --test_profile is deprecated; use --safety_profile (same values).")
+    profile: dict | None = None
+    if pre.safety_profile is not None:
+        profile = load_safety_profile(pre.safety_profiles_file, pre.safety_profile,
+                                      valid={a.dest for a in parser._actions})
+        parser.set_defaults(**profile)
+    args = parser.parse_args()
+    args.safety_profile_values = profile
+    if args.live_dashboard:
+        args.live_plot = True  # the dashboard reads the --live_plot log folder
+    # Policy profile: --deploy_profile NAME -> src/deploy/profiles/NAME.yaml, or an explicit --config path, or the default.
+    if args.deploy_profile is not None and args.config is not None:
+        parser.error("--deploy_profile and --config both select the policy recipe; pass only one.")
+    if args.deploy_profile is not None:
+        cand = os.path.join(PROFILES_DIR, f"{args.deploy_profile}.yaml")
+        if not os.path.isfile(cand):
+            avail = sorted(os.path.splitext(f)[0] for f in os.listdir(PROFILES_DIR) if f.endswith(".yaml"))
+            parser.error(f"deploy profile '{args.deploy_profile}' not found in {PROFILES_DIR}. Available: {avail}")
+        args.config = cand
+    elif args.config is None:
+        args.config = DEFAULT_PROFILE
+    return args
+
+
+def main():
+    args = parse_args()
+    if args.safety_profile_values is not None:
+        print(f"[INFO] Safety profile '{args.safety_profile}' ({args.safety_profiles_file}); explicit CLI flags override it:")
+        for k, v in args.safety_profile_values.items():
+            note = "" if getattr(args, k) == v else f"   (profile {v}, overridden)"
+            print(f"         {k} = {getattr(args, k)}{note}")
+    cfg = load_config(args.config, args.network_interface, args.link_lost_after, args.hold_kp, args.policy_path,
+                      args.history_length)
+    print(f"[INFO] Deploy profile: {os.path.relpath(args.config)} | safety profile: {args.safety_profile or 'none'}")
+    print(f"[INFO]   policy_path={cfg.policy_path} history_length={cfg.history_length} kp={cfg.kp} kd={cfg.kd} "
+          f"joint_vel_filter_hz={cfg.joint_vel_filter_hz}")
+
+    if args.skip_release and cfg.network_interface != "lo":
+        raise ValueError(
+            "--skip_release is only accepted with --network_interface lo (the fake robot). Refusing to "
+            f"publish LowCmd to '{cfg.network_interface}' without releasing the onboard controller first."
+        )
+
+    if not _UNITREE_SDK_AVAILABLE:
+        if not args.dry_run:
+            raise RuntimeError(
+                "unitree_sdk2py is not installed. Install it into this same interpreter "
+                "(`_isaac_sim/python.sh -m pip install unitree_sdk2py`) before running without --dry_run."
+            )
+        print("[WARN] unitree_sdk2py not installed -- --dry_run will skip all DDS init and use zeroed state.")
+
+    sdk_to_isaac, isaac_to_sdk = build_joint_index_maps(cfg)
+    default_joint_pos_isaac_order = [cfg.default_joint_pos[name] for name in cfg.isaac_joint_order]
+    default_joint_pos_sdk_order = [cfg.default_joint_pos[name] for name in cfg.sdk_joint_order]
+
+    print(f"[INFO] Loading policy from: {cfg.policy_path}")
+    policy = torch.jit.load(cfg.policy_path)
+    policy.eval()
+    obs_dim, obs_layout = policy_obs_layout(policy, cfg.history_length)
+    include_base_lin_vel = obs_layout["has_lin_vel"]
+    print(f"[INFO] Policy observation dim {obs_dim}: base_lin_vel {'INCLUDED' if include_base_lin_vel else 'OMITTED'} "
+          f"(SportModeState {'needed' if include_base_lin_vel else 'not needed -- it stops after ReleaseMode anyway'}).")
+    obs_history = ObsHistory(cfg.history_length, frame_term_widths(obs_dim, obs_layout))
+    jv_filter = ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
+    if cfg.history_length > 1:
+        print(f"[INFO] Stacking {cfg.history_length} observation frames -> policy input {obs_dim * cfg.history_length}.")
+
+    state = LatestRobotState(num_joints=12)
+
+    manual_cmd = ManualCommandBuffer()
+    if args.manual_commands:
+        threading.Thread(
+            target=_manual_command_file_poll_loop, args=(manual_cmd, args.command_file), daemon=True
+        ).start()
+        launch_slider(args.command_file)
+        print(f"[INFO] Manual command mode: slider window launched (writing to {args.command_file}).")
+
+    live_plot_writer = None
+    live_plot_dir = None
+    if args.live_plot:
+        from torch.utils.tensorboard import SummaryWriter
+
+        live_plot_dir = os.path.join("logs", "hardware_dashboard", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        live_plot_writer = SummaryWriter(log_dir=live_plot_dir)
+        # Record the exact invocation + resolved gains next to the scalars: these runs are otherwise
+        # un-reproducible (no argv is logged anywhere), which cost us the exact CLI values after the fact.
+        try:
+            with open(os.path.join(live_plot_dir, "cli_args.txt"), "w") as f:
+                f.write("argv: " + " ".join(sys.argv) + "\n")
+                f.write(f"config: {args.config}\n")
+                f.write(f"deploy_profile: {os.path.relpath(args.config)}\n")
+                if args.safety_profile_values is not None:
+                    resolved = {k: getattr(args, k) for k in args.safety_profile_values}
+                    f.write(f"safety_profile: {args.safety_profile} resolved={resolved}\n")
+                f.write(f"kp={cfg.kp} kd={cfg.kd} hold_kp={cfg.hold_kp} effort_limit={cfg.effort_limit} "
+                        f"tau_abort={0.9 * cfg.effort_limit:.2f}Nm\n")
+                f.write(f"max_target_dev_deg={args.max_target_dev_deg} abort_err_deg={args.abort_err_deg} "
+                        f"max_joint_speed_rad_s={args.max_joint_speed_rad_s} link_lost_after_s={cfg.link_lost_after_s}\n")
+        except OSError as e:
+            print(f"[WARN] could not write cli_args.txt: {e!r}")
+        print(f"[INFO] Live plot logging to: {live_plot_dir}")
+        if args.live_dashboard:
+            dashboard_launch.start(live_plot_dir, args.dashboard_output, viewer=args.dashboard_viewer)
+
+    # --- DDS init ---
+    low_cmd_publisher = None
+    crc = None
+    target_buf = None
+    publish_thread = None
+    startup_kp = None
+    if _UNITREE_SDK_AVAILABLE and not args.dry_run:
+        ChannelFactoryInitialize(0, cfg.network_interface)
+        crc = CRC()
+
+        # Subscribe BEFORE releasing (same order as Unitree's official C++ example's Init()), so state --
+        # including the controller buttons and tau_est -- is already flowing while the release happens.
+        def _on_low_state(msg: LowState_):
+            state.update_from_low_state(msg)
+
+        def _on_sportmode_state(msg: SportModeState_):
+            state.update_from_sportmode_state(msg)
+
+        low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
+        low_state_sub.Init(_on_low_state, 10)
+        # Only subscribe to SportModeState if the policy actually uses base_lin_vel. Current policies (47-dim)
+        # do not, and it stops publishing after ReleaseMode() anyway, so the subscription is pointless for them.
+        sportmode_sub = None
+        if include_base_lin_vel:
+            sportmode_sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+            sportmode_sub.Init(_on_sportmode_state, 10)
+
+        low_cmd_publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
+        low_cmd_publisher.Init()
+
+        print(f"[INFO] Waiting for first LowState message on interface {cfg.network_interface}...")
+        while not state.ready:
+            time.sleep(0.05)
+        print("[INFO] Robot state stream connected.")
+
+        # MUST happen before LowCmd means anything -- see release_motion_control's comment above. The
+        # operator checklist prompt only appears if a release is actually about to happen.
+        if args.skip_release:
+            print("[WARN] --skip_release: skipping the release checklist and release_motion_control() "
+                  "(loopback/fake robot only).")
+        else:
+            release_motion_control(
+                stand_down=args.stand_down,
+                before_release=lambda: wait_for_space(PRE_RELEASE_CHECKLIST, flush=True),
+            )
+
+        # Two-rate publish architecture (see module docstring): the 50 Hz loop below only ever updates
+        # target_buf; this dedicated ~500 Hz RecurrentThread is what actually calls Write(), matching
+        # unitree_sdk2py's own reference example (RecurrentThread(interval=0.002, target=LowCmdWrite)).
+        #
+        # Publishing starts with ZERO gains (kp=kd=0 -> no torque), like Unitree's official examples, whose
+        # first ~1 s after release is zero-gain frames. The real starting pose is captured later, after the
+        # (optional) hoist pause, so the ramp starts from where the robot actually is by then -- hoisting
+        # changes the joint positions by tens of degrees, so a pose captured here would be stale.
+        # kp then starts gentle (see --startup_kp_fraction) and ramps alongside the position ramp, not
+        # instantly -- see LowCmdTarget's and ramp_to_default_pose's docstrings for why.
+        # The ramp climbs to cfg.hold_kp (>= cfg.kp): kp=25 is the policy's trained gain but is too soft to
+        # raise/hold the robot's weight off the ground before the policy is live, so the ramp uses a stiffer
+        # hold and the policy loop later drops kp back to cfg.kp on its first tick (see below).
+        startup_kp = cfg.hold_kp * args.startup_kp_fraction
+        initial_snap = state.snapshot()
+        hold_isaac_order = [initial_snap.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
+
+        low_cmd = init_low_cmd(cfg)
+        target_buf = LowCmdTarget(hold_isaac_order, initial_kp=0.0, initial_kd=0.0)
+        publish_thread = RecurrentThread(
+            interval=0.002,
+            target=publish_low_cmd,
+            name="lowcmd_publish",
+            args=(low_cmd, target_buf, isaac_to_sdk, low_cmd_publisher, crc),
+        )
+        publish_thread.Start()
+        print("[INFO] LowCmd publish thread started at 500 Hz with ZERO gains (kp=kd=0 -> no torque).")
+    else:
+        print("[INFO] --dry_run: skipping DDS init, using zeroed/default robot state throughout.")
+        state.joint_pos = list(default_joint_pos_sdk_order)
+        state.ready = True
+
+    last_action = [0.0] * 12
+    # Optional action low-pass (--low_pass HZ): EMA on the policy action before it forms the joint target, to
+    # suppress the ~25 Hz buzz (see the arg help). alpha = 1 - exp(-2*pi*fc*dt); action_filt is lazily seeded with
+    # the first action so there is no startup lurch. Off when --low_pass is not given.
+    action_lpf_alpha = None
+    if args.low_pass is not None:
+        action_lpf_alpha = 1.0 - math.exp(-2.0 * math.pi * args.low_pass * cfg.control_dt)
+        print(f"[INFO] Action low-pass ON: {args.low_pass:.1f} Hz (EMA alpha={action_lpf_alpha:.3f}).")
+    action_filt: list[float] | None = None
+    step = 0
+    policy_trace: list = []  # per-tick rows saved to policy_trace.npz with --live_plot (offline replay / diagnosis)
+    policy_tick = 0  # counts policy commands; drives the kp fade hold_kp -> kp after the ramp handover
+    handover_ticks = max(0, int(round(args.kp_handover_s / cfg.control_dt)))
+    control_dt = cfg.control_dt
+
+    gate = StepConfirmGate(args.steps_per_confirm) if args.steps_per_confirm is not None else None
+    if gate is not None:
+        print(f"[INFO] Manual step-confirm mode: every target printed in degrees, {gate.steps_per_confirm} "
+              f"command(s) sent per SPACE press. Not real-time while this is on.")
+
+    max_joint_step_rad = args.max_joint_speed_rad_s * control_dt
+    # The handover slew caps the target rate while kp is still faded high (hold_kp -> kp). It is never larger
+    # than the main slew, so raising --max_joint_speed_rad_s for balance recovery cannot un-protect the handoff.
+    handover_step_rad = min(args.handover_slew_rad_s, args.max_joint_speed_rad_s) * control_dt
+    print(f"[INFO] Per-tick slew-rate limit: max {args.max_joint_speed_rad_s:.3f} rad/s "
+          f"({math.degrees(max_joint_step_rad):.1f} deg/joint/tick); "
+          f"{min(args.handover_slew_rad_s, args.max_joint_speed_rad_s):.3f} rad/s "
+          f"({math.degrees(handover_step_rad):.1f} deg/tick) during the kp handover fade.")
+
+    # Gated runs count steps per keypress (each one a deliberate human action), free-running ones count
+    # control ticks, so the same "no torque response" evidence needs far fewer gated steps (5) than ticks (25
+    # = 0.5 s at 50 Hz).
+    monitor = None
+    if target_buf is not None:
+        speed_watchdog = JointSpeedWatchdog(
+            consecutive_steps=args.speed_fault_steps,
+            caps_by_type=dict(zip(("hip", "thigh", "calf"), args.speed_fault_cap_rad_s)),
+            joint_names=cfg.isaac_joint_order,
+        )
+        monitor = SafetyMonitor(
+            state, sdk_to_isaac, TorqueResponseWatchdog(consecutive_steps=5 if gate is not None else 25),
+            joint_names=cfg.isaac_joint_order,
+            max_dev_rad=math.radians(args.max_target_dev_deg),
+            abort_err_rad=math.radians(args.abort_err_deg),
+            abort_steps=3,
+            tau_abort_nm=0.9 * cfg.effort_limit,
+            speed_watchdog=speed_watchdog,
+            writer=live_plot_writer,
+            link_lost_after_s=cfg.link_lost_after_s,
+            calf_tau_abort_nm=args.calf_tau_abort_nm,
+        )
+        print(f"[INFO] Tether: targets limited to {args.max_target_dev_deg:.0f} deg of actual "
+              f"(max PD torque ~ kp*dev = {cfg.kp * math.radians(args.max_target_dev_deg):.1f} Nm); abort if error "
+              f"> {args.abort_err_deg:.0f} deg for 3 steps or torque >= {0.9 * cfg.effort_limit:.1f} Nm "
+              f"(calves {args.calf_tau_abort_nm:.1f} Nm).")
+        tether_nm = cfg.kp * math.radians(args.max_target_dev_deg)
+        if tether_nm < 0.5 * 0.9 * cfg.effort_limit:
+            print(f"[WARN] Tether torque ceiling in the policy loop is only {tether_nm:.1f} Nm (kp {cfg.kp:.0f} x "
+                  f"{args.max_target_dev_deg:.0f} deg) -- less than the ~10-13 Nm the rear calves need to hold the "
+                  f"stance at kp {cfg.kp:.0f}, so the policy's correction gets clipped and the robot can sag "
+                  f"(real run). Raise --max_target_dev_deg (and --abort_err_deg above it) while keeping kp x dev "
+                  f"under the {0.9 * cfg.effort_limit:.1f} Nm abort.")
+        print(f"[INFO] Joint-speed fault: abort if actual |velocity| exceeds "
+              f"{args.speed_fault_cap_rad_s[0]:.1f}/{args.speed_fault_cap_rad_s[1]:.1f}/{args.speed_fault_cap_rad_s[2]:.1f} "
+              f"rad/s (hip/thigh/calf) for {args.speed_fault_steps} consecutive steps.")
+
+    print(f"[INFO] Entering control loop at {1.0 / control_dt:.0f} Hz (dry_run={args.dry_run}). Ctrl+C to stop.")
+    with cbreak_terminal() if gate is not None else contextlib.nullcontext():
+        try:
+            # Moved inside this try/finally (was previously called before it) so Ctrl+C during the ramp --
+            # now a multi-second operation, potentially much longer still when gated on keypresses -- is
+            # caught by the same damping-command safety net as the main loop below, not left to crash past
+            # it uncaught. target_buf is None only in --dry_run, which never ramps (nothing to interpolate
+            # toward on fake data).
+            if target_buf is not None:
+                # 1) Zero-gain heartbeat (no torque), with the controller e-stop already live.
+                heartbeat_end = time.monotonic() + ZERO_GAIN_HEARTBEAT_S
+                while time.monotonic() < heartbeat_end:
+                    monitor.poll()
+                    time.sleep(0.02)
+
+                # 2) Hold damped and pause so the robot can be hoisted while released (no sport controller
+                #    exists any more to react to being lifted). Controller buttons are echoed so the e-stop
+                #    path can be tested before anything moves.
+                if not args.no_pause_for_hoist:
+                    target_buf.set_kd(HOLD_DAMPING_KD)
+                    seen_buttons: set[str] = set()
+
+                    def _pause_poll() -> None:
+                        nonlocal seen_buttons
+                        pressed = {
+                            n for n, v in decode_controller_buttons(state.snapshot().wireless_remote).items() if v
+                        }
+                        if pressed != seen_buttons:
+                            if pressed:
+                                print(f"[CONTROLLER] pressed: {sorted(pressed)}", flush=True)
+                            seen_buttons = pressed
+                        monitor.poll()
+
+                    wait_for_space(HOIST_PAUSE_PROMPT, poll=_pause_poll, flush=True)
+
+                # 3) Start the ramp from where the robot ACTUALLY is now (hoisting moves the legs), with
+                #    target == actual so there is no error at the moment stiffness switches on.
+                start_snap = state.snapshot()
+                start_isaac_order = [start_snap.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
+                target_buf.set(start_isaac_order)
+                target_buf.set_kd(cfg.kd)
+                target_buf.set_kp(startup_kp)
+                print(f"[INFO] Holding actual pose at gentle kp={startup_kp:.1f}, kd={cfg.kd:.1f} "
+                      f"(ramp hold kp={cfg.hold_kp:.1f}, policy-loop kp={cfg.kp:.1f}).")
+                if cfg.hold_kp != cfg.kp:
+                    print(f"[INFO] Ramp raises the robot to default at kp={cfg.hold_kp:.1f}; kp drops to "
+                          f"{cfg.kp:.1f} on the first policy tick so the policy's active hold takes over.")
+
+                if args.lift_calf_tether_deg is not None:
+                    monitor.set_lift_mode(math.radians(args.lift_calf_tether_deg), 0.9 * CALF_RATED_NM)
+                    print(f"[INFO] Lift mode (ramp + settle only): calf tether {args.lift_calf_tether_deg:.0f} deg "
+                          f"(max calf torque ~ {cfg.hold_kp * math.radians(args.lift_calf_tether_deg):.0f} Nm), calf "
+                          f"torque abort {0.9 * CALF_RATED_NM:.0f} Nm; hips/thighs keep {args.max_target_dev_deg:.0f} deg "
+                          f"and {0.9 * cfg.effort_limit:.1f} Nm.")
+                ramp_to_default_pose(
+                    target_buf, start_isaac_order, default_joint_pos_isaac_order, args.startup_ramp_s,
+                    cfg.control_dt, cfg.isaac_joint_order, start_kp=startup_kp, full_kp=cfg.hold_kp, gate=gate,
+                    monitor=monitor, settle_s=args.settle_s, settle_tol_rad=math.radians(args.settle_tol_deg),
+                )
+                monitor.end_lift_mode()  # normal leash + torque abort for everything from here on
+                if args.policy_max_target_dev_deg is not None:
+                    monitor.max_dev_rad = math.radians(args.policy_max_target_dev_deg)
+                    print(f"[INFO] Ramp done. Policy-loop tether: {args.policy_max_target_dev_deg:.0f} deg "
+                          f"(ramp used {args.max_target_dev_deg:.0f} deg).")
+
+            while True:
+                tick_start = time.perf_counter()
+                snap = state.snapshot()
+                cmd = manual_cmd.get()
+
+                # `cmd` stays 5 values for logging; the policy gets what ITS layout takes (a height-command policy
+                # also gets the commanded stance height, clamped to the trained range).
+                obs_cmd = command_for_layout(cmd, obs_layout, manual_cmd.get_height())
+                frame = build_observation(cfg, snap, sdk_to_isaac, default_joint_pos_isaac_order, obs_cmd, last_action,
+                                          include_base_lin_vel=include_base_lin_vel, joint_vel_filter=jv_filter)
+                obs = obs_history.push_and_stack(frame)  # (1, base_dim) -> (1, base_dim * history_length)
+                with torch.inference_mode():
+                    action = policy(obs)[0].tolist()
+
+                # Optional action low-pass: the MOTOR target is built from the smoothed action; the raw `action`
+                # is still logged (policy_trace) and the slew/tether layers below act on the smoothed target.
+                if action_lpf_alpha is not None:
+                    if action_filt is None:
+                        action_filt = list(action)  # lazy seed: no startup transient
+                    else:
+                        action_filt = [
+                            action_filt[i] + action_lpf_alpha * (action[i] - action_filt[i]) for i in range(12)
+                        ]
+                    action_for_target = action_filt
+                else:
+                    action_for_target = action
+
+                # Isaac-ordered target joint positions. PD gains/mode/head are fixed at init (init_low_cmd);
+                # only this target changes per policy tick. Actual publishing happens on the separate ~500 Hz
+                # thread started above -- this loop only updates the shared buffer at the 50 Hz policy rate.
+                target_isaac_order = [
+                    default_joint_pos_isaac_order[i] + cfg.action_scale * action_for_target[i] for i in range(12)
+                ]
+
+                if target_buf is not None:
+                    held_target = target_buf.get()
+                    # During the kp fade, kp is still near hold_kp (stiff): a fast target step there makes a big
+                    # torque spike (kp * step), the jerk/torque-abort seen when --max_joint_speed_rad_s was raised
+                    # globally. Keep the slew at the conservative handover value until kp has reached the policy's
+                    # gain, then open up to the full value for balance recovery.
+                    in_fade = cfg.hold_kp != cfg.kp and policy_tick < handover_ticks
+                    step_rad = handover_step_rad if in_fade else max_joint_step_rad
+                    active_slew = step_rad / control_dt  # true cap this tick, for the warning message
+                    clamped_target, clipped_names = clamp_step(
+                        held_target, target_isaac_order, step_rad, cfg.isaac_joint_order
+                    )
+                    if clipped_names:
+                        # Actual rate the policy's raw (unclamped) target implied this tick, rad/s -- vs.
+                        # active_slew, the cap that's about to be enforced below. Lets an operator see HOW large
+                        # the policy's ask was, not just that it was clipped.
+                        policy_rates = {
+                            name: (target_isaac_order[i] - held_target[i]) / control_dt
+                            for i, name in enumerate(cfg.isaac_joint_order)
+                        }
+                        rate_str = ", ".join(f"{name}={policy_rates[name]:+.2f}rad/s" for name in clipped_names)
+                        print(f"[WARN] step {step}: slew-rate limit clipped {len(clipped_names)} joint(s) "
+                              f"to {active_slew:.3f} rad/s{' (handover)' if in_fade else ''} "
+                              f"(policy wanted: {rate_str})")
+                    max_err, max_tau = monitor.check(target_buf.get(), kp_fraction=1.0)
+                    clamped_target, tethered = monitor.limit_target(clamped_target)
+                    if tethered:
+                        print(f"[WARN] step {step}: tether limited {len(tethered)} joint(s) to within "
+                              f"{args.max_target_dev_deg:.0f} deg of actual: {', '.join(tethered)}")
+                    if gate is not None:
+                        print(f"[STEP {step}] {format_degrees(clamped_target, cfg.isaac_joint_order)}  "
+                              f"| max|err|={math.degrees(max_err):.1f}deg max|tau_est|={max_tau:.2f}Nm\n")
+                        gate.wait(poll=monitor.poll)
+                    # Fade kp from the stiff ramp hold to the policy's trained gain over the first
+                    # --kp_handover_s, applied in the same update as each policy target, so the policy's own
+                    # hold takes over progressively and the robot cannot sag in a gap between ramp and policy.
+                    if cfg.hold_kp != cfg.kp and policy_tick < max(handover_ticks, 1):
+                        target_buf.set_kp(handover_kp(policy_tick, handover_ticks, cfg.hold_kp, cfg.kp))
+                        if policy_tick == 0:
+                            print(f"[INFO] Policy control started: kp fading {cfg.hold_kp:.1f} -> {cfg.kp:.1f} "
+                                  f"over {args.kp_handover_s:.2f}s ({handover_ticks} ticks).")
+                    policy_tick += 1
+                    target_buf.set(clamped_target)
+                    # last_action MUST reflect what was actually sent (clamped_target), not the policy's raw
+                    # wish (action) -- target_isaac_order is recomputed fresh from default_joint_pos every
+                    # tick (not integrated from the previous target), so if last_action lies about what
+                    # really happened, the policy's own feedback observation drifts further from reality
+                    # every tick with nothing to ground it. Confirmed directly on real hardware: once the
+                    # slew-rate clamp started clipping, commanded targets drifted by a constant +/-3 deg/tick
+                    # indefinitely with no sign of settling -- a feedback runaway, not normal policy behavior.
+                    last_action = [
+                        (clamped_target[i] - default_joint_pos_isaac_order[i]) / cfg.action_scale
+                        for i in range(12)
+                    ]
+                    if live_plot_writer is not None:
+                        policy_trace.append((
+                            step, time.monotonic(), obs[0].tolist(), list(action), list(clamped_target),
+                            target_buf.get_kp(), len(clipped_names), len(tethered),
+                            [snap.tau_est[i] for i in sdk_to_isaac], [snap.joint_vel[i] for i in sdk_to_isaac],
+                            list(snap.foot_force), list(snap.quat_wxyz), list(snap.gyro),
+                        ))
+                else:
+                    last_action = action
+                    if args.dry_run and step % 50 == 0:
+                        print(f"[DRY_RUN] step={step} target_joint_pos(isaac order)={['%.3f' % t for t in target_isaac_order]}")
+
+                if live_plot_writer is not None:
+                    lean, pitch = quat_to_pitch_lean(snap.quat_wxyz)
+                    actual_isaac = [snap.joint_pos[sdk_i] for sdk_i in sdk_to_isaac]
+                    log_live_plot(
+                        live_plot_writer,
+                        step,
+                        cmd,
+                        snap.sportmode_velocity,
+                        snap.gyro[2],
+                        pitch,
+                        lean,
+                        commanded_isaac=target_buf.get() if target_buf is not None else None,
+                        actual_isaac=actual_isaac,
+                        joint_names=cfg.isaac_joint_order,
+                    )
+
+                step += 1
+                elapsed = time.perf_counter() - tick_start
+                sleep_time = control_dt - elapsed
+                # When gated, gate.wait() (just above) already blocked far longer than control_dt for the
+                # keypress -- the real-time pacing below and its overrun warning are meaningless noise in
+                # that mode (would otherwise fire on literally every gated tick) and skipped accordingly.
+                if gate is None:
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    elif step % 50 == 0:
+                        print(f"[WARN] control loop overran by {-sleep_time * 1000:.1f}ms at step {step}")
+        except KeyboardInterrupt:
+            print("\n[INFO] Ctrl+C received -- stopping control loop.")
+        except EmergencyStop as e:
+            print(f"\n[ESTOP] {e} -- stopping control loop.")
+        except (TorqueResponseFault, TrackingFault) as e:
+            print(f"\n[FAULT] {e}")
+        except LinkLost as e:
+            print(f"\n[LINK] {e}")
+        finally:
+            # RecurrentThread.Wait() sets the thread's quit flag before joining (confirmed in the SDK source),
+            # so the 500 Hz publisher is stopped here and cannot overwrite the damping frames below.
+            if publish_thread is not None:
+                publish_thread.Wait(1.0)
+            if low_cmd_publisher is not None and crc is not None:
+                print("[INFO] Sending damping command before exit (kp=0, kd=3, tau=0 on all joints).")
+                damp_cmd = init_low_cmd(cfg)
+                for sdk_i in range(12):
+                    damp_cmd.motor_cmd[sdk_i].q = 0.0
+                    damp_cmd.motor_cmd[sdk_i].kp = 0.0
+                    damp_cmd.motor_cmd[sdk_i].kd = HOLD_DAMPING_KD
+                damp_cmd.crc = crc.Crc(damp_cmd)
+                # Repeated for ~0.5 s rather than sent once: a single dropped frame must not leave the robot
+                # without its damping command, and what the robot does when LowCmd simply stops is unverified.
+                for _ in range(100):
+                    low_cmd_publisher.Write(damp_cmd)
+                    time.sleep(0.005)
+            # LowState link-health summary -- most useful over WiFi, where a p95/max gap approaching the
+            # link-loss threshold is the early warning that the link margin is too thin.
+            gs = state.gap_stats()
+            if gs["count"] > 0:
+                print(
+                    f"[LINK] LowState gaps over {gs['count']} msgs: max {gs['max_s'] * 1000:.0f} ms, "
+                    f"p95 {gs['p95_s'] * 1000:.0f} ms (link-loss threshold {cfg.link_lost_after_s * 1000:.0f} ms)"
+                    + ("  [sample buffer capped]" if gs["capped"] else "")
+                )
+            if policy_trace and live_plot_dir is not None:
+                try:
+                    import numpy as np
+
+                    cols = ("step", "t", "obs", "raw_action", "sent_target", "kp", "n_slew_clipped", "n_tethered",
+                            "tau_est", "joint_vel", "foot_force", "quat_wxyz", "gyro")
+                    np.savez_compressed(
+                        os.path.join(live_plot_dir, "policy_trace.npz"),
+                        **{c: np.array([row[i] for row in policy_trace]) for i, c in enumerate(cols)},
+                        joint_order=np.array(cfg.isaac_joint_order),
+                    )
+                    print(f"[INFO] Policy trace ({len(policy_trace)} ticks) saved to {live_plot_dir}/policy_trace.npz")
+                except Exception as e:  # noqa: BLE001 -- diagnostics must never mask the real exit path
+                    print(f"[WARN] could not save policy_trace.npz: {e!r}")
+
+
+if __name__ == "__main__":
+    main()
