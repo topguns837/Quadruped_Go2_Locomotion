@@ -3,25 +3,42 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+# Enable once per clone:   pip install pre-commit && pre-commit install      (see CLAUDE.md "Code Style")
+# Run on everything:       pre-commit run --all-files
+#
+# What this enforces: lint (no auto-format), whitespace/EOF hygiene, valid YAML/TOML, no merge-conflict markers,
+# no debug statements, no large accidental files, no secrets (hostapd.conf / relay.key / passphrases) and spelling.
+# Hooks only look at *staged* files, so old files are untouched until you commit them.
+# (The template's insert-license hook is intentionally not used: it adds a second header to files whose header year
+# differs, e.g. 2022-2025 vs 2022-2026.)
+
+# Never touch fetched, generated or historical files.
+exclude: ^(logs/|src/sim2sim/mujoco/|docs/archive/|models/[^/]+/params/)|\.(usd|usda|usdz)$
+
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.10
     hooks:
-      # Run the linter
-      - id: ruff
+      # Lint only (safe auto-fixes). ruff-format is deliberately NOT enabled: it would rewrite ~70 files,
+      # including the hardware deploy code. Rules live in pyproject.toml [tool.ruff].
+      - id: ruff-check
         args: ["--fix"]
-      # Run the formatter
-      - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: check-symlinks
       - id: destroyed-symlinks
+      # Big accidental files (traces, logs, intermediate checkpoints) are rejected; the intentional binaries --
+      # curated models and the robot USD assets -- are exempt by path.
       - id: check-added-large-files
-        args: ["--maxkb=2000"]  # restrict files more than 2 MB. Should use git-lfs instead.
+        args: ["--maxkb=8000"]
+        # Curated models (final checkpoint + exports) may exceed the limit; a .pt/.onnx anywhere else may not.
+        exclude: ^models/[^/]+/(model_[0-9]+\.pt|exported/policy\.(pt|onnx))$
       - id: check-yaml
+        args: ["--allow-multiple-documents"]
       - id: check-merge-conflict
+        args: ["--assume-in-merge"]  # catch stray <<<<<<< markers on ordinary commits too
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-toml
@@ -34,38 +51,19 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies:
-        - tomli
-        exclude: "CONTRIBUTORS.md|docs/source/setup/walkthrough/concepts_env_design.rst"
-  # FIXME: Figure out why this is getting stuck under VPN.
-  # - repo: https://github.com/RobertCraigie/pyright-python
-  #   rev: v1.1.315
-  #   hooks:
-  #   - id: pyright
-  - repo: https://github.com/Lucas-C/pre-commit-hooks
-    rev: v1.5.5
+          - tomli
+  - repo: local
     hooks:
-      - id: insert-license
-        files: \.(py|ya?ml)$
-        args:
-          # - --remove-header    # Remove existing license headers. Useful when updating license.
-          - --license-filepath
-          - .github/LICENSE_HEADER.txt
-          - --use-current-year
-        exclude: "source/isaaclab_mimic/|scripts/imitation_learning/isaaclab_mimic/"
-  # Apache 2.0 license for mimic files
-  - repo: https://github.com/Lucas-C/pre-commit-hooks
-    rev: v1.5.5
-    hooks:
-      - id: insert-license
-        files: ^(source/isaaclab_mimic|scripts/imitation_learning/isaaclab_mimic)/.*\.py$
-        args:
-          # - --remove-header    # Remove existing license headers. Useful when updating license.
-          - --license-filepath
-          - .github/LICENSE_HEADER_MIMIC.txt
-          - --use-current-year
-  - repo: https://github.com/pre-commit/pygrep-hooks
-    rev: v1.10.0
-    hooks:
-      - id: rst-backticks
-      - id: rst-directive-colons
-      - id: rst-inline-touching-normal
+      # The AP passphrase (hostapd.conf) and the relay key must never reach git. .gitignore only stops a plain
+      # `git add`; this refuses them even if force-added. hostapd_open.conf is the secret-free template and is allowed.
+      - id: no-secrets
+        name: block secrets (hostapd.conf, relay.key, *.secret, wpa_passphrase)
+        language: pygrep
+        entry: '(wpa_passphrase\s*=\s*\S)|(BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY)'
+        types: [text]
+        exclude: ^(\.pre-commit-config\.yaml|src/deploy/wireless/README\.md|CLAUDE\.md)$
+      - id: no-secret-files
+        name: block secret file names
+        language: fail
+        entry: Secret file staged -- remove it (it belongs only on the machine that uses it).
+        files: (^|/)(hostapd\.conf|relay\.key|[^/]*\.secret)$

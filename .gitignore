@@ -18,7 +18,7 @@
 # position) has no other distribution mechanism today -- unlike most USD assets here, it's not pulled from
 # Nucleus at runtime, so unitree_go2witharm_cfg.py can't load the robot at all without this file present.
 # Single-file exception, not a blanket unblock -- every other USD file in the repo stays ignored.
-!/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd
+!/src/env/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd
 
 # Second deliberate exception, for the same reason: go2withOpenXstatic.usd carries a PAYLOAD to
 # '../openManipulator/open_manipulator_x_static.usd' -- note the `.usd` extension. Only the `.usda` sibling was
@@ -27,7 +27,7 @@
 # sensor with "could not find any bodies with contact reporter API". The file below is ASCII-identical to
 # open_manipulator_x_static.usda; USD's `.usd` extension auto-detects ASCII vs crate, so one file satisfies the
 # payload. Keep the two in sync, or repoint the payload inside go2withOpenXstatic.usd at the `.usda` instead.
-!/source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/openManipulator/open_manipulator_x_static.usd
+!/src/env/quadruped_go2_locomotion/resources/openManipulator/open_manipulator_x_static.usd
 
 # Python
 .DS_Store
@@ -90,8 +90,7 @@ _build
 # Teleop Recorded Dataset
 /datasets/
 
-# Tests
-tests/
+# Tests live next to the code they test (src/<stage>/tests/) and ARE tracked; only caches are ignored (see above).
 
 # Docker history
 .isaac-lab-docker-history
@@ -100,12 +99,12 @@ tests/
 **/tactile_record/*
 **/gelsight_r15_data/*
 
-# sim2sim: Menagerie Go2 model, fetched by sim2sim/fetch_go2_model.sh
-sim2sim/mujoco/menagerie/
+# sim2sim: Menagerie Go2 model, fetched by src/sim2sim/fetch_go2_model.sh
+src/sim2sim/mujoco/menagerie/
 
 # Wireless relay shared secret (never commit)
-deploy/relay.key
+src/deploy/relay.key
 
 # AP hostapd config holds the wpa_passphrase (never commit)
-deploy/wireless/hostapd.conf
-deploy/wireless/*.secret
+src/deploy/wireless/hostapd.conf
+src/deploy/wireless/*.secret
