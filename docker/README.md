@@ -46,9 +46,9 @@ rebuild. Only restarting the container does.
 ### The go2withArm USD asset
 
 The robot asset is **committed** to this repo, at
-`source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd`
+`src/env/quadruped_go2_locomotion/resources/go2withArm/go2withOpenXstatic.usd`
 (note the lowercase "s" and the `.usd` extension). Nothing needs generating:
-`.gitignore` carries a deliberate exception for it, and `unitree_go2witharm_cfg.py`
+`.gitignore` carries a deliberate exception for it, and `robot_cfg.py`
 loads it directly. Every policy in `models/` was trained on this exact file.
 
 This asset mounts the OpenManipulator-X on the Go2's **head**, at
@@ -69,7 +69,7 @@ Two files it depends on, both also committed:
   (`omniverse-content-production.s3-us-west-2.amazonaws.com/.../Go2/go2/configuration.usd`).
   First load therefore needs network access or a warm Isaac cache.
 
-`scripts/compose_go2_with_arm.py` is kept as a **reference only** and writes to
+`src/env/tools/compose_go2_with_arm.py` is kept as a **reference only** and writes to
 `go2_with_arm_regenerated.usda`. It documents the composition steps and the PhysX
 constraints they work around (the arm must be a *sibling* of `base`, not nested
 inside it -- Isaac Lab's `activate_contact_sensors` never recurses past a rigid
@@ -80,7 +80,7 @@ point). Do not point the config at its output.
 > **Note:** running that script, or anything else, inside the container creates
 > files owned by `root`, since the container runs as root against the bind mount.
 > That can leave directories under `resources/` unwritable from the host. Fix with
-> `sudo chown -R "$USER:$USER" source/`.
+> `sudo chown -R "$USER:$USER" src/`.
 
 ## 2. Build the image
 
@@ -137,21 +137,23 @@ story.
 From the repo root:
 
 ```bash
-./startScript.sh
+./start.sh
 ```
 
 This shows a menu:
 
 1. **Open Isaac Lab shell**, runs `docker/isaaclab-shell.sh`: opens a tmux
-   session with three windows (`list-envs`, `train`, `play`), each with its
-   command already typed into the pane but **not executed**. Press Enter on
-   whichever one you want, or edit it first:
+   session with five windows, each with its command already typed into the
+   pane but **not executed**. Press Enter on whichever one you want, or edit
+   it first (the commands are the `*_CMD` variables in `docker/isaaclab-shell.sh`):
    ```
-   list-envs:  isaaclab -p scripts/list_envs.py
-   train:      isaaclab -p scripts/rsl_rl/train.py --task=Quadruped-Locomotion-Go2 --rendering_mode performance --num_envs 1 --livestream 2
-   play:       isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play --num_envs 1 --rendering_mode performance --livestream 2
+   list-envs:  isaaclab -p src/env/tools/list_envs.py
+   train:      bash src/training/train.sh --profile obs_stacking_with_height        # a weak GPU gets the single-phase profile with --gui --num_envs 1
+   play:       isaaclab -p src/play/play.py --task=Quadruped-Locomotion-Go2-Play --manual_commands --live_plot
+   hardware:   python.sh src/deploy/deploy_real.py --deploy_profile go2_obs_stacking --safety_profile confident --dry_run ...
+   sim2sim:    python.sh src/sim2sim/sim2sim_mujoco.py --config src/deploy/profiles/go2_obs_stacking.yaml ...
    ```
-   Switch windows with `Ctrl-b` then a number (`0`/`1`/`2`), or `Ctrl-b n`/`p`.
+   Switch windows with `Ctrl-b` then a number (`0`-`4`), or `Ctrl-b n`/`p`.
 2. **Build docker image**, runs `docker/build.sh` (`docker compose build`).
 3. **Open empty container**, runs `docker/shell.sh`: a bare tmux prompt at
    `/workspace/quadruped_go2_locomotion` (this repo, bind-mounted, with the
@@ -173,10 +175,10 @@ bind-mounted, so they survive container recreation regardless.
 `isaaclab` is a bash alias baked into the image for `$ISAACLAB_PATH/isaaclab.sh`;
 `python`/`pip` aliases point at the Isaac Sim Python env the same way. These
 aliases only exist in interactive shells. For a scripted one-off command
-against a container already started via `./startScript.sh`, use the full path:
+against a container already started via `./start.sh`, use the full path:
 
 ```bash
-docker compose exec quadruped-go2 /workspace/isaaclab/isaaclab.sh -p scripts/zero_agent.py --task=Quadruped-Locomotion-Go2
+docker compose exec quadruped-go2 /workspace/isaaclab/isaaclab.sh -p src/env/tools/zero_agent.py --task=Quadruped-Locomotion-Go2
 ```
 
 ## Notes
@@ -201,7 +203,7 @@ docker compose exec quadruped-go2 /workspace/isaaclab/isaaclab.sh -p scripts/zer
     window back (e.g. on a machine with more VRAM headroom); it's just typed
     text in the tmux pane, not a hardcoded default.
   - If it still freezes: add `--num_envs` reductions too (see
-    `quadruped_go2_locomotion_env_cfg.py`), since this is a hard VRAM
+    `env_cfg.py`), since this is a hard VRAM
     ceiling, not a bug.
   - **Recovering from a freeze without a hard power-cycle**: try switching
     to a text VT first (`Ctrl+Alt+F3` or `F4`), logging in, and running

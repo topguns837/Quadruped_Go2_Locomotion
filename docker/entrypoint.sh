@@ -9,7 +9,7 @@
 # build time) because the project source is bind-mounted, not baked in.
 set -e
 
-EXTENSION_PATH="${PROJECT_PATH}/source/quadruped_go2_locomotion"
+EXTENSION_PATH="${PROJECT_PATH}/src/env"
 READY_MARKER=/tmp/.entrypoint_ready
 
 if [ -f "${EXTENSION_PATH}/pyproject.toml" ]; then
