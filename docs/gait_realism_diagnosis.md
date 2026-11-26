@@ -12,7 +12,7 @@ retuned to bring gait coordination, foot clearance and stance height back within
 
 ## What changed in this retrain (commit `44bb1b9`, vs prior tip `8d26178`)
 
-Confirmed by `git diff 8d26178 44bb1b9` on `quadruped_go2_locomotion_env_cfg.py` and `unitree_go2witharm_cfg.py`:
+Confirmed by `git diff 8d26178 44bb1b9` on `env_cfg.py` and `robot_cfg.py`:
 
 - **Smoothness penalties hardened** in `RewardsCfg`:
   - `dof_torques_l2`  −1.0e-5 → **−3.0e-5** (×3)
@@ -21,9 +21,9 @@ Confirmed by `git diff 8d26178 44bb1b9` on `quadruped_go2_locomotion_env_cfg.py`
   - `dof_vel_l2`  **new, −1.0e-4** (direct joint-speed penalty, did not exist before)
 - **`foot_lift` reward left at weight 0.1** (unchanged, tiny) against **`foot_sliding` −1.0**.
 - **PhysX hard joint-speed clamp removed** in the earlier commit `e1ad833`
-  (`PHYSX_JOINT_SPEED_LIMIT = 500`, `unitree_go2witharm_cfg.py:30`) — real-hardware parity.
-- **kp/kd raised 25/0.5 → 40/0.8** (`unitree_go2witharm_cfg.py:95-100,110-111`) so the stance can be held
-  passively; deploy gains in `deploy/profiles/go2_locomotion.yaml` must match.
+  (`PHYSX_JOINT_SPEED_LIMIT = 500`, `robot_cfg.py:30`) — real-hardware parity.
+- **kp/kd raised 25/0.5 → 40/0.8** (`robot_cfg.py:95-100,110-111`) so the stance can be held
+  passively; deploy gains in `src/deploy/profiles/go2_locomotion.yaml` must match.
 - Added the mass/COM/push **DR curriculum** (`mdp/events.py`, `mdp/curriculums.py`).
 
 ## Evidence: the reward balance the policy actually optimized
@@ -79,7 +79,7 @@ Per-term `Episode_Reward/*` from the run's tfevents, mean over the last 30% of t
   came from a **MuJoCo-only** run. Per the parity check below, MuJoCo matches Isaac's actuator/gains/limits but
   **not** its contact solver, and uses a rigid-arm approximation, so a few cm of that could be MuJoCo contact
   behaviour rather than the Isaac policy. The droop direction is consistent with the weak-penalty mechanism,
-  but to quote an Isaac-true stance height, record one with `scripts/rsl_rl/play.py --trace_out` (it logs root
+  but to quote an Isaac-true stance height, record one with `src/play/play.py --trace_out` (it logs root
   height) and read it back.
 - kp40 lets the legs *hold* whatever posture the policy picks; it does not force the posture up. The reward,
   not the gains, chooses the low stance.
@@ -87,8 +87,8 @@ Per-term `Episode_Reward/*` from the run's tfevents, mean over the last 30% of t
 ### 2a. Does MuJoCo reproduce Isaac? (parity check — why the two claims have different confidence)
 
 Verified against the trained run's own dump (`…/2026-11-02_14-39-14/params/env.yaml`),
-`unitree_go2witharm_cfg.py`, `deploy/profiles/go2_locomotion.yaml`, `sim2sim/go2_model.py` and
-`sim2sim/sim2sim_mujoco.py`.
+`robot_cfg.py`, `src/deploy/profiles/go2_locomotion.yaml`, `src/sim2sim/go2_model.py` and
+`src/sim2sim/sim2sim_mujoco.py`.
 
 **Matches exactly (so the actuator/robot the policy drives is the same in both):** PD gains kp40/kd0.8;
 `action_scale` 0.25 with default offset; physics dt 0.005, decimation 4, control 50 Hz; **armature 0.01** (both
@@ -118,7 +118,7 @@ Isaac-side height trace before being quoted.
 
 Removing the fictitious PhysX speed clamp (`e1ad833`) stripped away the artificial "springiness" earlier
 policies learned to exploit (they produced bang-bang joint targets the clamp silently tamed; see
-`sim2sim/README.md`). Without it, Isaac, MuJoCo and hardware share the same torque-speed limits, so the gait
+`src/sim2sim/README.md`). Without it, Isaac, MuJoCo and hardware share the same torque-speed limits, so the gait
 the policy settles into under the hardened smoothness penalties is a genuine low-energy gait — which is why it
 reads as realistic in both sims and is expected to match the robot.
 
@@ -135,21 +135,21 @@ clearance and stance height within limits together:
 - **Gait coordination:** `gait_coordination` (+0.51) is nearly cancelled by the −0.59 smoothness pressure;
   re-weight so the trot shaping is not swamped.
 - Any retune is a **from-scratch 18k run** (the action→torque mapping is tied to kp40 and these weights), with
-  the mem guard (`scripts/train_mem_guard.sh`) alongside, then re-checked in both engines.
+  the mem guard (`src/training/train_mem_guard.sh`) alongside, then re-checked in both engines.
 
 ## How to reproduce these findings (all read-only)
 
-1. **Config diff:** `git diff 8d26178 44bb1b9 -- …/quadruped_go2_locomotion_env_cfg.py`; read `unitree_go2witharm_cfg.py`.
+1. **Config diff:** `git diff 8d26178 44bb1b9 -- …/env_cfg.py`; read `robot_cfg.py`.
 2. **Reward balance:** `EventAccumulator` over the run's tfevents, mean of each `Episode_Reward/*` over the last
    30% of steps. Run via the container's `/workspace/isaaclab/_isaac_sim/python.sh`.
 3. **Height reconciliation:** read `base_height_l2_pitch` (`mdp/rewards.py:82`) against the sim2sim per-segment
    height column.
-4. **MuJoCo↔Isaac parity:** cross-read `params/env.yaml`, `unitree_go2witharm_cfg.py`,
-   `deploy/profiles/go2_locomotion.yaml`, `sim2sim/go2_model.py`, `sim2sim/sim2sim_mujoco.py` (see §2a).
-5. **Behaviour cross-check:** `sim2sim/sim2sim_mujoco.py --headless --scenario sim2sim/scenarios/basic.yaml
+4. **MuJoCo↔Isaac parity:** cross-read `params/env.yaml`, `robot_cfg.py`,
+   `src/deploy/profiles/go2_locomotion.yaml`, `src/sim2sim/go2_model.py`, `src/sim2sim/sim2sim_mujoco.py` (see §2a).
+5. **Behaviour cross-check:** `src/sim2sim/sim2sim_mujoco.py --headless --scenario src/sim2sim/scenarios/basic.yaml
    --policy …/2026-11-03_22-14-59/exported/policy.pt` shows the low stance (0.05–0.12 m, MuJoCo) and 0 falls.
-   For the Isaac-true stance height, `scripts/rsl_rl/play.py --trace_out …` then read the root-height channel;
-   `sim2sim/compare_traces.py` quantifies per-foot clearance and joint-target offsets across the two engines.
+   For the Isaac-true stance height, `src/play/play.py --trace_out …` then read the root-height channel;
+   `src/sim2sim/compare_traces.py` quantifies per-foot clearance and joint-target offsets across the two engines.
 
 ## Correction (2026-11-04, after the hardware run)
 

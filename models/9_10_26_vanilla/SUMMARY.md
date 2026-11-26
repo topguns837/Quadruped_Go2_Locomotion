@@ -1,6 +1,6 @@
 # 9_10_26_vanilla_corrected_arm_mounting
 
-**Training profile:** No training-profile file — this run predates the `training_profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
+**Training profile:** No training-profile file — this run predates the `src/training/profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
 
 **What this is:** baseline policy, original reward weights, trained from scratch on the **corrected**
 Go2 + OpenManipulatorX asset (`go2withOpenXstatic.usd`, arm USD offset/orientation fixed — unlike the

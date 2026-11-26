@@ -27,11 +27,11 @@ Project description: Isaac Lab task for Unitree Go2 locomotion with extended pit
 
 Relevant files:
 
-- `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py`
-- `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py`
-- `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/__init__.py`
-- `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/agents/rsl_rl_ppo_cfg.py`
-- `scripts/rsl_rl/train.py`
+- `src/env/quadruped_go2_locomotion/env_cfg.py`
+- `src/env/quadruped_go2_locomotion/mdp/rewards.py`
+- `src/env/quadruped_go2_locomotion/mdp/__init__.py`
+- `src/env/quadruped_go2_locomotion/agents/rsl_rl_ppo_cfg.py`
+- `src/training/train.py`
 
 ---
 
@@ -1045,7 +1045,7 @@ Use the project's existing export style.
 
 ---
 
-# 29. File: `quadruped_go2_locomotion_env_cfg.py`
+# 29. File: `env_cfg.py`
 
 Add new `RewTerm`s.
 
@@ -1778,19 +1778,19 @@ The robot is still free to discover the detailed joint trajectories required to 
    `https://github.com/SMEAC/Quadruped_Go2_Locomotion`
 
 2. Project environment configuration:
-   `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py`
+   `src/env/quadruped_go2_locomotion/env_cfg.py`
 
 3. Project reward implementation:
-   `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py`
+   `src/env/quadruped_go2_locomotion/mdp/rewards.py`
 
 4. Project MDP exports:
-   `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/__init__.py`
+   `src/env/quadruped_go2_locomotion/mdp/__init__.py`
 
 5. Project PPO configuration:
-   `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/agents/rsl_rl_ppo_cfg.py`
+   `src/env/quadruped_go2_locomotion/agents/rsl_rl_ppo_cfg.py`
 
 6. Project training script:
-   `scripts/rsl_rl/train.py`
+   `src/training/train.py`
 
 7. Literature precedent for explicit foot-clearance and locomotion reward shaping:
    Scientific Reports, "Learning-based quadrupedal locomotion..." and related quadruped RL literature.

@@ -21,13 +21,13 @@ H is a hyperparameter; choose it by covering the physics you need, then sweep:
   ~5–8 frames. Legged-gym / Go2 sim-to-real work uses either 1 (rely on velocity terms) or a 5–10 frame history for
   history-based system-id; the reference's 6 sits in that band.
 - **Decide empirically.** Pick a principled default, sweep a few values (e.g. {1, 5, 6}) for a few k iters each, and
-  compare on the existing random-command sim2sim eval (`sim2sim/run_random_eval.sh`: tracking RMS + falls), ideally
+  compare on the existing random-command sim2sim eval (`src/sim2sim/run_sim2sim_eval.sh`: tracking RMS + falls), ideally
   confirmed on hardware. Pick the **smallest** H that captures the gain — cheaper and less overfit.
 
 ## Changes made
 
 ### Training
-- `source/.../quadruped_go2_locomotion_env_cfg.py`
+- `source/.../env_cfg.py`
   - New module constant `HISTORY_LENGTH = 6`.
   - `PolicyCfg.__post_init__` and `CriticCfg.__post_init__`: set `self.history_length = HISTORY_LENGTH` and
     `self.flatten_history_dim = True`. Isaac Lab's `ObservationManager` maintains the per-env ring buffer and clears
@@ -36,7 +36,7 @@ H is a hyperparameter; choose it by covering the physics you need, then sweep:
   - `experiment_name = "go2_kp40_iter5_hist6"`. `empirical_normalization=True` and hidden dims `[256,512,128]`
     unchanged (normalises the full 282/300 vector transparently).
 
-### Deploy mirror (`deploy/deploy_real.py`)
+### Deploy mirror (`src/deploy/deploy_real.py`)
 - `DeployConfig.history_length` (default 1), read from the YAML config in `load_config`.
 - `policy_obs_layout(policy, history_length)`: reads the net's first Linear input (the STACKED width, e.g. 282),
   asserts it divides by `history_length`, and that the per-frame dim (47) is a known layout.
@@ -44,15 +44,15 @@ H is a hyperparameter; choose it by covering the physics you need, then sweep:
 - `ObsHistory`: per-step ring buffer, startup-padded by repeating the first frame H times (mirrors Isaac Lab's
   CircularBuffer reset fill), outputs the stacked vector in the layout set by two flags (see below).
 - Main loop: build the single 47-dim frame as before, then `obs = obs_history.push_and_stack(frame)`.
-- `deploy/deploy_real_wireless.py`: same wiring (and it now correctly sets `include_base_lin_vel`, which it
+- `src/deploy/deploy_real_wireless.py`: same wiring (and it now correctly sets `include_base_lin_vel`, which it
   previously left at the `True` default — already wrong for 47-dim policies).
 
-### sim2sim mirror (`sim2sim/sim2sim_mujoco.py`)
+### sim2sim mirror (`src/sim2sim/sim2sim_mujoco.py`)
 - `--history_length` CLI (default: config's `history_length`, else 1).
 - `load_policy(path, history_length)` returns the per-frame base dim; the loop stacks via `deploy_real.ObsHistory`
   and resets it (and the obs-delay buffer) on a fall. Frame **delay** (`--obs_delay`, which frame) and frame
   **history** (stack the last H) are orthogonal and compose.
-- `sim2sim/compare_traces.py`: `newest_frame()` reduces a stacked trace to its newest single frame (term-major
+- `src/sim2sim/compare_traces.py`: `newest_frame()` reduces a stacked trace to its newest single frame (term-major
   aware) so per-term stats don't mis-slice or crash on the 282-dim width.
 
 ## THE LAYOUT RISK — must verify in the container before trusting it
@@ -68,7 +68,7 @@ are wrong, the policy sees scrambled history on hardware.
 
 **Gate before training/deploy:** run the auto-discovery check in the container, from the repo root:
 
-    ../IsaacLab/isaaclab.sh -p scripts/verify_obs_stacking.py --task Quadruped-Locomotion-Go2-Play \
+    ../IsaacLab/isaaclab.sh -p src/play/verify_obs_stacking.py --task Quadruped-Locomotion-Go2-Play \
         --num_envs 1 --history_length 6 --steps 20 --headless
 
 It runs the real env twice (H=1 and H=6, same seed, zero actions, deterministic reset), rebuilds the stacked vector
@@ -87,7 +87,7 @@ flag values to set.
 - `ObsHistory` padding/ordering correct; the four layout combos are distinguishable (auto-discovery is sound).
 
 ## Not yet done
-- Container run of `scripts/verify_obs_stacking.py` (the layout gate).
+- Container run of `src/play/verify_obs_stacking.py` (the layout gate).
 - Training smoke test showing actor input = 282 / critic = 300 and a `policy.pt` export of width 282.
 - `sim2sim_mujoco.py --history_length 6` zero-mismatch check against a short Isaac trace.
 - Nothing committed.
@@ -104,7 +104,7 @@ The real robot shook with a ~24.9 Hz every-tick ("Nyquist") oscillation. Investi
   went −0.70 → **+0.40**, near-Nyquist power 2% → **0%**, body gyro RMS 0.187 → **0.135 (−28%)**, joint-vel RMS
   0.322 → **0.192 (−40%)** — and the filtered run used *more* aggressive commands. Mechanism: the smoothed sent
   target feeds back as `last_action`, so the policy's own feedback is clean and the amplification loop breaks at the
-  source (the filter is in `deploy/deploy_real.py` `--low_pass`, default 5 Hz; validated by
+  source (the filter is in `src/deploy/deploy_real.py` `--low_pass`, default 5 Hz; validated by
   `sim2sim_mujoco.py --action_lpf_hz`).
 - **Bearing on this retrain:** observation stacking (H=6) + a smaller joint-velocity obs noise is the *root* fix (the
   LPF is a deploy band-aid that masks it). In sim, lowering joint_vel noise reduced the buzz AND improved tracking —
@@ -121,12 +121,12 @@ kp≈50 / kd≈1.0** so sim, MuJoCo and the real robot agree, and **widen the PD
 (currently ×0.9–1.1 of kp40/kd0.8 = kd 0.72–0.88, which does not even cover 1.0) so a kd≈1.0 deploy is in-distribution.
 
 ## Files touched
-- `source/.../quadruped_go2_locomotion_env_cfg.py`
+- `source/.../env_cfg.py`
 - `source/.../agents/rsl_rl_ppo_cfg.py`
-- `deploy/deploy_real.py`, `deploy/deploy_real_wireless.py`
-- `sim2sim/sim2sim_mujoco.py`, `sim2sim/compare_traces.py`
-- `scripts/verify_obs_stacking.py` (new)
+- `src/deploy/deploy_real.py`, `src/deploy/deploy_real_wireless.py`
+- `src/sim2sim/sim2sim_mujoco.py`, `src/sim2sim/compare_traces.py`
+- `src/play/verify_obs_stacking.py` (new)
 - `CLAUDE.md` (Observations bullet updated)
-- Buzz investigation (separate, deploy-side): `deploy/deploy_real.py` (`--low_pass`), `docker/isaaclab-shell.sh`
-  (tmux default), `sim2sim/sim2sim_mujoco.py` (`--obs_noise`/`--jv_noise_scale`/`--action_lpf_hz`/`--kp`/`--kd`),
-  `sim2sim/analyze_hw_trace.py`, `sim2sim/scenario_from_trace.py` (new); traces in `logs/buzz_repro/`.
+- Buzz investigation (separate, deploy-side): `src/deploy/deploy_real.py` (`--low_pass`), `docker/isaaclab-shell.sh`
+  (tmux default), `src/sim2sim/sim2sim_mujoco.py` (`--obs_noise`/`--jv_noise_scale`/`--action_lpf_hz`/`--kp`/`--kd`),
+  `src/sim2sim/analyze_hw_trace.py`, `src/sim2sim/scenario_from_trace.py` (new); traces in `logs/buzz_repro/`.

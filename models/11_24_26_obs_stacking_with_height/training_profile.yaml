@@ -8,24 +8,29 @@
 #   - yaw (ang_vel_z) reward rebalance: track_ang_vel_z_exp/broad raised 1.6/0.8 -> 3.2/1.6 and the deficit penalty
 #     -0.5 -> -1.0. sim2sim random eval of the kp40 policy (logs/sim2sim_eval_24999/random/report.md) showed yaw RMS
 #     0.195 rad/s vs ~0.049 for lin_xy -- yaw carried ~5x less reward pressure than linear (2.9 vs ~14 units) and
-#     under-rotated on the hardest segments. Re-measure with sim2sim/run_random_eval.sh after training.
+#     under-rotated on the hardest segments. Re-measure with src/sim2sim/run_sim2sim_eval.sh after training.
 # Phase 1 forms a stable gait under mild disturbance; phase 2 re-ramps difficulty with full realistic magnitudes.
 #
 # This file is a COMPLETE, self-contained snapshot: the top-level `overrides` lists EVERY tunable value (even the
 # ones equal to the Python default), so the whole training config is auditable here without cross-referencing the
 # code. Each phase lists only what it CHANGES from that baseline. Effective config of a phase = baseline + phase.
-#   bash scripts/train_phased.sh --profile obs_stacking_with_height            # real run (headless)
-#   bash scripts/train_phased.sh --profile obs_stacking_with_height --dry_run  # print the per-phase commands only
+#   bash src/training/train.sh --profile obs_stacking_with_height            # real run (headless)
+#   bash src/training/train.sh --profile obs_stacking_with_height --dry_run  # print the per-phase commands only
 #
 # ---------------------------------------------------------------------------------------------------------------
 # FIXED IN CODE -- recorded here for completeness; NOT overridable in a profile (baked into the actuator / network
 # at class-definition time, or changing them would desync deploy or break resume):
-#   kp = 50.0, kd = 1.0                      (unitree_go2witharm_cfg.py DCMotorCfg; deploy must match)
+#   kp = 50.0, kd = 1.0                      (robot_cfg.py DCMotorCfg; deploy must match)
 #   JOINT_ARMATURE (nominal) = 0.01          (the DR band below scales THIS)
 #   PHYSX_JOINT_SPEED_LIMIT = 500            (hard joint-speed clamp disabled for hardware parity)
 #   observation history_length = 6           (ObservationsCfg; actor 48x6=288, critic 51x6=306)
 #   actor/critic hidden dims = [256,512,128], activation = elu, num_steps_per_env = 24
 # ---------------------------------------------------------------------------------------------------------------
+
+# How many training phases this profile runs. It must equal the number of entries under `phases:` below
+# (1 = a single-phase run; a profile with `num_phases: 4` needs four phase entries). `train.sh --num_phases K`
+# runs only the first K of them.
+num_phases: 2
 
 experiment_name: go2_obs_stacking_with_height
 run_dir: run_obs_stacking_with_height
@@ -33,7 +38,7 @@ task: Quadruped-Locomotion-Go2
 num_envs: 2048
 seed: null
 
-# Live graphs while training: train_batched.sh (re)starts scripts/live_dashboard.py at the start of every batch and
+# Live graphs while training: train_batched.sh (re)starts src/common/live_dashboard.py at the start of every batch and
 # opens feh on its PNG -- no separate tmux dashboard / viewer panes needed. CLI: --no_dashboard, --no_viewer,
 # --dashboard_output PATH override these per run.
 dashboard: true                       # run the live dashboard (writes a PNG every ~0.5 s)

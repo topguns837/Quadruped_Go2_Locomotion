@@ -1,9 +1,9 @@
 # 9_13_26_round3_pitch_lean_height_weights
 
-**Training profile:** No training-profile file — this run predates the `training_profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
+**Training profile:** No training-profile file — this run predates the `src/training/profiles/` system. Authoritative recipe: `params/env.yaml` + `params/agent.yaml` (full auto-generated config dump).
 
 **What this is:** the Round 3 reward-engineering experiment (see `docs/go2_round2_reward_engineering_plan.md`
-and `patches/round3_weights_and_height.patch`), trained on the corrected Go2 + OpenManipulatorX asset.
+and `docs/archive/round3_weights_and_height.patch`), trained on the corrected Go2 + OpenManipulatorX asset.
 Adds a `base_height` (root world-Z) observation term on top of the vanilla baseline's observation space
 (9 obs terms vs. vanilla's 8 — **not** checkpoint-compatible with vanilla runs), a `gait_diagonal_coordination`
 reward for trot-like diagonal foot sync, a raised `foot_lift` `min_height` (0.05m → 0.10m), and bumped
@@ -47,22 +47,22 @@ final word on this reward configuration's ceiling.
 this one — you must apply the patch first:
 
 ```bash
-git apply patches/round3_weights_and_height.patch
-isaaclab -p scripts/rsl_rl/play.py --task=Quadruped-Locomotion-Go2-Play --num_envs 1 \
+git apply docs/archive/round3_weights_and_height.patch
+isaaclab -p src/play/play.py --task=Quadruped-Locomotion-Go2-Play --num_envs 1 \
   --checkpoint models/9_13_26_pitch_lean_height_weights_experimental/model_17999.pt
-git apply -R patches/round3_weights_and_height.patch   # restore the vanilla-playable default afterward
+git apply -R docs/archive/round3_weights_and_height.patch   # restore the vanilla-playable default afterward
 ```
 
 Playing `models/9_10_26_vanilla/model_9999.pt` needs no patch — it matches the default committed state.
 
-**Update, post-retrain-prep fixes:** `patches/round3_weights_and_height.patch` no longer applies cleanly --
+**Update, post-retrain-prep fixes:** `docs/archive/round3_weights_and_height.patch` no longer applies cleanly --
 its height-command/`base_height`-observation hunks conflict with the current `mdp/commands.py` and
-`quadruped_go2_locomotion_env_cfg.py`, which have since dropped the height command and observation entirely
+`env_cfg.py`, which have since dropped the height command and observation entirely
 (no reliable way to measure height on real hardware; height is now training-reward-only, see
 `mdp/commands.py`'s module docstring). Both this checkpoint and `models/9_10_26_vanilla` are also stale for
 an unrelated reason: they were trained against a 23.5 Nm calf limit the real Go2 does not have (its calf has
 a 1.9169:1 knee reduction, 45.43 Nm) and a 2.0 kg imu/radar phantom mass that has since been fixed -- see
-`sim2sim/README.md` for the measurements. The patch, and this run, are kept only as a historical record of
+`src/sim2sim/README.md` for the measurements. The patch, and this run, are kept only as a historical record of
 the Round 3 reward-weight experiment; do not apply the patch or resume from this checkpoint.
 
 ## Metrics

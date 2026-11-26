@@ -5,7 +5,7 @@ as the obs-stacking *candidate* — it fixes the buzz at the source (6-frame his
 of the deploy `--low_pass` band-aid, and improves yaw tracking — but it has **open regressions** (see Caveats). Not
 ready for hardware.
 
-- Training profile: `training_profiles/obs_stacking_with_height.yaml` (frozen snapshot: `training_profile.yaml` in this dir); resolved config in `params/env.yaml` + `params/agent.yaml`.
+- Training profile: `src/training/profiles/obs_stacking_with_height.yaml` (frozen snapshot: `training_profile.yaml` in this dir); resolved config in `params/env.yaml` + `params/agent.yaml`.
 - Source run: `logs/rsl_rl/go2_obs_stacking_with_height/run_obs_stacking_with_height`, `model_24999.pt` (final
   checkpoint of the 25k-iteration phased batched run: phase-1 "clean" 10k → phase-2 "realistic" 15k).
 - Observation: **48-dim per frame**, **6-wide command** (lin_x, lin_y, ang_z, pitch, lean, **height**), **6-frame
@@ -20,7 +20,7 @@ ready for hardware.
   `track_ang_vel_deficit` −0.5→−1.0); phased clean→realistic schedule. See `docs/obs_stacking_with_height_changes.md`.
 - Config dump: `params/env.yaml`, `params/agent.yaml`. Export: `exported/policy.pt` (JIT, 288-dim in / 12 out) +
   `exported/policy.onnx`.
-- Deploy: `deploy/profiles/go2_obs_stacking.yaml` (kp50/kd1.0, `history_length: 6`, `joint_vel_filter_hz: 10.0`).
+- Deploy: `src/deploy/profiles/go2_obs_stacking.yaml` (kp50/kd1.0, `history_length: 6`, `joint_vel_filter_hz: 10.0`).
   Its `policy_path` is **not yet repointed** to this export — hardware isn't ready (see Caveats).
 
 ## Metrics
@@ -30,7 +30,7 @@ differ (e.g. the yaw-term weight changed 1.6→3.2 vs iter4).
 
 ### 1. Sim2sim (nominal physics, Isaac vs MuJoCo)
 
-`bash sim2sim/run_random_eval.sh --checkpoint model_24999.pt --config deploy/profiles/go2_obs_stacking.yaml`
+`bash src/sim2sim/run_sim2sim_eval.sh --checkpoint model_24999.pt --config src/deploy/profiles/go2_obs_stacking.yaml`
 — 3 seeds × 20 segments (60 segments, 240 s/sim), pooled RMS. Source:
 `logs/sim2sim_eval_obs_stacking_24999/random/report.md`.
 
@@ -89,5 +89,5 @@ Filled after a hardware session; quantitative tracking is not captured on hardwa
 - **Height command saturates:** in a MuJoCo height sweep the robot reached 0.28–0.33 m targets (err ≤0.04 m) but
   sat near ~0.30 m when commanded 0.38 m (err 0.07–0.10 m). Commands work downward, not upward.
 - **Falls:** 1 fall segment in each sim (iter4 had 0/0); the MuJoCo one reset 4× on one hard command.
-- **Layout-parity check not passed:** `scripts/verify_obs_stacking.py` hung and was killed — the deploy
+- **Layout-parity check not passed:** `src/play/verify_obs_stacking.py` hung and was killed — the deploy
   `ObsHistory` layout flags are not yet confirmed against the real env. This is a hard gate before any hardware use.

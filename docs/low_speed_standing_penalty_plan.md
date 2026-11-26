@@ -56,11 +56,11 @@ Not chosen:
 
 ## Files to change
 
-- `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/mdp/rewards.py`:
+- `src/env/quadruped_go2_locomotion/mdp/rewards.py`:
   add `standing_when_commanded` (same pattern as `track_lin_vel_deficit`, logged via `diagnostics.log_step`);
   remove `track_lin_vel_deficit`.
 - `.../mdp/__init__.py`: swap the export.
-- `.../quadruped_go2_locomotion_env_cfg.py` (`RewardsCfg`): replace the `track_lin_vel_deficit` term with
+- `.../env_cfg.py` (`RewardsCfg`): replace the `track_lin_vel_deficit` term with
   `standing_when_commanded`, weight chosen by calibration, with a comment explaining scale-free and two-sided.
 
 ## Verification
@@ -77,7 +77,7 @@ Not chosen:
    0.5 / 0.8 near 0 (like main and A, not B's 27 / 57), training mean reward and arm-contact fraction no worse than
    main (about 226 and 0.21).
 4. Only if a weight passes: commit the iteration-2 changes (stage `rsl_rl_ppo_cfg.py` by hunk; keep the stairs WIP
-   and `deploy/wireless/hostapd.conf` out), then launch the 18k run. If neither weight passes, fall back to
+   and `src/deploy/wireless/hostapd.conf` out), then launch the 18k run. If neither weight passes, fall back to
    ablation C or the earlier no-deficit config.
 
 ## Results (2026-11-04, 400 iterations, one seed each)

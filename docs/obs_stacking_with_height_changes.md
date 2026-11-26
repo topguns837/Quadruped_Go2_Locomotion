@@ -5,7 +5,7 @@ Written for: whoever reviews or runs this retrain.
 - **Previous iteration (trained & deployed):** `go2_kp40_iter4_realistic` — `models/11_18_26_iter4_realistic/`
   (`model_24999`). Single-frame observation, kp/kd 40/0.8, 5-dim command (no height).
 - **Going-to-be iteration:** `go2_obs_stacking_with_height` — profile
-  `training_profiles/obs_stacking_with_height.yaml`, run dir `run_obs_stacking_with_height`. 6-frame observation
+  `src/training/profiles/obs_stacking_with_height.yaml`, run dir `run_obs_stacking_with_height`. 6-frame observation
   history, kp/kd 50/1.0, 6-dim command (height re-added), yaw reward rebalance. **Trains from scratch** (the actor
   input dim changes, so it cannot resume a kp40 checkpoint).
 
@@ -13,10 +13,10 @@ Source of truth: a diff of the two resolved `params/env.yaml` + `params/agent.ya
 config. Everything not listed under "Changed" is **carried over unchanged** from `iter4_realistic` (see the bottom).
 
 Short paths below:
-- `env_cfg.py` = `source/quadruped_go2_locomotion/quadruped_go2_locomotion/tasks/manager_based/quadruped_go2_locomotion/quadruped_go2_locomotion_env_cfg.py`
-- `robot_cfg.py` = `.../manager_based/quadruped_go2_locomotion/unitree_go2witharm_cfg.py`
+- `env_cfg.py` = `src/env/quadruped_go2_locomotion/env_cfg.py`
+- `robot_cfg.py` = `.../manager_based/quadruped_go2_locomotion/robot_cfg.py`
 - `ppo_cfg.py` = `.../manager_based/quadruped_go2_locomotion/agents/rsl_rl_ppo_cfg.py`
-- `profile` = `training_profiles/obs_stacking_with_height.yaml`
+- `profile` = `src/training/profiles/obs_stacking_with_height.yaml`
 
 ## Changed parameters
 
@@ -43,7 +43,7 @@ These were needed for the phased pipeline to run at all in the container; found 
 
 | Parameter / code | File | Change | Why |
 |---|---|---|---|
-| Interpreter for `train_profile.py` | `scripts/train_phased.sh` | bare `python3` → prefer a yaml-capable `python3`, else the Isaac bundled Python (`TRAIN_PROFILE_PYTHON` to override) | The container's `/usr/bin/python3` has no PyYAML (it ships only in Isaac's Python); the wrapper crashed on `import yaml`. |
+| Interpreter for `train_profile.py` | `src/training/train.sh` | bare `python3` → prefer a yaml-capable `python3`, else the Isaac bundled Python (`TRAIN_PROFILE_PYTHON` to override) | The container's `/usr/bin/python3` has no PyYAML (it ships only in Isaac's Python); the wrapper crashed on `import yaml`. |
 | `events.robot_mass.params.max_abs_kg` | `profile` | override key `mass_distribution_params` → `max_abs_kg` (value `2.0`, i.e. ±2 kg) | This branch's `robot_mass` uses the custom `randomize_base_mass_curriculum` (param `max_abs_kg`); the stock `mass_distribution_params` key does not exist on it → Hydra "Key not in struct". |
 | `joint_vel.params.cutoff_hz` default | `env_cfg.py` | `None` → `10.0` | Isaac Lab's Hydra config updater refuses a `None → float` type change, so a `None` default could not be overridden to 10 Hz by the profile. A float default fixes it and matches deploy. |
 
