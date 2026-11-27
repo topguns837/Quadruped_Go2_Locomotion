@@ -37,6 +37,9 @@ services:
       # source code, scripts, USD/USDA assets, and training logs/checkpoints
       # all live on the host and are picked up immediately, no rebuild needed.
       - .:/workspace/quadruped_go2_locomotion
+      # The checkout's own entrypoint, not the copy baked into the image: it must match the repo layout (it pip-installs
+      # src/env), so a layout change never needs an image rebuild to keep containers working.
+      - ./docker/entrypoint.sh:/entrypoint.sh:ro
       # X11 passthrough for the Isaac Sim GUI (run `xhost +local:docker` on
       # the host first, see docker/README.md)
       - /tmp/.X11-unix:/tmp/.X11-unix
@@ -107,6 +110,43 @@ services:
     stdin_open: true
     tty: true
 
+  # Health-check container (see src/healthcheck/README.md, started by ./healthcheck.sh only: the "testing" profile keeps
+  # it out of `docker compose up` and ./start.sh). Same image as the main service, but isolated from it: its own
+  # network namespace (default bridge, so DDS on `lo` and `pkill -f` inside it can never reach the host, the main
+  # container or a robot), no X11, and its own Kit/pip caches so two containers never write one cache.
+  # HEALTHCHECK_REPO is the tree to test (default: this checkout; ./healthcheck.sh --ref points it at a git worktree).
+  quadruped-go2-testing:
+    profiles: ["testing"]
+    image: quadruped_go2_locomotion:latest
+    container_name: quadruped_go2_locomotion_testing
+    command: ["sleep", "infinity"]
+    environment:
+      - ACCEPT_EULA=Y
+      - OMNI_KIT_ALLOW_ROOT=1
+      - TERM
+    volumes:
+      - ${HEALTHCHECK_REPO:-.}:/workspace/quadruped_go2_locomotion
+      - ${HEALTHCHECK_REPO:-.}/docker/entrypoint.sh:/entrypoint.sh:ro
+      - /etc/localtime:/etc/localtime:ro
+      - test-cache-kit:/isaac-sim/kit/cache
+      - test-cache-ov:/root/.cache/ov
+      - test-cache-pip:/root/.cache/pip
+      - test-cache-gl:/root/.cache/nvidia/GLCache
+      - test-cache-compute:/root/.nv/ComputeCache
+      - test-logs:/root/.nvidia-omniverse/logs
+      - test-data:/root/.local/share/ov/data
+    deploy:
+      resources:
+        limits:
+          memory: 48g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, graphics, compute, utility]
+    stdin_open: true
+    tty: true
+
 volumes:
   isaac-cache-kit:
   isaac-cache-ov:
@@ -115,3 +155,10 @@ volumes:
   isaac-cache-compute:
   isaac-logs:
   isaac-data:
+  test-cache-kit:
+  test-cache-ov:
+  test-cache-pip:
+  test-cache-gl:
+  test-cache-compute:
+  test-logs:
+  test-data:

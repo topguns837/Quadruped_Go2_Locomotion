@@ -1,0 +1,22 @@
+# Health-check profile (src/healthcheck/). Tiny on purpose: it proves the pipeline runs, not that a policy learns.
+# Edge: phase 2 uses a different num_envs than phase 1 (the curriculum's per-env terrain levels must survive the resume).
+num_phases: 2
+experiment_name: healthcheck_envs_change
+run_dir: run_envs_change
+task: Quadruped-Locomotion-Go2
+num_envs: 16
+seed: 3
+dashboard: false
+viewer: false
+headless: true
+phases:
+  - name: small
+    iterations: 2
+    batched: true
+    batch_iterations: 2
+    num_envs: 8
+  - name: large
+    iterations: 2
+    batched: true
+    batch_iterations: 2
+    num_envs: 24

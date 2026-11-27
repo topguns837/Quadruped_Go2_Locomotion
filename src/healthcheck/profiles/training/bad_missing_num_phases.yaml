@@ -1,0 +1,9 @@
+# Health-check NEGATIVE fixture: num_phases is required
+
+experiment_name: healthcheck_bad
+run_dir: run_bad
+num_envs: 32
+dashboard: false
+viewer: false
+phases:
+  - {name: a, iterations: 2}

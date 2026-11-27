@@ -1,0 +1,5 @@
+# Health-check scenario. EDGE: 5-value commands only (no height) -- the stacked, 6-command policy must fall back to its
+# default stance height instead of crashing.
+segments:
+  - {name: a, duration: 2.0, command: [0.3, 0.0, 0.0, 0.1, 0.0]}
+  - {name: b, duration: 2.0, command: [0.0, 0.0, 0.4, 0.0, 0.1]}

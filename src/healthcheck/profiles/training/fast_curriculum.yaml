@@ -1,0 +1,23 @@
+# Health-check profile (src/healthcheck/). Tiny on purpose: it proves the pipeline runs, not that a policy learns.
+# Edge: the domain-randomisation difficulty curriculum is made to evaluate every ~2 iterations (a real run waits 250),
+# so its update/settle/restore code runs and difficulty_scale is saved in curriculum_<N>.pt.
+num_phases: 1
+experiment_name: healthcheck_fast_curriculum
+run_dir: run_fast_curriculum
+task: Quadruped-Locomotion-Go2
+num_envs: 32
+seed: 5
+dashboard: false
+viewer: false
+headless: true
+overrides:
+  env.curriculum.difficulty.params.dwell_steps: 48
+  env.curriculum.difficulty.params.settle_steps: 0
+  env.curriculum.difficulty.params.min_episodes: 1
+  env.curriculum.difficulty.params.step: 0.25
+  env.curriculum.difficulty.params.up_thresh: 0.0
+phases:
+  - name: fast
+    iterations: 6
+    batched: true
+    batch_iterations: 3

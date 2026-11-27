@@ -1,0 +1,13 @@
+# Health-check profile (src/healthcheck/). DRY-RUN ONLY: every optional run-setting key, to prove each one reaches the command.
+num_phases: 1
+experiment_name: healthcheck_run_settings
+run_dir: run_run_settings
+num_envs: 4
+dashboard: false
+viewer: false
+headless: false
+rendering_mode: performance
+livestream: 1
+max_fails: 2
+phases:
+  - {name: only, iterations: 2}

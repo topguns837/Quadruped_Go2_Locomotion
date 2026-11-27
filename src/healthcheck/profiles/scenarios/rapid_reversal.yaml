@@ -1,0 +1,9 @@
+# Health-check scenario. EDGE: the command flips sign every 0.5 s (a step input in each direction).
+segments:
+  - {name: fwd_1,  duration: 0.5, command: [0.6, 0.0, 0.0, 0.0, 0.0]}
+  - {name: back_1, duration: 0.5, command: [-0.6, 0.0, 0.0, 0.0, 0.0]}
+  - {name: fwd_2,  duration: 0.5, command: [0.6, 0.0, 0.0, 0.0, 0.0]}
+  - {name: back_2, duration: 0.5, command: [-0.6, 0.0, 0.0, 0.0, 0.0]}
+  - {name: left,   duration: 0.5, command: [0.0, 0.5, 0.0, 0.0, 0.0]}
+  - {name: right,  duration: 0.5, command: [0.0, -0.5, 0.0, 0.0, 0.0]}
+  - {name: stop,   duration: 1.5, command: [0.0, 0.0, 0.0, 0.0, 0.0]}

@@ -1,0 +1,15 @@
+# Health-check safety profiles (src/healthcheck/): used with --safety_profiles_file. Same format as
+# src/deploy/configs/safety_profiles.yaml, but made of edge cases.
+tight:
+  # EDGE: very small per-tick slew and tether, so clipping must happen constantly (and never crash).
+  max_target_dev_deg: 8.0
+slow_start:
+  # EDGE: gentle start (long ramp, 5% starting kp).
+  startup_ramp_s: 4.0
+  startup_kp_fraction: 0.05
+lenient:
+  # EDGE: wide tether and abort thresholds.
+  max_target_dev_deg: 40.0
+typo_key:
+  # NEGATIVE: not a real flag; must be rejected at startup, not silently ignored.
+  max_target_dvi_deg: 8.0

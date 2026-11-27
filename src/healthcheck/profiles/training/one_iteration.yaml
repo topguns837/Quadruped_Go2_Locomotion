@@ -1,0 +1,16 @@
+# Health-check profile (src/healthcheck/). Tiny on purpose: it proves the pipeline runs, not that a policy learns.
+# Edge: the smallest possible run (1 iteration, batch of 1).
+num_phases: 1
+experiment_name: healthcheck_one_iteration
+run_dir: run_one_iteration
+task: Quadruped-Locomotion-Go2
+num_envs: 16
+seed: 3
+dashboard: false
+viewer: false
+headless: true
+phases:
+  - name: tiny
+    iterations: 1
+    batched: true
+    batch_iterations: 1

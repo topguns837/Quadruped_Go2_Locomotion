@@ -1,0 +1,12 @@
+# Health-check NEGATIVE fixture: overrides a baked-in constant (kp)
+num_phases: 1
+experiment_name: healthcheck_bad
+run_dir: run_bad
+num_envs: 32
+dashboard: false
+viewer: false
+phases:
+  - name: a
+    iterations: 2
+    overrides:
+      env.scene.robot.actuators.legs.stiffness: 60.0

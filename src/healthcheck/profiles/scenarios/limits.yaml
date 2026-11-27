@@ -1,0 +1,13 @@
+# Health-check scenario. EDGE: every command at the edge of the trained range, one at a time, then all at once.
+# Ranges: lin x/y +-1, yaw +-1, pitch +-0.6, lean +-0.3, height 0.28..0.38. Falls are allowed here; NaNs/crashes are not.
+segments:
+  - {name: max_forward,   duration: 2.0, command: [1.0, 0.0, 0.0, 0.0, 0.0, 0.337]}
+  - {name: max_backward,  duration: 2.0, command: [-1.0, 0.0, 0.0, 0.0, 0.0, 0.337]}
+  - {name: max_left,      duration: 2.0, command: [0.0, 1.0, 0.0, 0.0, 0.0, 0.337]}
+  - {name: max_yaw,       duration: 2.0, command: [0.0, 0.0, 1.0, 0.0, 0.0, 0.337]}
+  - {name: max_pitch,     duration: 2.0, command: [0.0, 0.0, 0.0, 0.6, 0.0, 0.337]}
+  - {name: min_pitch,     duration: 2.0, command: [0.0, 0.0, 0.0, -0.6, 0.0, 0.337]}
+  - {name: max_lean,      duration: 2.0, command: [0.0, 0.0, 0.0, 0.0, 0.3, 0.337]}
+  - {name: low_height,    duration: 2.0, command: [0.0, 0.0, 0.0, 0.0, 0.0, 0.28]}
+  - {name: high_height,   duration: 2.0, command: [0.0, 0.0, 0.0, 0.0, 0.0, 0.38]}
+  - {name: everything,    duration: 2.0, command: [0.8, 0.5, 0.5, 0.3, 0.15, 0.33]}

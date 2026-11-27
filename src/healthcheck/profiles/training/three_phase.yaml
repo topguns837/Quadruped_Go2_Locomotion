@@ -1,0 +1,30 @@
+# Health-check profile (src/healthcheck/). Three phases (2 + 3 + 2 iterations) with a seam inside phase 2 and a seam
+# between every pair of phases; each phase sets a different push velocity so applying per-phase overrides is checkable.
+num_phases: 3
+experiment_name: healthcheck_three
+run_dir: run_three
+task: Quadruped-Locomotion-Go2
+num_envs: 32
+seed: 1
+dashboard: false
+viewer: false
+headless: true
+phases:
+  - name: calm
+    iterations: 2
+    batched: true
+    batch_iterations: 2
+    overrides:
+      env.events.push_robot.params.max_velocity: 0.1
+  - name: medium
+    iterations: 3
+    batched: true
+    batch_iterations: 2
+    overrides:
+      env.events.push_robot.params.max_velocity: 0.3
+  - name: rough
+    iterations: 2
+    batched: true
+    batch_iterations: 2
+    overrides:
+      env.events.push_robot.params.max_velocity: 0.5
