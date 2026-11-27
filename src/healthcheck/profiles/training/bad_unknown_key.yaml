@@ -1,0 +1,10 @@
+# Health-check NEGATIVE fixture: unknown top-level key
+num_phases: 1
+frobnicate: true
+experiment_name: healthcheck_bad
+run_dir: run_bad
+num_envs: 32
+dashboard: false
+viewer: false
+phases:
+  - {name: a, iterations: 2}

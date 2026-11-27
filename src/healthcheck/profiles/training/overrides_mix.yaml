@@ -1,0 +1,32 @@
+# Health-check profile (src/healthcheck/). Tiny on purpose: it proves the pipeline runs, not that a policy learns.
+# Edge: env AND agent overrides at top level and per phase (list, bool, zero-weight reward, PPO field), plus per-phase seed.
+num_phases: 2
+experiment_name: healthcheck_overrides_mix
+run_dir: run_overrides_mix
+task: Quadruped-Locomotion-Go2
+num_envs: 16
+seed: 3
+dashboard: false
+viewer: false
+headless: true
+overrides:
+  agent.algorithm.num_learning_epochs: 2
+  env.rewards.is_alive.weight: 0.0
+  env.events.actuator_gains.params.stiffness_distribution_params: [0.9, 1.1]
+phases:
+  - name: first
+    iterations: 2
+    batched: true
+    batch_iterations: 2
+    seed: 11
+    overrides:
+      env.events.push_robot.params.max_velocity: 0.2
+      agent.algorithm.learning_rate: 0.0005
+  - name: second
+    iterations: 2
+    batched: true
+    batch_iterations: 2
+    seed: 12
+    overrides:
+      env.events.push_robot.params.max_velocity: 0.4
+      agent.algorithm.learning_rate: 0.0002

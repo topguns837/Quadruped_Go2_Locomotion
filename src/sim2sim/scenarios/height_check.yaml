@@ -1,0 +1,25 @@
+# Height-command sweep for a 6-wide-command policy (obs_stacking_with_height): stand and walk at 0.28 / 0.33 / 0.38 m.
+# command = [lin_vel_x, lin_vel_y, ang_vel_z, pitch, lean, height (m)]. Run with:
+#   sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/sim2sim/scenarios/height_check.yaml
+segments:
+  - name: h0_0.28
+    duration: 6.0
+    command: [0, 0, 0, 0, 0, 0.28]
+  - name: h1_0.33
+    duration: 6.0
+    command: [0, 0, 0, 0, 0, 0.33]
+  - name: h2_0.38
+    duration: 6.0
+    command: [0, 0, 0, 0, 0, 0.38]
+  - name: h3_0.28
+    duration: 6.0
+    command: [0.6, 0, 0, 0, 0, 0.28]
+  - name: h4_0.38
+    duration: 6.0
+    command: [0.6, 0, 0, 0, 0, 0.38]
+  - name: h5_0.28
+    duration: 6.0
+    command: [0.5, 0, 0.5, 0.3, 0.1, 0.28]
+  - name: h6_0.38
+    duration: 6.0
+    command: [0.5, 0, 0.5, -0.3, -0.1, 0.38]

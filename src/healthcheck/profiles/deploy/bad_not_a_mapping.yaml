@@ -1,0 +1,3 @@
+# Health-check deploy profile: NEGATIVE, valid YAML but a list, not a mapping.
+- 1
+- 2

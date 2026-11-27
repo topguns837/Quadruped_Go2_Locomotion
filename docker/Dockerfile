@@ -114,7 +114,7 @@ ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
 RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install "pip==24.2"
 
 # wheel/toml are this project's own build-backend requirements (see
-# source/quadruped_go2_locomotion/pyproject.toml). Pre-installing them here so
+# src/env/pyproject.toml). Pre-installing them here so
 # entrypoint.sh's `pip install -e` can run with --no-build-isolation means
 # that install never needs a PyPI round-trip on every container start.
 RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install toml wheel

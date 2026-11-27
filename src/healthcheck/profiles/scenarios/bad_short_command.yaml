@@ -1,0 +1,3 @@
+# Health-check scenario. NEGATIVE: a 3-value command.
+segments:
+  - {name: short, duration: 2.0, command: [0.1, 0.0, 0.0]}

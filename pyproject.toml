@@ -32,6 +32,14 @@ select = [
 
 # Ignore specific rules (matching your flake8 config)
 ignore = [
+    # --- pre-existing style debt, ignored so the hook only blocks on real problems; tighten in a dedicated cleanup ---
+    "E501",   # Line too long (~200 lines, mostly deploy/)
+    "I001",   # Import sorting: entry points deliberately order imports around AppLauncher / sys.path.insert setup
+    "SIM105", # try/except/pass -> contextlib.suppress
+    "SIM115", # open() without a context manager
+    "UP031",  # printf-style formatting
+    "UP041",  # socket.timeout -> TimeoutError: only an alias on Python >= 3.10; relay_*.py also run on the Jetson
+    "C901",   # Function complexity (deploy_real.main etc.)
     "E402",   # Module level import not at top of file
     "D401",   # First line should be in imperative mood
     "RET504", # Unnecessary variable assignment before return statement
@@ -102,7 +110,7 @@ docstring-code-format = true
 
 [tool.pyright]
 
-include = ["source", "scripts"]
+include = ["src"]
 exclude = [
     "**/__pycache__",
     "**/_isaac_sim",
@@ -132,10 +140,14 @@ reportPrivateUsage = "warning"
 skip = '*.usd,*.usda,*.usdz,*.svg,*.png,_isaac_sim*,*.bib,*.css,*/_build'
 quiet-level = 0
 # the world list should always have words in lower case
-ignore-words-list = "haa,slq,collapsable,buss,reacher,thirdparty"
+ignore-words-list = "haa,slq,collapsable,buss,reacher,thirdparty,nd,hasnt,retuned"
 
 
 [tool.pytest.ini_options]
+# Tests live next to the code they test: src/<stage>/tests/. importlib mode lets same-named test modules coexist.
+testpaths = ["src"]
+python_files = ["test_*.py"]
+addopts = "--import-mode=importlib"
 
 markers = [
     "isaacsim_ci: mark test to run in isaacsim ci",

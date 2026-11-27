@@ -1,0 +1,9 @@
+# Health-check NEGATIVE fixture: a phase with zero iterations
+num_phases: 1
+experiment_name: healthcheck_bad
+run_dir: run_bad
+num_envs: 32
+dashboard: false
+viewer: false
+phases:
+  - {name: a, iterations: 0}

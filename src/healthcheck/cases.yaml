@@ -1,0 +1,879 @@
+# Health-check case list, read by src/healthcheck/run.py (start it with ./healthcheck.sh).
+#
+# Case keys:  id, group, cmd (bash, run from the repo root; {py} = Isaac python, {run} = this run's output dir),
+#             timeout (s), gpu (needs the GPU free), needs ([case ids that must pass first]),
+#             expect: {rc: 0 | <int> | nonzero, contains: [regex], not_contains: [regex]},
+#             artifacts ([paths, globs allowed]), checks ([asserts.py functions]), known (documented issue: the case
+#             is reported as KNOWN instead of FAIL), matrix ({key: [values]}: one case per combination, {key} is
+#             substituted in id/cmd/expect). A case that exits 0 fails if its log has a Python Traceback.
+#
+# Isolation: everything runs in the throwaway testing container. Network-facing cases only use that container's own
+# loopback interface.
+
+coverage_omit:
+  # vendored third-party tree
+  - src/sim2sim/mujoco/menagerie/*
+  # tests and the health check itself
+  - "src/*/tests/*"
+  - src/healthcheck/*
+  # tools that need a physical Go2 (or a Jetson / access point) and cannot run anywhere else
+  - src/deploy/mode_probe.py
+  - src/deploy/lowstate_probe.py
+  - src/deploy/single_joint_test.py
+  - src/deploy/verify_joint_mapping.py
+  - src/deploy/dump_joint_order.py
+  - src/deploy/tools/udp_probe.py
+  # packaging metadata, executed by pip at install time, not by the repo's code
+  - src/env/setup.py
+  # one-off USD asset authoring tool (composes the robot USD with the arm); needs the Omniverse asset server
+  - src/env/tools/compose_go2_with_arm.py
+  # depth-camera observation term: the depth camera is disabled in env_cfg.py (the term is never instantiated)
+  - src/env/quadruped_go2_locomotion/mdp/observations.py
+  # Tk slider window: needs a display, which the isolated container deliberately does not have
+  - src/common/manual_command_slider.py
+  - src/sim2sim/mujoco/menagerie/*
+
+cases:
+  # ======================================================================================================== hygiene
+  - id: hygiene-precommit
+    group: hygiene
+    description: pre-commit hooks pass on the whole repo (run on the host by healthcheck.sh)
+    cmd: |
+      case "${HEALTHCHECK_PRECOMMIT_RC:-skip}" in
+        0) echo "pre-commit passed on the host" ;;
+        skip) echo "pre-commit not run (not on the host, or --ref used)" ;;
+        *) printf '%s\n' "$HEALTHCHECK_PRECOMMIT_LOG"; exit 1 ;;
+      esac
+    timeout: 60
+
+  - {id: hygiene-extension-installed, group: hygiene,
+     description: the task extension is importable and registers both gym tasks (entrypoint installed src/env),
+     cmd: "{py} -c \"import quadruped_go2_locomotion, gymnasium as g; ids = [k for k in g.registry if 'Quadruped-Locomotion-Go2' in k]; print('tasks', sorted(ids)); assert len(ids) >= 2\"",
+     expect: {contains: ["tasks \\['Quadruped-Locomotion-Go2', 'Quadruped-Locomotion-Go2-Play'\\]"]}, timeout: 300}
+  - {id: hygiene-links, group: hygiene, description: relative links in READMEs/docs resolve,
+     cmd: "{py} src/healthcheck/check_repo.py links", timeout: 120}
+  - {id: hygiene-paths, group: hygiene, description: policy/scenario/script paths exist and stale names are gone,
+     cmd: "{py} src/healthcheck/check_repo.py paths", timeout: 120}
+  - {id: hygiene-policies, group: hygiene, description: committed policies load and match their deploy profile,
+     cmd: "{py} src/healthcheck/check_repo.py policies", timeout: 300}
+  - {id: hygiene-profiles, group: hygiene, description: every shipped training profile loads,
+     cmd: "{py} src/healthcheck/check_repo.py profiles", timeout: 120}
+
+  # ===================================================================================================== unit tests
+  - id: unit-pytest
+    group: unit
+    description: every unit test under src/*/tests (the libddsc test fails only because of a container symlink)
+    cmd: "{py} -m pytest src -q -p no:cacheprovider --deselect src/deploy/tests/test_relay_safety.py -k 'not libddsc'"
+    timeout: 1800
+
+  # ===================================================================================== training profiles (static)
+  - id: profile-dryrun-{profile}
+    group: profiles
+    description: a real training profile resolves to commands without launching anything
+    cmd: "bash src/training/train.sh --profile {profile} --dry_run"
+    expect: {contains: ['=== phase 1/']}
+    matrix:
+      profile: [obs_stacking_with_height, obs_stacking_with_height_single_phase, iter4_realistic, aggressive, example]
+    timeout: 120
+
+  - id: profile-dryrun-three-phase
+    group: profiles
+    description: three-phase test profile prints three phases, each with its own push velocity
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --dry_run"
+    expect: {contains: ['=== phase 3/3: rough', 'max_velocity=0.1', 'max_velocity=0.3', 'max_velocity=0.5']}
+    timeout: 120
+
+  - id: profile-num-phases-truncate
+    group: profiles
+    description: --num_phases 2 on a 3-phase profile keeps only the first two
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --num_phases 2 --dry_run"
+    expect: {contains: ['phase 2/2'], not_contains: ['phase 3/']}
+    timeout: 120
+
+  - id: profile-num-phases-too-many
+    group: profiles
+    description: --num_phases larger than the profile defines is rejected
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --num_phases 9 --dry_run"
+    expect: {rc: nonzero, contains: ['num_phases']}
+    timeout: 120
+
+  - id: profile-cli-overrides
+    group: profiles
+    description: --num_envs/--seed/--gui/--rendering_mode/--livestream/Hydra overrides reach the command line
+    cmd: >-
+      bash src/training/train.sh --profile src/healthcheck/profiles/training/single_phase.yaml --dry_run
+      --num_envs 7 --seed 5 --gui --rendering_mode performance --livestream 2 env.rewards.is_alive.weight=3.0
+    expect: {contains: ['--num_envs 7', '--seed 5', '--gui', '--rendering_mode performance', '--livestream 2',
+                        'is_alive.weight=3.0']}
+    timeout: 120
+
+  - id: profile-negative-{bad}
+    group: profiles
+    description: a malformed profile is rejected with a specific message
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/{bad}.yaml --dry_run"
+    expect: {rc: nonzero, contains: ['{msg}']}
+    matrix:
+      bad: [bad_num_phases]
+      msg: ['num_phases: 3 but 2']
+    timeout: 120
+  - {id: profile-negative-missing-num-phases, group: profiles, description: num_phases is required,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_missing_num_phases.yaml --dry_run",
+     expect: {rc: nonzero, contains: ["'num_phases' is required"]}, timeout: 120}
+  - {id: profile-negative-baked-key, group: profiles, description: kp/kd cannot be overridden per phase,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_baked_key.yaml --dry_run",
+     expect: {rc: nonzero, contains: ['baked-in constant']}, timeout: 120}
+  - {id: profile-negative-unknown-key, group: profiles, description: typos in top-level keys are caught,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_unknown_key.yaml --dry_run",
+     expect: {rc: nonzero, contains: ['unknown top-level key']}, timeout: 120}
+  - {id: profile-negative-zero-iters, group: profiles, description: a phase needs positive iterations,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_zero_iters.yaml --dry_run",
+     expect: {rc: nonzero, contains: ["positive integer 'iterations'"]}, timeout: 120}
+  - {id: profile-negative-batch-gt-iters, group: profiles, description: batch_iterations cannot exceed iterations,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_batch_gt_iters.yaml --dry_run",
+     expect: {rc: nonzero, contains: ['exceeds its iterations']}, timeout: 120}
+  - {id: profile-negative-duplicate-phase, group: profiles, description: phase names must be unique,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_duplicate_phase.yaml --dry_run",
+     expect: {rc: nonzero, contains: ['duplicate phase name']}, timeout: 120}
+  - {id: profile-negative-bad-head, group: profiles, description: only env./agent. overrides are allowed,
+     cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_head.yaml --dry_run",
+     expect: {rc: nonzero, contains: ["must start with 'env.' or 'agent.'"]}, timeout: 120}
+  - {id: profile-negative-missing-file, group: profiles, description: an unknown profile name is rejected,
+     cmd: "bash src/training/train.sh --profile no_such_profile --dry_run",
+     expect: {rc: nonzero, contains: ['No such file or directory']}, timeout: 120}
+
+  # ===================================================================================================== sim2sim
+  - id: sim2sim-model-present
+    group: sim2sim
+    description: the MuJoCo Go2 model is available (fetched once, idempotent)
+    cmd: "bash src/sim2sim/fetch_go2_model.sh"
+    artifacts: [src/sim2sim/mujoco/menagerie/unitree_go2/go2.xml]
+    timeout: 600
+
+  - id: sim2sim-{profile}-{scn}
+    group: sim2sim
+    description: headless MuJoCo run of a deploy profile's policy on a scenario, no falls on the basic stand/walk/turn
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/{profile}.yaml
+      --scenario src/healthcheck/profiles/scenarios/{scn}.yaml
+    expect: {contains: ['\[SUMMARY\]', 'total falls: 0']}
+    checks: [no_nan_in_log]
+    matrix:
+      profile: [go2_locomotion, go2_obs_stacking]
+      scn: [short]
+    timeout: 300
+
+  - id: sim2sim-height-scenario
+    group: sim2sim
+    description: the stacked policy tracks the shipped height_check scenario (first 12 s)
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml
+      --scenario src/sim2sim/scenarios/height_check.yaml --duration 12
+    expect: {contains: ['\[SUMMARY\]']}
+    checks: [no_nan_in_log]
+    timeout: 300
+
+  - id: sim2sim-basic-scenario
+    group: sim2sim
+    description: the shipped basic scenario runs to its end with the stacked policy
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml
+      --scenario src/sim2sim/scenarios/basic.yaml
+    expect: {contains: ['\[SUMMARY\]']}
+    checks: [no_nan_in_log]
+    timeout: 600
+
+  - id: sim2sim-edge-{name}
+    group: sim2sim
+    description: "edge option: {name}"
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml
+      --scenario src/healthcheck/profiles/scenarios/short.yaml {flags}
+    expect: {contains: ['\[SUMMARY\]']}
+    checks: [no_nan_in_log]
+    matrix:
+      name: [obs-noise]
+      flags: ["--obs_noise 0.05 --obs_noise_seed 3"]
+    timeout: 300
+  - {id: sim2sim-edge-obs-delay, group: sim2sim, description: observation delay, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/short.yaml --obs_delay 2",
+     expect: {contains: ['\[SUMMARY\]']}, timeout: 300}
+  - {id: sim2sim-edge-action-delay, group: sim2sim, description: action delay, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/short.yaml --action_delay 2",
+     expect: {contains: ['\[SUMMARY\]']}, timeout: 300}
+  - {id: sim2sim-edge-action-lpf, group: sim2sim, description: 5 Hz action low-pass filter, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/short.yaml --action_lpf_hz 5",
+     expect: {contains: ['\[SUMMARY\]']}, timeout: 300}
+  - {id: sim2sim-edge-joint-speed-cap, group: sim2sim, description: hardware-like joint speed cap, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/short.yaml --joint_speed_cap 30 30 15",
+     expect: {contains: ['\[SUMMARY\]']}, timeout: 300}
+  - {id: sim2sim-edge-gain-override, group: sim2sim, description: kp/kd override, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/short.yaml --kp 45 --kd 0.9",
+     expect: {contains: ['\[SUMMARY\]']}, timeout: 300}
+  - {id: sim2sim-edge-no-reset, group: sim2sim, description: --no_reset stops at a fall instead of resetting, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/short.yaml --no_reset",
+     expect: {contains: ['\[SUMMARY\]']}, timeout: 300}
+  - {id: sim2sim-edge-wrong-history, group: sim2sim, description: a policy/history_length mismatch fails loudly, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --history_length 4 --scenario src/healthcheck/profiles/scenarios/short.yaml",
+     expect: {rc: nonzero, contains: ['not a known per-frame layout']}, timeout: 120}
+  - {id: sim2sim-edge-single-frame-as-stack, group: sim2sim, description: a 47-dim policy given history_length 6 fails loudly, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_locomotion.yaml --history_length 6 --scenario src/healthcheck/profiles/scenarios/short.yaml",
+     expect: {rc: nonzero, contains: ['not divisible by history_length']}, timeout: 120}
+
+  - id: sim2sim-random-schedule
+    group: sim2sim
+    description: seeded random commands run, and the saved schedule replays through random_commands/scenario files
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml
+      --random_seed 3 --random_segments 3 --random_segment_s 2 --random_scale 0.5 --save_scenario {run}/random_saved.yaml
+    expect: {contains: ['\[SUMMARY\]']}
+    artifacts: ["{run}/random_saved.yaml"]
+    timeout: 300
+
+  - id: sim2sim-save-xml
+    group: sim2sim
+    description: the compiled MuJoCo model can be written out
+    needs: [sim2sim-model-present]
+    cmd: "{py} src/sim2sim/sim2sim_mujoco.py --config src/deploy/profiles/go2_obs_stacking.yaml --save_xml {run}/go2_compiled.xml"
+    artifacts: ["{run}/go2_compiled.xml"]
+    timeout: 300
+
+  # ====================================================================================== deploy (no robot, no DDS)
+  - id: deploy-dryrun-{dp}-{sp}
+    group: deploy
+    description: full control loop on zeroed state for every deploy profile x safety profile
+    cmd: >-
+      {py} src/deploy/deploy_real.py --deploy_profile {dp} --safety_profile {sp} --network_interface lo
+      --skip_release --dry_run --no_live_dashboard --max_steps 80
+    expect: {contains: ['--max_steps 80 reached', '\[DRY_RUN\] step=50']}
+    checks: [no_nan_in_log]
+    matrix:
+      dp: [go2_locomotion, go2_obs_stacking]
+      sp: [cautionary, confident, no_limits, iter4_realistic, wireless]
+    timeout: 180
+
+  - {id: deploy-dryrun-low-pass, group: deploy, description: action low-pass enabled with its default cutoff,
+     cmd: "{py} src/deploy/deploy_real.py --deploy_profile go2_obs_stacking --safety_profile cautionary --network_interface lo --skip_release --dry_run --no_live_dashboard --low_pass --max_steps 80",
+     expect: {contains: ['--max_steps 80 reached']}, timeout: 180}
+  - {id: deploy-dryrun-low-pass-5hz, group: deploy, description: action low-pass at an explicit 5 Hz,
+     cmd: "{py} src/deploy/deploy_real.py --deploy_profile go2_obs_stacking --safety_profile cautionary --network_interface lo --skip_release --dry_run --no_live_dashboard --low_pass 5 --max_steps 80",
+     expect: {contains: ['--max_steps 80 reached']}, timeout: 180}
+  - {id: deploy-unknown-safety-profile, group: deploy, description: an unknown safety profile is rejected,
+     cmd: "{py} src/deploy/deploy_real.py --deploy_profile go2_obs_stacking --safety_profile nope --network_interface lo --dry_run --max_steps 5",
+     expect: {rc: nonzero, contains: ["safety profile 'nope' not found"]}, timeout: 120}
+  - {id: deploy-unknown-deploy-profile, group: deploy, description: an unknown deploy profile is rejected,
+     cmd: "{py} src/deploy/deploy_real.py --deploy_profile nope --safety_profile cautionary --network_interface lo --dry_run --max_steps 5",
+     expect: {rc: nonzero, contains: ["deploy profile 'nope' not found"]}, timeout: 120}
+  - {id: deploy-history-mismatch, group: deploy, description: a 47-dim policy with a stacked profile's history_length fails loudly,
+     cmd: "{py} src/deploy/deploy_real.py --deploy_profile go2_locomotion --history_length 6 --safety_profile cautionary --network_interface lo --dry_run --max_steps 5",
+     expect: {rc: nonzero, contains: ['not divisible by history_length']}, timeout: 120}
+
+  # ======================================================================================= fake robot (loopback DDS)
+  - id: fake-nominal
+    group: deploy
+    description: deploy_real.py drives the synthetic robot for 200 steps; every LowCmd has a valid CRC; a trace is saved
+    cmd: >-
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_nominal "--duration_s 60" --deploy_profile go2_obs_stacking
+      --safety_profile cautionary --live_plot --max_steps 200
+      && cp "$(ls -td logs/hardware_dashboard/*/ | head -1)policy_trace.npz" {run}/hw_trace.npz
+    expect: {contains: ['--max_steps 200 reached', 'Policy trace']}
+    checks:
+      - {fn: fake_robot_summary, args: {out_dir: "{run}/fake_nominal", min_lowcmds: 300}}
+      - {fn: npz_fields, args: {path: "{run}/hw_trace.npz", fields: [obs, raw_action, sent_target, tau_est, quat_wxyz, gyro], min_rows: 100}}
+    artifacts: ["{run}/hw_trace.npz"]
+    timeout: 300
+
+  - id: fake-{dp}
+    group: deploy
+    description: each deploy profile runs against the synthetic robot (the 47-dim and the stacked 288-dim policy)
+    cmd: >-
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_{dp} "--duration_s 60" --deploy_profile {dp}
+      --safety_profile cautionary --max_steps 120
+    expect: {contains: ['--max_steps 120 reached']}
+    checks:
+      - {fn: fake_robot_summary, args: {out_dir: "{run}/fake_{dp}", min_lowcmds: 200}}
+    matrix:
+      dp: [go2_locomotion, go2_obs_stacking]
+    timeout: 300
+
+  - id: fake-estop
+    group: deploy
+    description: the controller e-stop combo stops the control loop and damps
+    cmd: >-
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_estop "--press_estop_after 12 --duration_s 90"
+      --deploy_profile go2_obs_stacking --safety_profile cautionary
+    expect: {contains: ['\[ESTOP\] Controller e-stop', 'Sending damping command before exit']}
+    timeout: 300
+
+  - id: fake-speed-fault
+    group: deploy
+    description: an implausible joint speed (100 rad/s) trips the speed fault and damps
+    cmd: >-
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_dq "--fake_high_dq_after 12 --duration_s 90"
+      --deploy_profile go2_obs_stacking --safety_profile cautionary
+    expect: {contains: ['\[FAULT\] Joint .* measured speed', 'Sending damping command before exit']}
+    timeout: 300
+
+  - id: fake-link-lost
+    group: deploy
+    description: the robot going silent stops the loop as link-lost and never resumes
+    cmd: >-
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_link "--duration_s 25"
+      --deploy_profile go2_obs_stacking --safety_profile cautionary
+    expect: {contains: ['\[LINK\] No LowState for', 'Sending damping command before exit']}
+    timeout: 300
+
+  - id: fake-preflight
+    group: deploy
+    description: the read-only pre-flight check connects to the synthetic robot and reports a verdict
+    cmd: >-
+      HC_TOOL=src/deploy/preflight_check.py bash src/healthcheck/fake_robot_case.sh {run}/fake_preflight
+      "--duration_s 40" --duration 8
+    expect: {contains: ['VERDICT', 'Connectivity confirmed working']}
+    timeout: 300
+
+  - id: relay-loopback
+    group: deploy
+    description: the wireless relay (key auth, forged packets, invalid commands, link loss) over loopback
+    cmd: "bash src/deploy/tests/run_t2_loopback.sh"
+    expect: {contains: ['RESULT: \d+ passed, 0 failed']}
+    timeout: 900
+
+  - id: trace-scenario-from-hw-trace
+    group: deploy
+    description: a recorded deploy trace is turned back into a sim2sim scenario
+    needs: [fake-nominal]
+    cmd: "{py} src/sim2sim/scenario_from_trace.py {run}/hw_trace.npz --out {run}/from_trace.yaml"
+    artifacts: ["{run}/from_trace.yaml"]
+    timeout: 120
+
+  - id: trace-analyze-hw
+    group: deploy
+    description: the hardware-trace analysis report is produced and finite
+    needs: [fake-nominal]
+    cmd: "{py} src/sim2sim/analyze_hw_trace.py {run}/hw_trace.npz --out {run}/hw_report.md"
+    checks:
+      - {fn: finite_numbers_in_file, args: {path: "{run}/hw_report.md", min_numbers: 3}}
+    timeout: 120
+
+  - id: trace-random-commands
+    group: sim2sim
+    description: seeded random command schedules are reproducible
+    cmd: >-
+      {py} src/sim2sim/random_commands.py --seed 4 --segments 3 --segment_s 2 --out {run}/rc_a.yaml
+      && {py} src/sim2sim/random_commands.py --seed 4 --segments 3 --segment_s 2 --out {run}/rc_b.yaml
+      && cmp {run}/rc_a.yaml {run}/rc_b.yaml
+    artifacts: ["{run}/rc_a.yaml"]
+    timeout: 120
+
+  # ======================================================================================== Isaac Sim (needs the GPU)
+  - id: env-list
+    group: env
+    gpu: true
+    description: both tasks are registered
+    cmd: "{py} src/env/tools/list_envs.py"
+    expect: {contains: ['Quadruped-Locomotion-Go2 ', 'Quadruped-Locomotion-Go2-Play']}
+    timeout: 900
+
+  - id: env-{agent}-{task}
+    group: env
+    gpu: true
+    description: the task steps 100x with zero/random actions without errors
+    cmd: "{py} src/env/tools/{agent}.py --task {task} --headless --num_envs 8 --max_steps 100"
+    expect: {contains: ['Gym observation space', 'Gym action space']}
+    checks:
+      - {fn: no_nan_in_log, args: {allow_inf: true}}
+    matrix:
+      agent: [zero_agent, random_agent]
+      task: [Quadruped-Locomotion-Go2, Quadruped-Locomotion-Go2-Play]
+    timeout: 900
+
+  - id: train-single
+    group: training
+    gpu: true
+    description: one phase, 4 iterations, a checkpoint seam in the middle; checkpoints, curriculum and params written
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/single_phase.yaml"
+    expect: {contains: ['reached target', 'batched training finished']}
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_single, run: run_single, last: 3, resumes: 1}}
+    timeout: 1500
+
+  - id: train-single-rerun
+    group: training
+    gpu: true
+    needs: [train-single]
+    description: rerunning a finished profile is a no-op (resumes nothing, trains nothing)
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/single_phase.yaml"
+    expect: {not_contains: ['Learning iteration 4/']}
+    checks:
+      - {fn: files_exist, args: {patterns: ["logs/rsl_rl/healthcheck_single/run_single/model_3.pt"]}}
+    timeout: 900
+
+  - id: train-three-first-phase
+    group: training
+    gpu: true
+    description: --num_phases 1 on a three-phase profile trains only phase 1
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --num_phases 1"
+    expect: {contains: ['phase 1/1: calm']}
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_three, run: run_three, last: 1}}
+      - {fn: env_param, args: {experiment: healthcheck_three, run: run_three, key: events.push_robot.params.max_velocity, value: 0.1}}
+    timeout: 1500
+
+  - id: train-three-resume
+    group: training
+    gpu: true
+    needs: [train-three-first-phase]
+    description: --start_phase 2 resumes the same run folder through phases 2 and 3 (curriculum restored at every seam)
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --start_phase 2"
+    expect: {contains: ['phase 2/3: medium', 'phase 3/3: rough']}
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_three, run: run_three, last: 6, resumes: 3}}
+      - {fn: env_param, args: {experiment: healthcheck_three, run: run_three, key: events.push_robot.params.max_velocity, value: 0.5}}
+    timeout: 2400
+
+  - id: train-bad-hydra-key
+    group: training
+    gpu: true
+    description: an override naming a non-existent config key fails fast and loudly (no hang, no silent no-op)
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/bad_hydra_key.yaml"
+    expect: {rc: nonzero, contains: ['no_such_term']}
+    timeout: 900
+
+  - id: play-trace-zero
+    group: play
+    gpu: true
+    needs: [train-single]
+    description: play a fresh checkpoint at a zero command; the policy is exported (JIT + ONNX) with the stacked input size
+    cmd: >-
+      {py} src/play/play.py --task Quadruped-Locomotion-Go2-Play --num_envs 1 --headless
+      --checkpoint logs/rsl_rl/healthcheck_single/run_single/model_3.pt --trace_out {run}/isaac_zero.npz --trace_steps 100
+    checks:
+      - {fn: npz_fields, args: {path: "{run}/isaac_zero.npz", fields: [obs, action, target, joint_pos, torque, root_pos, command, fell], min_rows: 90}}
+      - {fn: jit_input_dim, args: {path: "logs/rsl_rl/healthcheck_single/run_single/exported/policy.pt", dim: 288}}
+    timeout: 900
+
+  - id: play-trace-scenario
+    group: play
+    gpu: true
+    needs: [train-single]
+    description: replay a command scenario from the exact default pose and log the live-plot dashboard
+    cmd: >-
+      {py} src/play/play.py --task Quadruped-Locomotion-Go2-Play --num_envs 1 --headless
+      --checkpoint logs/rsl_rl/healthcheck_single/run_single/model_3.pt --scenario src/healthcheck/profiles/scenarios/short.yaml
+      --trace_out {run}/isaac_short.npz --trace_deterministic_reset --live_plot
+    checks:
+      - {fn: npz_fields, args: {path: "{run}/isaac_short.npz", fields: [obs, action, command], min_rows: 250}}
+    timeout: 900
+
+  - id: chain-sim2sim-on-exported
+    group: sim2sim
+    needs: [play-trace-scenario]
+    description: the policy exported by Isaac runs in MuJoCo with the stacked deploy profile (train -> export -> sim2sim)
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml
+      --policy logs/rsl_rl/healthcheck_single/run_single/exported/policy.pt
+      --scenario src/healthcheck/profiles/scenarios/short.yaml --trace_out {run}/mujoco_short.npz
+    expect: {contains: ['\[SUMMARY\]']}
+    checks:
+      - {fn: npz_fields, args: {path: "{run}/mujoco_short.npz", fields: [obs, action, command], min_rows: 250}}
+    timeout: 300
+
+  - id: chain-compare-traces
+    group: sim2sim
+    needs: [chain-sim2sim-on-exported]
+    description: Isaac and MuJoCo traces of the same scenario compare (and a trace equals itself)
+    cmd: >-
+      {py} src/sim2sim/compare_traces.py {run}/isaac_short.npz {run}/mujoco_short.npz
+      && {py} src/sim2sim/compare_traces.py {run}/isaac_short.npz {run}/isaac_short.npz
+    timeout: 300
+
+  - id: chain-replay-actions
+    group: sim2sim
+    needs: [play-trace-scenario]
+    description: Isaac's recorded actions replayed through MuJoCo physics
+    cmd: >-
+      {py} src/sim2sim/replay_actions.py --isaac_trace {run}/isaac_short.npz --out {run}/replay.npz
+      --config src/deploy/profiles/go2_obs_stacking.yaml
+    artifacts: ["{run}/replay.npz"]
+    timeout: 300
+
+  - id: eval-isaac-vs-mujoco
+    group: sim2sim
+    gpu: true
+    needs: [train-single]
+    description: the sim2sim eval script runs Isaac and MuJoCo on a seeded schedule and writes a finite report
+    cmd: >-
+      bash src/sim2sim/run_sim2sim_eval.sh --checkpoint logs/rsl_rl/healthcheck_single/run_single/model_3.pt
+      --config src/deploy/profiles/go2_obs_stacking.yaml --seeds "0" --segments 2 --segment_s 3 --out_dir {run}/eval
+    artifacts: ["{run}/eval/report.md", "{run}/eval/seed0_isaac.npz", "{run}/eval/seed0_mujoco.npz"]
+    checks:
+      - {fn: finite_numbers_in_file, args: {path: "{run}/eval/report.md", min_numbers: 5, allow_nan: true}}
+    timeout: 1500
+
+
+  # ============================================================== second wave: more profiles, each with its own edge
+  # ---- training profiles (static)
+  - id: profile-edge-dryrun-{p}
+    group: profiles
+    description: every edge-case training profile resolves to commands
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/{p}.yaml --dry_run"
+    expect: {contains: ['=== phase 1/']}
+    matrix:
+      p: [unbatched, one_iteration, uneven_batches, overrides_mix, envs_change]
+    timeout: 120
+  - id: profile-run-settings-reach-command
+    group: profiles
+    description: headless false / rendering_mode / livestream / max_fails keys of a profile reach the launch command
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/run_settings.yaml --dry_run"
+    expect: {contains: ['--gui', '--rendering_mode performance', '--livestream 1', '--max_fails 2', '--num_envs 4']}
+    timeout: 120
+  - id: profile-cli-beats-profile
+    group: profiles
+    description: CLI flags take precedence over the profile's own run settings
+    cmd: >-
+      bash src/training/train.sh --profile src/healthcheck/profiles/training/run_settings.yaml --dry_run
+      --num_envs 9 --rendering_mode quality --livestream 2
+    expect: {contains: ['--num_envs 9', '--rendering_mode quality', '--livestream 2'], not_contains: ['--rendering_mode performance']}
+    timeout: 120
+  - id: profile-overrides-mix-per-phase
+    group: profiles
+    description: per-phase seed and agent/env overrides differ between phases of overrides_mix
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/overrides_mix.yaml --dry_run"
+    expect: {contains: ['--seed 11', '--seed 12', 'learning_rate=0.0005', 'learning_rate=0.0002', 'max_velocity=0.2',
+                        'max_velocity=0.4', 'num_learning_epochs=2', 'is_alive.weight=0.0']}
+    timeout: 120
+  - id: profile-only-phase-flag
+    group: profiles
+    description: --only_phase 2 prints only phase 2 of three
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --only_phase 2 --dry_run"
+    expect: {contains: ['phase 2/3: medium'], not_contains: ['phase 1/3', 'phase 3/3']}
+    timeout: 120
+  - id: profile-start-phase-out-of-range
+    group: profiles
+    description: --start_phase beyond the last phase is rejected
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/three_phase.yaml --start_phase 9 --dry_run"
+    expect: {rc: nonzero}
+    timeout: 120
+
+  # ---- training profiles (real runs, GPU)
+  - id: train-unbatched
+    group: training
+    gpu: true
+    description: batched false trains the whole phase in one process
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/unbatched.yaml"
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_unbatched, run: run_unbatched, last: 2}}
+    timeout: 1500
+  - id: train-one-iteration
+    group: training
+    gpu: true
+    description: the smallest possible run (one iteration) still saves checkpoint, curriculum and params
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/one_iteration.yaml"
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_one_iteration, run: run_one_iteration, last: 0}}
+    timeout: 1500
+  - id: train-uneven-batches
+    group: training
+    gpu: true
+    description: 5 iterations in chunks of 2 (the last chunk is partial) end at the right checkpoint
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/uneven_batches.yaml"
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_uneven, run: run_uneven, last: 4, resumes: 2}}
+    timeout: 2400
+  - id: train-overrides-mix
+    group: training
+    gpu: true
+    description: top-level and per-phase env/agent overrides land in the dumped params (last phase wins)
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/overrides_mix.yaml"
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_overrides_mix, run: run_overrides_mix, last: 3, resumes: 1}}
+      - {fn: env_param, args: {experiment: healthcheck_overrides_mix, run: run_overrides_mix, key: events.push_robot.params.max_velocity, value: 0.4}}
+      - {fn: env_param, args: {experiment: healthcheck_overrides_mix, run: run_overrides_mix, key: rewards.is_alive.weight, value: 0.0}}
+      - {fn: env_param, args: {experiment: healthcheck_overrides_mix, run: run_overrides_mix, key: algorithm.learning_rate, value: 0.0002, file: agent}}
+      - {fn: env_param, args: {experiment: healthcheck_overrides_mix, run: run_overrides_mix, key: algorithm.num_learning_epochs, value: 2, file: agent}}
+    timeout: 2400
+  - id: train-envs-change-between-phases
+    group: training
+    gpu: true
+    description: phase 2 with a different num_envs resumes the run (the per-env curriculum state must not break it)
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/envs_change.yaml"
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_envs_change, run: run_envs_change, last: 3, resumes: 1}}
+    timeout: 2400
+
+  # ---- deploy / sim2sim edge profiles (no GPU)
+  - id: deploy-edge-profile-{name}
+    group: deploy
+    description: an edge-case deploy profile (filter off / very strong / Nyquist, low gains, long link guard, filter on a single-frame policy) runs
+    cmd: >-
+      {py} src/deploy/deploy_real.py --config src/healthcheck/profiles/deploy/{name}.yaml --safety_profile cautionary
+      --network_interface lo --skip_release --dry_run --no_live_dashboard --max_steps 80
+    expect: {contains: ['--max_steps 80 reached']}
+    checks: [no_nan_in_log]
+    matrix:
+      name: [stacked_no_filter, stacked_strong_filter, stacked_nyquist_filter, stacked_low_gains, stacked_slow_link_guard, single_with_filter]
+    timeout: 180
+  - id: deploy-bad-profile-{name}
+    group: deploy
+    description: a malformed deploy profile fails at load with a message naming the problem
+    cmd: >-
+      {py} src/deploy/deploy_real.py --config src/healthcheck/profiles/deploy/bad_{name}.yaml --safety_profile cautionary
+      --network_interface lo --skip_release --dry_run --no_live_dashboard --max_steps 10
+    expect: {rc: nonzero, contains: ['{msg}']}
+    matrix:
+      name: [joint_order]
+      msg: ['must list 12 distinct joints']
+    timeout: 120
+  - {id: deploy-bad-profile-not-a-mapping, group: deploy, description: a list instead of a mapping is rejected clearly,
+     cmd: "{py} src/deploy/deploy_real.py --config src/healthcheck/profiles/deploy/bad_not_a_mapping.yaml --safety_profile cautionary --network_interface lo --skip_release --dry_run --max_steps 10",
+     expect: {rc: nonzero, contains: ['must be a YAML mapping']}, timeout: 120}
+  - {id: deploy-bad-profile-empty, group: deploy, description: an empty profile file is rejected clearly,
+     cmd: "{py} src/deploy/deploy_real.py --config src/healthcheck/profiles/deploy/bad_empty.yaml --safety_profile cautionary --network_interface lo --skip_release --dry_run --max_steps 10",
+     expect: {rc: nonzero, contains: ['an empty file']}, timeout: 120}
+  - {id: deploy-bad-profile-missing-policy, group: deploy, description: a policy_path that does not exist is rejected,
+     cmd: "{py} src/deploy/deploy_real.py --config src/healthcheck/profiles/deploy/bad_missing_policy.yaml --safety_profile cautionary --network_interface lo --skip_release --dry_run --max_steps 10",
+     expect: {rc: nonzero, contains: ['does not exist']}, timeout: 120}
+  - {id: deploy-bad-profile-history-mismatch, group: deploy, description: history_length 1 with a stacked policy is rejected,
+     cmd: "{py} src/deploy/deploy_real.py --config src/healthcheck/profiles/deploy/bad_history_mismatch.yaml --safety_profile cautionary --network_interface lo --skip_release --dry_run --max_steps 10",
+     expect: {rc: nonzero, contains: ['not a known per-frame layout']}, timeout: 120}
+  - id: deploy-test-safety-{sp}
+    group: deploy
+    description: edge-case safety profiles (tight tether, gentle start, lenient) from the test safety file run
+    cmd: >-
+      {py} src/deploy/deploy_real.py --deploy_profile go2_obs_stacking --safety_profiles_file src/healthcheck/profiles/deploy/safety_test.yaml
+      --safety_profile {sp} --network_interface lo --skip_release --dry_run --no_live_dashboard --max_steps 80
+    expect: {contains: ['--max_steps 80 reached']}
+    matrix:
+      sp: [tight, slow_start, lenient]
+    timeout: 180
+  - {id: deploy-test-safety-typo-key, group: deploy, description: a misspelled key in a safety profile is rejected, not ignored,
+     cmd: "{py} src/deploy/deploy_real.py --deploy_profile go2_obs_stacking --safety_profiles_file src/healthcheck/profiles/deploy/safety_test.yaml --safety_profile typo_key --network_interface lo --skip_release --dry_run --max_steps 10",
+     expect: {rc: nonzero, contains: ['unknown/unsupported key']}, timeout: 120}
+  - id: fake-tight-safety
+    group: deploy
+    description: with a tiny tether the policy target is clipped constantly and the loop still runs cleanly
+    cmd: >-
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_tight "--duration_s 60" --deploy_profile go2_obs_stacking
+      --safety_profiles_file src/healthcheck/profiles/deploy/safety_test.yaml --safety_profile tight --max_steps 150
+    expect: {contains: ['--max_steps 150 reached']}
+    checks:
+      - {fn: fake_robot_summary, args: {out_dir: "{run}/fake_tight", min_lowcmds: 200}}
+    timeout: 300
+
+  - id: sim2sim-scn-{scn}-{dp}
+    group: sim2sim
+    description: "edge scenario {scn}: zero command, every command at its limit, rapid reversals, 5-value commands"
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/{dp}.yaml
+      --scenario src/healthcheck/profiles/scenarios/{scn}.yaml
+    expect: {contains: ['\[SUMMARY\]']}
+    checks:
+      - {fn: no_nan_in_log, args: {allow_inf: true}}
+    matrix:
+      scn: [zero_command, limits, rapid_reversal, five_dim_command]
+      dp: [go2_obs_stacking, go2_locomotion]
+    timeout: 300
+  - id: sim2sim-bad-scenario-{scn}
+    group: sim2sim
+    description: a malformed scenario file is rejected with a clear message
+    needs: [sim2sim-model-present]
+    cmd: >-
+      {py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml
+      --scenario src/healthcheck/profiles/scenarios/bad_{scn}.yaml
+    expect: {rc: nonzero, contains: ['{msg}']}
+    matrix:
+      scn: [missing_segments]
+      msg: ["non-empty 'segments:'"]
+    timeout: 120
+  - {id: sim2sim-bad-scenario-short-command, group: sim2sim, description: a 3-value command is rejected, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/bad_short_command.yaml",
+     expect: {rc: nonzero, contains: ['5 or 6 values']}, timeout: 120}
+  - {id: sim2sim-bad-scenario-negative-duration, group: sim2sim, description: a negative duration is rejected, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario src/healthcheck/profiles/scenarios/bad_negative_duration.yaml",
+     expect: {rc: nonzero, contains: ['duration must be > 0']}, timeout: 120}
+  - {id: sim2sim-bad-scenario-missing-file, group: sim2sim, description: a scenario path that does not exist is rejected, needs: [sim2sim-model-present],
+     cmd: "{py} src/sim2sim/sim2sim_mujoco.py --headless --config src/deploy/profiles/go2_obs_stacking.yaml --scenario /nonexistent/s.yaml",
+     expect: {rc: nonzero, contains: ['No such file']}, timeout: 120}
+
+  - id: soak-local-and-analyze
+    group: deploy
+    description: the whole wireless stack on loopback (fake robot, relay, desktop loop, impairment schedule) then the soak analyzer
+    cmd: >-
+      bash src/deploy/tests/run_soak_local.sh hc_soak 0.05
+      && {py} src/deploy/tools/analyze_soak.py logs/relay_runs/hc_soak
+    expect: {contains: ['desktop exit code: 0', 'wrote logs/relay_runs/hc_soak/report.md']}
+    artifacts: [logs/relay_runs/hc_soak/report.md, logs/relay_runs/hc_soak/report.json]
+    checks:
+      - {fn: finite_numbers_in_file, args: {path: "logs/relay_runs/hc_soak/report.md", min_numbers: 20, allow_nan: true}}
+    timeout: 600
+
+  # ======================================================================================== tools without a robot/GPU
+  - id: tool-collect-and-replay-{dp}
+    group: deploy
+    description: record a still standing robot (synthetic) and replay it offline through the policy, single-frame and stacked
+    cmd: >-
+      HC_TOOL=src/deploy/collect_still_observations.py bash src/healthcheck/fake_robot_case.sh {run}/still_{dp}
+      "--duration_s 40" --config src/deploy/profiles/{dp}.yaml --duration_s 4 --out {run}/still_{dp}.npz
+      && {py} src/deploy/replay_policy_offline.py --config src/deploy/profiles/{dp}.yaml --obs_log {run}/still_{dp}.npz
+      --out {run}/replay_{dp}.npz
+    expect: {contains: ['Saved \d+ samples', 'No tick had any \|action\| exceed']}
+    artifacts: ["{run}/still_{dp}.npz", "{run}/replay_{dp}.npz"]
+    matrix:
+      dp: [go2_locomotion, go2_obs_stacking]
+    timeout: 300
+
+  - id: tool-cleanup-old-runs
+    group: training
+    description: the run-folder cleaner lists by default, keeps the newest N, deletes only with --yes, refuses --keep 0
+    cmd: |
+      set -e
+      D={run}/cleanup_runs; rm -rf $D; mkdir -p $D
+      for n in 1 2 3 4; do mkdir -p $D/run_2026-01-0${n}_x; echo data > $D/run_2026-01-0${n}_x/f.txt; done
+      {py} src/training/cleanup_old_runs.py --logdir $D --keep 2
+      test "$(ls $D | wc -l)" = 4
+      {py} src/training/cleanup_old_runs.py --logdir $D --keep 2 --yes
+      test "$(ls $D | sort | tr '\n' ' ')" = "run_2026-01-03_x run_2026-01-04_x "
+      if {py} src/training/cleanup_old_runs.py --logdir $D --keep 0; then echo "--keep 0 was accepted"; exit 1; fi
+    expect: {contains: ['Dry run only', 'Deleted 2 folder']}
+    allow_traceback: true
+    timeout: 120
+
+  - id: tool-live-dashboard
+    group: training
+    gpu: false
+    needs: [train-single]
+    description: the live dashboard renders a training log to a PNG (and keeps running until interrupted)
+    cmd: >-
+      timeout -s INT 25 {py} src/common/live_dashboard.py --logdir logs/rsl_rl/healthcheck_single/run_single
+      --output {run}/dashboard.png; rc=$?; test $rc -eq 124 -o $rc -eq 0 && test -s {run}/dashboard.png
+    artifacts: ["{run}/dashboard.png"]
+    allow_traceback: true
+    timeout: 120
+
+  - id: tool-eval-velocity-tracking
+    group: play
+    gpu: true
+    needs: [train-single]
+    description: the Isaac-vs-MuJoCo velocity-tracking evaluation on a fresh checkpoint
+    cmd: >-
+      {py} src/play/eval_velocity_tracking.py --headless
+      --checkpoint logs/rsl_rl/healthcheck_single/run_single/model_3.pt
+      --mujoco_config src/deploy/profiles/go2_obs_stacking.yaml
+    timeout: 1500
+
+  - id: fake-preflight-verbose
+    group: deploy
+    description: the pre-flight check in verbose mode prints per-joint and observation detail
+    cmd: >-
+      HC_TOOL=src/deploy/preflight_check.py bash src/healthcheck/fake_robot_case.sh {run}/fake_preflight_v
+      "--duration_s 40" --duration 6 --verbose
+    expect: {contains: ['VERDICT', 'Connectivity confirmed working']}
+    timeout: 300
+  - id: preflight-no-robot
+    group: deploy
+    description: with nothing publishing, the pre-flight check says FAIL and exits non-zero (usable from scripts)
+    cmd: "{py} src/deploy/preflight_check.py --network_interface lo --duration 4"
+    expect: {rc: nonzero, contains: ['\[FAIL\] rt/lowstate connectivity issue', '\[FAIL\] No IMU data']}
+    allow_traceback: true
+    timeout: 120
+
+  # ---- interactive paths, typed into a pseudo-terminal by src/healthcheck/pty_run.py
+  - id: fake-hoist-pause-confirm
+    group: deploy
+    description: after release, the legs are held damped until SPACE is pressed; then the ramp and policy loop run
+    cmd: >-
+      HC_KEEP_HOIST_PAUSE=1
+      HC_WRAP="{py} src/healthcheck/pty_run.py --once 'Press SPACE when the robot is hoisted' SPACE --"
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_hoist "--duration_s 60" --deploy_profile go2_obs_stacking
+      --safety_profile cautionary --max_steps 60
+    expect: {contains: ['\[PAUSE\] Onboard controller released', 'Ramp done', '--max_steps 60 reached']}
+    checks:
+      - {fn: fake_robot_summary, args: {out_dir: "{run}/fake_hoist", min_lowcmds: 100}}
+    timeout: 300
+  - id: fake-step-confirm
+    group: deploy
+    description: --steps_per_confirm gates every 5 commands behind a SPACE press (11 steps = 3 confirmations)
+    cmd: >-
+      HC_WRAP="{py} src/healthcheck/pty_run.py --auto 'Press SPACE to send' SPACE --"
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_confirm "--duration_s 60" --deploy_profile go2_obs_stacking
+      --safety_profile cautionary --steps_per_confirm 5 --max_steps 11
+    expect: {contains: ['\[CONFIRM\] Press SPACE to send the next 5', '--max_steps 11 reached']}
+    timeout: 300
+  - id: fake-ctrl-c
+    group: deploy
+    description: Ctrl+C in the control loop stops it cleanly and damps the robot
+    cmd: >-
+      HC_WRAP="{py} src/healthcheck/pty_run.py --once 'Entering control loop' '\x03' --delay 4 --"
+      bash src/healthcheck/fake_robot_case.sh {run}/fake_ctrlc "--duration_s 60" --deploy_profile go2_obs_stacking
+      --safety_profile cautionary
+    expect: {contains: ['Ctrl\+C received', 'Sending damping command before exit']}
+    timeout: 300
+
+  - id: profile-dryrun-fast-curriculum
+    group: profiles
+    description: the fast-curriculum edge profile resolves
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/fast_curriculum.yaml --dry_run"
+    expect: {contains: ['dwell_steps=48', 'up_thresh=0.0']}
+    timeout: 120
+  - id: train-fast-curriculum
+    group: training
+    gpu: true
+    description: the difficulty curriculum updates during a run, is saved in curriculum_<N>.pt and restored on the resume
+    cmd: "bash src/training/train.sh --profile src/healthcheck/profiles/training/fast_curriculum.yaml"
+    expect: {contains: ['Restored curriculum from']}
+    checks:
+      - {fn: training_run, args: {experiment: healthcheck_fast_curriculum, run: run_fast_curriculum, last: 5, resumes: 1}}
+      - {fn: curriculum_difficulty, args: {experiment: healthcheck_fast_curriculum, run: run_fast_curriculum, last: 5, above: 0.0}}
+    timeout: 1800
+
+  - id: play-verify-obs-stacking
+    group: play
+    gpu: true
+    description: the real env's stacked observation layout equals what deploy_real.ObsHistory builds (gate before hardware)
+    cmd: "{py} src/play/verify_obs_stacking.py --headless"
+    expect: {contains: ['<== MATCH', 'PASS: flags already correct', 'ObsHistory reproduces the env stacked obs.*PASS']}
+    timeout: 900
+
+  - id: chain-replay-actions-options
+    group: sim2sim
+    needs: [play-trace-scenario]
+    description: replaying Isaac's actions in MuJoCo with legacy motor limits, other friction/armature and a joint-speed cap
+    cmd: >-
+      {py} src/sim2sim/replay_actions.py --isaac_trace {run}/isaac_short.npz --out {run}/replay_opts.npz
+      --config src/deploy/profiles/go2_obs_stacking.yaml --motor_limits legacy --armature 0.02
+      --foot_friction 0.8 --floor_friction 0.9 --joint_speed_cap 30 30 15
+    artifacts: ["{run}/replay_opts.npz"]
+    timeout: 300
+
+  - id: play-manual-command-file
+    group: play
+    gpu: true
+    needs: [train-single]
+    description: --manual_commands applies commands written to the slider's JSON file (the slider window itself needs a display and fails harmlessly)
+    cmd: |
+      echo '{"lin_vel_x": 0.3, "lin_vel_y": 0.0, "ang_vel_z": 0.0, "pitch": 0.1, "lean": 0.0, "height": 0.33}' > {run}/manual_cmd.json
+      {py} src/play/play.py --task Quadruped-Locomotion-Go2-Play --num_envs 1 --headless --manual_commands \
+        --command_file {run}/manual_cmd.json --checkpoint logs/rsl_rl/healthcheck_single/run_single/model_3.pt \
+        --trace_out {run}/isaac_manual.npz --trace_steps 120
+    expect: {contains: ['Manual command mode'], not_contains: ['File ".*/src/play/play\\.py"']}
+    allow_traceback: true
+    checks:
+      - {fn: npz_fields, args: {path: "{run}/isaac_manual.npz", fields: [obs, action, command], min_rows: 100}}
+    timeout: 900
+
+  - id: fake-preflight-live-dashboard
+    group: deploy
+    description: the pre-flight check with --live_dashboard logs joint angles and starts the dashboard generator (the viewer needs a display and is skipped)
+    cmd: >-
+      HC_TOOL=src/deploy/preflight_check.py bash src/healthcheck/fake_robot_case.sh {run}/fake_preflight_dash
+      "--duration_s 40" --duration 10 --live_dashboard
+      && rm -rf "$(ls -td logs/preflight_dashboard/*/ | head -1)"
+    expect: {contains: ['Live joint-angle plot logging to', 'Dashboard generator started', 'VERDICT']}
+    allow_traceback: true
+    timeout: 300

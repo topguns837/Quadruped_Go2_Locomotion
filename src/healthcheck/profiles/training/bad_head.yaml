@@ -1,0 +1,12 @@
+# Health-check NEGATIVE fixture: override that is not env./agent.
+num_phases: 1
+experiment_name: healthcheck_bad
+run_dir: run_bad
+num_envs: 32
+dashboard: false
+viewer: false
+phases:
+  - name: a
+    iterations: 2
+    overrides:
+      sim.dt: 0.01

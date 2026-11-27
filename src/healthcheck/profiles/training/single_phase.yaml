@@ -1,0 +1,17 @@
+# Health-check profile (src/healthcheck/). Tiny on purpose: it proves the pipeline runs, not that a policy learns.
+# One phase, 4 iterations in chunks of 2: exercises the chunk seam (checkpoint -> fresh process -> resume).
+num_phases: 1
+experiment_name: healthcheck_single
+run_dir: run_single
+task: Quadruped-Locomotion-Go2
+num_envs: 32
+seed: 1
+dashboard: false
+viewer: false
+headless: true
+phases:
+  - name: only
+    iterations: 4
+    batched: true
+    batch_iterations: 2
+    overrides: {}

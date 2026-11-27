@@ -1,0 +1,135 @@
+# Named hardware test/deploy profiles for deploy_real.py / deploy_real_wireless.py:  --safety_profile <name>
+# (--test_profile is the deprecated alias of --safety_profile; --deploy_profile now selects the policy recipe in src/deploy/profiles/.)
+#
+# Edit any value here and it takes effect on the NEXT run (this file is re-read at every launch).
+# Precedence per value:  explicit CLI flag  >  this profile  >  the built-in default in deploy_real.py.
+# So `--test_profile cautionary --max_joint_speed_rad_s 5` runs the cautionary profile with only the slew changed.
+#
+# Keys are the names of the deploy_real.py flags (without the leading --). Omit a key to keep its default.
+# NOT configurable here and active in every profile: the torque abort (0.9 x effort_limit in the robot config),
+# the TorqueResponseWatchdog (limp detector), the L2+B controller stop, and link-loss detection.
+# speed_fault_cap_rad_s below is the real-robot analogue of the sim's rated joint speed (hip/thigh 30.1, calf 15.7);
+# raising it above those values prints a warning at startup.
+#
+# Meaning of the main knobs:
+#   max_joint_speed_rad_s      per-tick slew cap on the commanded target (rad/s; 2.618 = 3 deg per 50 Hz tick).
+#   max_target_dev_deg         tether during the startup ramp/settle: target may lead the real joint by at most this.
+#   policy_max_target_dev_deg  tether during the policy loop (omit = same as max_target_dev_deg).
+#   abort_err_deg              abort if commanded-vs-actual error stays above this for 3 ticks (keep > the tether).
+#   hold_kp / lift_calf_tether_deg   startup lift from a crouch: calf torque ceiling = hold_kp x lift tether
+#                              (60 x 25 deg = 26 Nm; the rear calves need ~19 Nm; 40 x 25 stalls).
+#   kp_handover_s              seconds to fade kp from hold_kp to the policy's kp after the policy starts.
+#   low_pass                   action low-pass cutoff in Hz (EMA) to suppress the ~25 Hz buzz; omit = off, a value
+#                              (e.g. 5.0) turns it on. See models/11_18_26_iter4_realistic/SUMMARY.md.
+#   calf_tau_abort_nm          per-calf torque abort in the policy loop (default ~41 Nm = 0.9 x the calf rating;
+#                              the global abort is the hip/thigh rating ~21 Nm).
+#   policy_path                (avoid in safety profiles) overrides the policy .pt and beats --deploy_profile, so a profile
+#                              that sets it can no longer be paired with a policy of a different stack depth. Select the
+#                              policy with --deploy_profile instead.
+#   live_dashboard             start the live graphs (src/common/live_dashboard.py) for this run -- replaces the
+#                              separate tmux dashboard/viewer panes. Implies --live_plot (it reads that log folder).
+#   dashboard_viewer           also open a feh window on the dashboard PNG (needs DISPLAY + feh; skipped with a
+#                              warning otherwise -- the run is never blocked by the graphs).
+#   dashboard_output           PNG the dashboard writes / feh shows (/tmp/hardware_dashboard.png; training uses
+#                              /tmp/dashboard.png, so the two never collide).
+#   Per-run CLI: --live_dashboard / --no_live_dashboard, --dashboard_viewer / --no_dashboard_viewer,
+#   --dashboard_output PATH.
+
+# First touch of an unproven policy: target rate and distance both tightly limited.
+cautionary:
+  max_joint_speed_rad_s: 2.618
+  max_target_dev_deg: 15.0
+  policy_max_target_dev_deg: 15.0
+  abort_err_deg: 30.0
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+
+# A policy already seen to behave: slew and policy tether widened (the 2026-10-30 session's values).
+confident:
+  max_joint_speed_rad_s: 15.0
+  max_target_dev_deg: 15.0
+  policy_max_target_dev_deg: 45.0
+  abort_err_deg: 55.0
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+
+# Sim parity: nothing reshapes the policy's targets in the policy loop (what the 2026-11-04 15:39 run used).
+# The startup ramp keeps its 15 deg tether (it needs it to lift from a crouch). The torque abort, speed abort and
+# error abort still stop a genuine fault; a high-frequency buzz is below all of them, so keep a hand on L2+B.
+no_limits:
+  max_joint_speed_rad_s: 1000.0
+  max_target_dev_deg: 15.0
+  policy_max_target_dev_deg: 1000.0
+  abort_err_deg: 30.0
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+
+# The setup validated on hardware 2026-11-18/19 with models/11_18_26_iter4_realistic: the `confident` limits with the
+# startup-ramp tether widened to 25 deg, the 5 Hz action low-pass (suppresses the ~25 Hz buzz) and the per-calf torque
+# abort at its own rating. The policy is chosen separately by --deploy_profile, so reproduce the whole run with:
+#   src/deploy/deploy_real.py --network_interface <nic> --manual_commands --deploy_profile go2_locomotion --safety_profile iter4_realistic
+iter4_realistic:
+  max_joint_speed_rad_s: 15.0
+  max_target_dev_deg: 25.0
+  policy_max_target_dev_deg: 45.0
+  abort_err_deg: 55.0
+  calf_tau_abort_nm: 40.9
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  low_pass: 5.0
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+
+# Wireless run over the modem WiFi (src/deploy/deploy_real_wireless.py): the iter4_realistic safety limits plus a `relay:`
+# block that replaces the long --relay_* flags. The `relay:` block is read only by deploy_real_wireless.py (wired
+# deploy_real.py ignores it); an explicit CLI flag still overrides every value here. Topology and bring-up:
+# src/deploy/wireless/README.md and src/deploy/README.md Stage 0b.
+#   src/deploy/deploy_real_wireless.py --deploy_profile go2_locomotion --safety_profile wireless --manual_commands
+# (the policy comes from --deploy_profile. This profile's 5 Hz action low-pass was the single-frame policy's buzz
+# workaround; there is no CLI flag to switch it off, so for the obs-stacking policy copy this block under a new name
+# with `low_pass: null`. Do NOT pass --low_pass 0 -- a 0 Hz cutoff freezes the action.)
+# link_lost_after / the relay's --silence_damp_s are deliberately NOT set yet: tune them from the measured gaps/RTT.
+wireless:
+  max_joint_speed_rad_s: 15.0
+  max_target_dev_deg: 25.0
+  policy_max_target_dev_deg: 45.0
+  abort_err_deg: 55.0
+  calf_tau_abort_nm: 40.9
+  speed_fault_cap_rad_s: [30.1, 30.1, 15.7]
+  speed_fault_steps: 5
+  hold_kp: 60.0
+  lift_calf_tether_deg: 25.0
+  kp_handover_s: 0.5
+  low_pass: 5.0
+  live_dashboard: true
+  dashboard_viewer: true
+  dashboard_output: /tmp/hardware_dashboard.png
+  relay:
+    host: 192.168.50.20            # REPLACE: the Jetson dongle's address on the modem subnet (never 192.168.123.x)
+    key_file: ~/.go2_relay_key     # same file as on the Jetson (relay_jetson.py --init_key)
+    control_port: 9871             # TCP: auth, release, damp (matches relay_link.DEFAULT_CONTROL_PORT)
+    cmd_port: 9870                 # UDP: commands (matches relay_link.DEFAULT_CMD_PORT)
+    cmd_rate_hz: 100.0             # command rate to the relay
+    log_nic: enp233s0              # REPLACE: the desktop NIC on the modem link; its packet/error counters are logged

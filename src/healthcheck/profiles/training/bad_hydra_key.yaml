@@ -1,0 +1,13 @@
+# Health-check NEGATIVE fixture: loads fine, but Hydra must reject a reward term that does not exist at launch.
+num_phases: 1
+experiment_name: healthcheck_badhydra
+run_dir: run_badhydra
+num_envs: 32
+dashboard: false
+viewer: false
+max_fails: 1
+phases:
+  - name: a
+    iterations: 2
+    overrides:
+      env.rewards.no_such_term.weight: 1.0

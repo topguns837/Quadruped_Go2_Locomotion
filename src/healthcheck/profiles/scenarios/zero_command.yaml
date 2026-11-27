@@ -1,0 +1,3 @@
+# Health-check scenario. EDGE: nothing but a zero command (stand still); the stand-still path must stay upright.
+segments:
+  - {name: stand, duration: 4.0, command: [0.0, 0.0, 0.0, 0.0, 0.0]}
