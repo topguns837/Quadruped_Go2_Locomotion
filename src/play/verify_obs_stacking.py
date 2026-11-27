@@ -11,8 +11,9 @@ reproduces it with ObsHistory under two flags (OBS_HISTORY_TERM_MAJOR, OBS_HISTO
 wrong, the policy sees scrambled history on hardware. This script runs the REAL env and auto-discovers the true
 layout, so you can confirm the flags (or learn exactly what to set them to) before training or deploying.
 
-How: it builds the Play env twice in the same process (sequentially, one alive at a time) with the SAME seed and
-drives both with zero actions and deterministic resets, so the two rollouts are identical step-for-step:
+How: it runs the Play env twice, each pass in its OWN process (Isaac Lab cannot build a second env in the process
+that already ran one: the second build hangs), with the SAME seed, zero actions and deterministic resets, so the two
+rollouts are identical step-for-step:
   pass 1: history_length = 1  -> record each step's single-frame policy obs      (T, base)
   pass 2: history_length = H  -> record each step's stacked policy obs           (T, base*H)
 Then, offline, it rebuilds the stacked vector from the single frames under all four layout combos and reports which
@@ -38,23 +39,32 @@ parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--history_length", type=int, default=6, help="H to verify (must match env_cfg.HISTORY_LENGTH).")
 parser.add_argument("--steps", type=int, default=20, help="Rollout length; must be > H.")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
+# Internal: set by the orchestrator when it starts one rollout in a fresh process.
+parser.add_argument("--worker_history", type=int, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--worker_out", type=str, default=None, help=argparse.SUPPRESS)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
+IS_WORKER = args_cli.worker_history is not None
 
 import os
+import subprocess
 import sys
+import tempfile
 
-import gymnasium as gym
 import numpy as np
 import torch
 
-import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.utils import parse_env_cfg
+if IS_WORKER:
+    # Only a worker starts Isaac Sim; the orchestrator below just launches workers and compares their output.
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
 
-import quadruped_go2_locomotion  # noqa: F401
+    import gymnasium as gym
+
+    import isaaclab_tasks  # noqa: F401
+    from isaaclab_tasks.utils import parse_env_cfg
+
+    import quadruped_go2_locomotion  # noqa: F401
 
 # Reuse the SAME ObsHistory / frame_term_widths the robot uses (deploy/ is not a package; add it to the path like
 # sim2sim does).
@@ -103,13 +113,25 @@ def build_stack(frames: np.ndarray, H: int, widths: list[int], term_major: bool,
     return out
 
 
+def run_pass_in_new_process(history_length: int, out_path: str) -> np.ndarray:
+    """One rollout in a fresh Isaac Sim process (see the module docstring for why); returns its (steps, obs_dim)."""
+    cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + [
+        "--worker_history", str(history_length), "--worker_out", out_path]
+    result = subprocess.run(cmd)
+    if result.returncode != 0 or not os.path.exists(out_path):
+        raise SystemExit(f"[verify] FAIL: the history_length={history_length} rollout process exited with "
+                         f"{result.returncode}; cannot verify the layout.")
+    return np.load(out_path)
+
+
 def main() -> None:
     H = args_cli.history_length
     assert args_cli.steps > H, "need more steps than H"
-    print("[verify] pass 1: single-frame rollout (history_length=1)")
-    single = rollout(1)
-    print(f"[verify] pass 2: stacked rollout (history_length={H})")
-    stacked = rollout(H)
+    with tempfile.TemporaryDirectory() as tmp:
+        print("[verify] pass 1: single-frame rollout (history_length=1), own process")
+        single = run_pass_in_new_process(1, os.path.join(tmp, "single.npy"))
+        print(f"[verify] pass 2: stacked rollout (history_length={H}), own process")
+        stacked = run_pass_in_new_process(H, os.path.join(tmp, "stacked.npy"))
     base = single.shape[1]
     assert stacked.shape[1] == base * H, (stacked.shape, base, H)
     layout = deploy_real.OBS_LAYOUT[base]
@@ -150,5 +172,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    if IS_WORKER:
+        np.save(args_cli.worker_out, rollout(args_cli.worker_history))
+        simulation_app.close()
+    else:
+        main()

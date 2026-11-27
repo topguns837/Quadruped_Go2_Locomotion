@@ -25,11 +25,13 @@ import os
 import numpy as np
 
 # Observation layouts by policy input size, mirroring deploy_real.OBS_LAYOUT (cmd_width, has_height_obs, has_lin_vel):
-#   47: current (no base_lin_vel, 5-wide command)   50: with base_lin_vel   51/52: legacy 6-wide command (+ base_height).
+#   47: single frame, 5-wide command   48: 6-wide command incl. height (the stacked policy's frame, 48 x 6 = 288)
+#   50: with base_lin_vel   51/52: legacy 6-wide command (+ base_height).
 # The term order is that of deploy_real.build_observation / ObservationsCfg. The slice of every term depends on the
 # size, so it is derived from the trace's own observation width and never assumed to be 50.
 OBS_LAYOUT = {
     47: (5, False, False),
+    48: (6, False, False),
     50: (5, False, True),
     51: (6, False, True),
     52: (6, True, True),

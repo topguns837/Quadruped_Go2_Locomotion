@@ -175,12 +175,15 @@ def run_mujoco(policy_path: str, config_path: str) -> tuple[dict[str, dict[str, 
     sdk_to_isaac, _ = s2s.deploy_real.build_joint_index_maps(cfg)
     robot = s2s.MujocoGo2(model, cfg, motor_limits="hardware")
     default_isaac = robot.default_isaac
-    policy, obs_dim = s2s.load_policy(policy_path)
-    layout = s2s.OBS_LAYOUT.get(obs_dim)
-    # 47 (no base_lin_vel) and 50 (with it) are the current 5-wide-command layouts; the 6-wide legacy ones need a
-    # height command this comparison does not feed.
-    if layout is None or layout["cmd_width"] != 5 or layout["has_height_obs"]:
-        raise ValueError(f"Expected a 47- or 50-dim (current) policy, got {obs_dim}-dim.")
+    # Build the policy input exactly as deploy_real.py's live loop does (and as the Isaac env trained it): the
+    # policy's observation layout (with/without base_lin_vel, 5- or 6-wide command), the joint_vel filter and the
+    # stacked history. This used to assume the old 47/50-wide single-frame layouts and rejected current policies.
+    dr = s2s.deploy_real
+    policy, obs_dim = s2s.load_policy(policy_path, cfg.history_length)
+    _, layout = dr.policy_obs_layout(policy, cfg.history_length)
+    obs_stack = dr.ObsHistory(cfg.history_length, dr.frame_term_widths(obs_dim, layout))
+    jv_filter = dr.ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
+    stance_height = dr.ManualCommandBuffer().get_height()
 
     results: dict[str, dict[str, float]] = {}
     mean_joint_pos: dict[str, np.ndarray] = {}
@@ -190,15 +193,17 @@ def run_mujoco(policy_path: str, config_path: str) -> tuple[dict[str, dict[str, 
         joint_pos_samples = []
         num_steps = round(seg.duration / cfg.control_dt)
         for k in range(num_steps):
-            obs = s2s.deploy_real.build_observation(
+            frame = dr.build_observation(
                 cfg,
                 robot.to_robot_state(),
                 sdk_to_isaac,
                 default_isaac,
-                list(seg.command),
+                dr.command_for_layout(list(seg.command), layout, stance_height),
                 last_action,
                 include_base_lin_vel=layout["has_lin_vel"],
+                joint_vel_filter=jv_filter,
             )
+            obs = obs_stack.push_and_stack(frame)
             with torch.inference_mode():
                 action = policy(obs)[0].numpy()
             target = default_isaac + cfg.action_scale * action

@@ -148,7 +148,7 @@ def print_summary(
     sportmode_health: TopicHealth,
     joint_tracker: JointTracker,
     gravity_tracker: GravityTracker,
-) -> None:
+) -> bool:
     print("\n" + "=" * 74)
     print("PRE-FLIGHT SUMMARY")
     print("=" * 74)
@@ -217,6 +217,7 @@ def print_summary(
     for line in verdict:
         print(f"  {line}")
     print("=" * 74)
+    return not any(line.startswith("[FAIL]") for line in verdict)
 
 
 # Panel titles in src/common/live_dashboard.py's PANELS that don't apply to preflight_check.py's data (it only
@@ -422,8 +423,10 @@ def main():
     except KeyboardInterrupt:
         print()
 
-    print_summary(low_state_health, sportmode_health, joint_tracker, gravity_tracker)
+    verdict_ok = print_summary(low_state_health, sportmode_health, joint_tracker, gravity_tracker)
+    # Exit code follows the verdict, so scripts and CI can tell a failed pre-flight from a passed one.
+    return 0 if verdict_ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

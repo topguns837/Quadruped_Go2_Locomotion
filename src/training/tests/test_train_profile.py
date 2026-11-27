@@ -428,6 +428,22 @@ class NumPhases(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     tp.main(["--profile", path, "--dry_run", "--num_phases", bad])
 
+    def test_start_phase_beyond_the_last_phase_is_rejected(self):
+        path = write_yaml(self.BODY.format(num="num_phases: 2"), auto_num_phases=False)
+        for bad in ("3", "9"):
+            err = io.StringIO()
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                tp.main(["--profile", path, "--dry_run", "--start_phase", bad])
+            self.assertIn("beyond the last phase", err.getvalue())
+
+    def test_start_phase_at_the_last_phase_runs_only_it(self):
+        path = write_yaml(self.BODY.format(num="num_phases: 2"), auto_num_phases=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(tp.main(["--profile", path, "--dry_run", "--start_phase", "2"]), 0)
+        self.assertIn("phase 2/2: b", out.getvalue())
+        self.assertNotIn("phase 1/2", out.getvalue())
+
     def test_cli_num_phases_keeps_cumulative_iterations_of_kept_phases(self):
         prof = tp.load_profile(write_yaml(self.BODY.format(num="num_phases: 2"), auto_num_phases=False))
         self.assertEqual(tp.phase_boundaries(prof)[0], (0, 10))

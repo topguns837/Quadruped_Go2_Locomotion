@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 
+import mujoco
 import numpy as np
 
 _SIM2SIM_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,10 +82,12 @@ def main() -> None:
     viewer = None
     viewer_threads: set[threading.Thread] = set()
     if args.viewer:
-        import mujoco.viewer
+        # `from ... import` rather than `import mujoco.viewer`: the latter would make `mujoco` a LOCAL name of main()
+        # and break every later use of it when --viewer is not given (UnboundLocalError in the stepping loop).
+        from mujoco import viewer as mujoco_viewer
 
         threads_before = set(threading.enumerate())
-        viewer = mujoco.viewer.launch_passive(model, robot.data)
+        viewer = mujoco_viewer.launch_passive(model, robot.data)
         viewer_threads = set(threading.enumerate()) - threads_before
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.trackbodyid = robot.base_id

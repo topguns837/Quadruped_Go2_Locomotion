@@ -117,11 +117,46 @@ class DeployConfig:
             self.hold_kp = self.kp
 
 
+_REQUIRED_CONFIG_KEYS = ("kp", "kd", "control_dt", "action_scale", "effort_limit", "isaac_joint_order",
+                         "sdk_joint_order", "default_joint_pos")
+_N_JOINTS = 12
+
+
+def _validate_raw_config(raw, path: str, need_policy_path: bool) -> None:
+    """Fail at startup, with a message that names the file and the problem, instead of deep inside the control loop
+    (an 11-joint order used to surface as a matrix-shape error, an empty file as a bare TypeError)."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: a deploy profile must be a YAML mapping (key: value pairs), got "
+                         f"{type(raw).__name__ if raw is not None else 'an empty file'}")
+    required = list(_REQUIRED_CONFIG_KEYS) + (["policy_path"] if need_policy_path else [])
+    missing = [k for k in required if k not in raw]
+    if missing:
+        raise ValueError(f"{path}: missing required key(s) {missing}")
+    for key in ("control_dt", "action_scale", "effort_limit"):
+        if not float(raw[key]) > 0:
+            raise ValueError(f"{path}: {key} must be > 0, got {raw[key]!r}")
+    for key in ("kp", "kd"):
+        if float(raw[key]) < 0:
+            raise ValueError(f"{path}: {key} must be >= 0, got {raw[key]!r}")
+    for key in ("isaac_joint_order", "sdk_joint_order"):
+        names = list(raw[key])
+        if len(names) != _N_JOINTS or len(set(names)) != _N_JOINTS:
+            raise ValueError(f"{path}: {key} must list {_N_JOINTS} distinct joints, got {len(names)} "
+                             f"({len(set(names))} distinct)")
+    if set(raw["isaac_joint_order"]) != set(raw["sdk_joint_order"]):
+        diff = sorted(set(raw["isaac_joint_order"]) ^ set(raw["sdk_joint_order"]))
+        raise ValueError(f"{path}: isaac_joint_order and sdk_joint_order name different joints: {diff}")
+    if set(raw["default_joint_pos"]) != set(raw["isaac_joint_order"]):
+        diff = sorted(set(raw["default_joint_pos"]) ^ set(raw["isaac_joint_order"]))
+        raise ValueError(f"{path}: default_joint_pos and isaac_joint_order name different joints: {diff}")
+
+
 def load_config(path: str, cli_network_interface: str | None, cli_link_lost_after: float | None = None,
                 cli_hold_kp: float | None = None, cli_policy_path: str | None = None,
                 cli_history_length: int | None = None) -> DeployConfig:
     with open(path) as f:
         raw = yaml.safe_load(f)
+    _validate_raw_config(raw, path, need_policy_path=cli_policy_path is None)
     # policy_path: CLI / profile (--policy_path) > config file. Lets a deploy profile select the policy without a
     # separate config file, the one thing the config YAML otherwise pins per policy.
     policy_path = cli_policy_path or raw["policy_path"]
@@ -1519,6 +1554,11 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--max_steps", type=int, default=None,
+        help="Stop the control loop (through the same damping/shutdown path as Ctrl+C) after this many control "
+        "steps. Default: run until stopped. Used by the health check (src/healthcheck/) to end runs by itself.",
+    )
+    parser.add_argument(
         "--startup_ramp_s", type=float, default=10.0,
         help="Seconds to smoothly interpolate from the robot's actual current joint positions AND from a "
         "gentle starting kp (see --startup_kp_fraction) to default_joint_pos/full kp, instead of jumping "
@@ -2091,6 +2131,9 @@ def main():
                     )
 
                 step += 1
+                if args.max_steps is not None and step >= args.max_steps:
+                    print(f"\n[INFO] --max_steps {args.max_steps} reached -- stopping control loop.")
+                    break
                 elapsed = time.perf_counter() - tick_start
                 sleep_time = control_dt - elapsed
                 # When gated, gate.wait() (just above) already blocked far longer than control_dt for the

@@ -78,6 +78,15 @@ def main():
     policy = torch.jit.load(policy_path)
     policy.eval()
 
+    # Build the policy input exactly as deploy_real.py's live loop does: the observation layout the policy was trained
+    # with (with/without base_lin_vel, 5- or 6-wide command), the joint_vel filter, and the stacked history. Without
+    # this the replay only works for the oldest 50-wide layout and crashes on every current policy.
+    obs_dim, obs_layout = dr.policy_obs_layout(policy, cfg.history_length)
+    include_base_lin_vel = obs_layout["has_lin_vel"]
+    obs_stack = dr.ObsHistory(cfg.history_length, dr.frame_term_widths(obs_dim, obs_layout))
+    jv_filter = dr.ObsEmaFilter(cfg.joint_vel_filter_hz, cfg.control_dt)
+    cmd_height = dr.ManualCommandBuffer().get_height()
+
     state = dr.LatestRobotState(num_joints=12)
     last_action = [0.0] * 12
     obs_history: list[list[float]] = []
@@ -91,11 +100,14 @@ def main():
         state.sportmode_velocity = tuple(sportmode_velocity_log[i].tolist())
         manual_cmd = manual_cmd_log[i].tolist()
 
-        obs = dr.build_observation(cfg, state, sdk_to_isaac, default_joint_pos_isaac_order, manual_cmd, last_action)
+        obs_cmd = dr.command_for_layout(manual_cmd, obs_layout, cmd_height)
+        frame = dr.build_observation(cfg, state, sdk_to_isaac, default_joint_pos_isaac_order, obs_cmd, last_action,
+                                     include_base_lin_vel=include_base_lin_vel, joint_vel_filter=jv_filter)
+        obs = obs_stack.push_and_stack(frame)
         with torch.inference_mode():
             action = policy(obs)[0].tolist()  # raw policy output, no clamp/tether/watchdog applied
 
-        obs_history.append(obs[0].tolist())
+        obs_history.append(frame[0].tolist())
         action_history.append(action)
         last_action = action  # feeds back exactly as it would live (see module docstring)
 

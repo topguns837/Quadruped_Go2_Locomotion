@@ -467,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
         indices = [args.only_phase - 1]
     else:
         indices = list(range(args.start_phase - 1, n))
+        if not indices:
+            parser.error(f"--start_phase {args.start_phase} is beyond the last phase ({n}): nothing would run")
     for i in indices:
         if not 0 <= i < n:
             parser.error(f"phase index {i + 1} out of range 1..{n}")

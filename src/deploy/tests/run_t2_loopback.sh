@@ -81,7 +81,7 @@ echo "=== F. security: wrong key, forged packets, invalid authenticated command 
 reset; start_fake; start_relay
 $PY - <<'EOF' >/tmp/sec.log 2>&1
 import os, sys, socket, time
-sys.path.insert(0, "deploy")
+sys.path.insert(0, "src/deploy")
 import relay_link as rl
 good = rl.load_key("/tmp/t2_relay.key")
 bad = bytes(range(32))

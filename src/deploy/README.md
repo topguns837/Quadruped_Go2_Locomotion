@@ -93,7 +93,7 @@ Dockerfile work) is done and committed. What's left, in rough priority order:
 ## Proposed pipeline (staged, safety-first)
 
 ### Stage 0 — Physical safety setup (no code)
-**The authoritative step-by-step procedure is [`src/deploy/Checklist.md`](src/deploy/Checklist.md)** — follow that, not
+**The authoritative step-by-step procedure is [`src/deploy/Checklist.md`](Checklist.md)** — follow that, not
 this section, when they differ.
 
 Correction (an earlier version of this doc used G1/H1 conventions that are wrong for the Go2): on the Go2's

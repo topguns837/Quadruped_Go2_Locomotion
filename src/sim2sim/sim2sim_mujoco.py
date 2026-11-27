@@ -125,6 +125,10 @@ def load_sim_config(config_path: str, policy_path: str | None) -> deploy_real.De
         isaac_joint_order=list(raw["isaac_joint_order"]),
         sdk_joint_order=list(raw["sdk_joint_order"]),
         default_joint_pos=dict(raw["default_joint_pos"]),
+        # Both come from the deploy profile, exactly as deploy_real.load_config reads them. Leaving them out meant
+        # MuJoCo ran every policy with no joint_vel low-pass and (for callers other than main) a single frame.
+        history_length=int(raw.get("history_length", 1)),
+        joint_vel_filter_hz=raw.get("joint_vel_filter_hz"),
     )
 
 
@@ -150,14 +154,24 @@ class Segment:
 
 
 def load_scenario(path: str) -> list[Segment]:
+    """Read a scenario YAML (``segments: [{name, duration, command}]``). Fails with a message that names the file and
+    the segment instead of a bare KeyError, and rejects segments that would silently do nothing."""
     with open(path) as f:
         raw = yaml.safe_load(f)
+    if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list) or not raw["segments"]:
+        raise ValueError(f"{path}: a scenario needs a non-empty 'segments:' list")
     segments = []
-    for entry in raw["segments"]:
+    for i, entry in enumerate(raw["segments"]):
+        missing = [k for k in ("name", "duration", "command") if not isinstance(entry, dict) or k not in entry]
+        if missing:
+            raise ValueError(f"{path}: segment #{i} lacks {missing}")
         cmd = [float(v) for v in entry["command"]]
         if len(cmd) not in (5, 6):
             raise ValueError(f"Segment {entry['name']!r}: command must have 5 or 6 values (6th = height), got {len(cmd)}")
-        segments.append(Segment(entry["name"], float(entry["duration"]), cmd))
+        duration = float(entry["duration"])
+        if not duration > 0:
+            raise ValueError(f"Segment {entry['name']!r}: duration must be > 0 s, got {duration}")
+        segments.append(Segment(entry["name"], duration, cmd))
     return segments
 
 
@@ -367,7 +381,8 @@ def print_summary(
         rms = s.rms()
         dev = np.degrees(s.target_sum / max(s.samples, 1) - default_isaac)
         worst = int(np.argmax(np.abs(dev)))
-        errors = "".join(f"{rms[n]:>9.3f}" for n in METRIC_NAMES)
+        # A segment shorter than the settle window has no steady-state samples: say so instead of printing nan.
+        errors = "".join(f"{rms[n]:>9.3f}" if not math.isnan(rms[n]) else f"{'n/a':>9}" for n in METRIC_NAMES)
         print(
             f"  {s.name:<16}{errors}{s.falls:>7d}{s.peak_torque:>10.1f}  {dev[worst]:+6.1f} [{joint_names[worst]}]"
         )
@@ -526,6 +541,7 @@ def main():
     is_legacy = layout["has_lin_vel"] or layout["has_height_obs"]
     nominal_height = NOMINAL_HEIGHT_M["legacy" if is_legacy else "new"]
     cfg = load_sim_config(args.config, policy_path)
+    cfg.history_length = history_length  # --history_length on the command line wins over the profile
     # PD-gain overrides for the kd damping sweep (default: keep the config's values). Raising kd above the
     # training value (0.8) damps the ~25 Hz limit cycle but is a sim-to-real mismatch -- see the plan.
     if args.kp is not None:
