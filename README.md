@@ -395,7 +395,7 @@ it lives in `src/common/`.
 |---|---|---|
 | `src/env/` | The robot + task as an Isaac Lab extension (`quadruped_go2_locomotion/`: `env_cfg.py`, `robot_cfg.py`, `mdp/`, `agents/`, `resources/`) | change rewards, observations, commands, curriculum, kp/kd, PPO settings |
 | `src/training/` | `train.sh` (the entry point), its drivers, and `profiles/` (training recipes) | start or tune a training run |
-| `src/play/` | `play.py` (plus two checkers with known issues, see [`src/play/README.md`](src/play/README.md)) | watch/evaluate a policy in Isaac Sim |
+| `src/play/` | `play.py` (plus `eval_velocity_tracking.py` and `verify_obs_stacking.py`, see [`src/play/README.md`](src/play/README.md)) | watch/evaluate a policy in Isaac Sim |
 | `src/sim2sim/` | MuJoCo runner, random-command eval, `scenarios/` | cross-check a policy outside Isaac |
 | `src/deploy/` | Real-robot runner, `profiles/` (per-policy recipe), `configs/safety_profiles.yaml`, `wireless/` | run a policy on the Go2 |
 | `src/common/` | `cli_args.py`, `live_dashboard.py`, `manual_command_slider.py` | shared UI/CLI helpers |
@@ -521,6 +521,26 @@ pre-commit run --all-files
 
 The hooks run ruff (lint only), whitespace/YAML/TOML checks, codespell, and refuse to commit secrets such as the
 access-point config or relay key. `CLAUDE.md` documents the project conventions for AI-assisted development.
+
+### Health check
+
+Before merging, run the repo health check from the host. It starts a separate throwaway container
+(`quadruped_go2_locomotion_testing`, your main container is not touched) and runs the basics of every stage: training
+profiles (single, multi-phase and edge cases), a tiny real training run, export, play, MuJoCo sim2sim, the Isaac-vs-MuJoCo
+eval, and deploy against a synthetic robot. It ends with a pass/fail report and a code-coverage report:
+
+```bash
+./healthcheck.sh
+```
+
+Test one specific commit without touching your working tree:
+
+```bash
+./healthcheck.sh --ref <commit>
+```
+
+The report and the coverage report (`htmlcov/index.html`) are written to `logs/healthcheck/<timestamp>_<commit>/`. See
+[`src/healthcheck/README.md`](src/healthcheck/README.md) for the groups, the edge-case profiles, and how to add a case.
 
 For VS Code, run the workspace task `setup_python_env` to improve Pylance resolution of Isaac Sim packages.
 

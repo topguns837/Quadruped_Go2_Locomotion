@@ -39,6 +39,7 @@ src/
     profiles/               # per-policy recipes incl. observation stack depth (--deploy_profile <name>)
     configs/safety_profiles.yaml   # session caution levels (--safety_profile <name>)
     wireless/ tools/ tests/
+  healthcheck/              # repo health check: ./healthcheck.sh runs run.py in a throwaway *_testing container (profiles/, cases.yaml, coverage)
   common/                   # shared by 2+ stages: cli_args.py live_dashboard.py manual_command_slider.py
 models/                     # curated, committed policies (SUMMARY.md each)
 logs/rsl_rl/<experiment>/   # training runs (gitignored); logs/hydra/ = Hydra per-launch dirs
